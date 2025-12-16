@@ -1,0 +1,358 @@
+"""Vision Token Pruning - 两阶段剪枝训练函数
+
+实现Token Merge + Layer-wise Pruning的两阶段剪枝训练。
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import Dict, Any, List
+
+from collections import defaultdict
+from .utils import (
+    extract_target_hidden_states,
+    compute_task_loss,
+    register_multi_layer_hooks,
+    remove_hooks,
+    replace_vision_tokens_in_embeddings,
+    update_temperature_for_all
+)
+
+
+def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """两阶段剪枝的训练step函数
+
+    架构：
+    1. Token Merge（LLM输入前）：576 tokens → ~288 tokens
+    2. Layer-wise Pruning（LLM内部）：在Layer 10/20/31分别剪枝
+    3. GAN对抗训练：Discriminator判别real/fake
+
+    Generator = Token Merger + Layer Pruners（统一优化）
+
+    参数:
+        batch: 数据batch
+        device: 设备
+        info: 包含config, models等的字典
+            - models:
+                - "backbone": LLaVA backbone
+                - "token_merger": LearnableTokenMerger实例
+                - "layer_pruners": LayerSpecificPruner实例
+                - "discriminator": Discriminator实例
+
+    返回:
+        损失字典，包含两个optimizer组：generator, discriminator
+    """
+    config = info["config"]
+    backbone = info["models"]["backbone"]
+    token_merger = info["models"]["token_merger"]
+    layer_pruners = info["models"]["layer_pruners"]
+    discriminator = info["models"]["discriminator"]
+    current_step = info["global_batch_index"]
+
+    # === 配置参数 ===
+    disc_target_layers = config["method_settings"]["disc_target_layers"]
+    disc_reinit_prob = config["method_settings"]["disc_reinit_prob"]
+    total_steps = config["trainer_settings"]["dl_settings"]["epochs"] * info.get("total_planned_batches", 1000)
+
+    # === Discriminator随机重初始化 ===
+    if torch.rand(1).item() < disc_reinit_prob:
+        config["logger"].info(f"[Step {current_step}] Discriminator reinit triggered")
+        discriminator._init_weights()
+
+    # === Temperature Annealing ===
+    update_temperature_for_all(token_merger, layer_pruners, config, current_step, total_steps)
+
+    # === 初始化损失累加器 ===
+    generator_losses = defaultdict(lambda: torch.tensor(0.0, device=device))  # Generator = Merger + Pruners
+    disc_losses = defaultdict(lambda: torch.tensor(0.0, device=device))
+    stats = defaultdict(float)
+
+    valid_samples = 0
+
+    # === 遍历Batch ===
+    for sample in batch:
+        valid_samples += 1
+
+        # ========== Phase 1: Token Merge（LLM输入前） ==========
+
+        # 1.1 获取原始embeddings
+        with torch.no_grad():
+            emb_info = backbone.preprocess(sample["image"], sample["question"], sample["answer"])
+            original_embeddings = emb_info['embeddings']  # (1, seq_len, 4096)
+            original_vision_pos = emb_info['vision_token_positions']  # (start, end)
+            answer_pos = emb_info['answer_token_positions']
+
+            # 提取vision features（投影前，来自CLIP）
+            # if hasattr(backbone.model, 'vision_tower'):
+            #     pixel_values = backbone.processor(images=sample["image"], return_tensors="pt")['pixel_values'].to(device)
+            #     vision_features_raw = backbone.model.vision_tower(pixel_values)  # (1, 576, 1024)
+            # else:
+                # Fallback: 从embeddings中提取（已投影到4096维）
+            v_start, v_end = original_vision_pos
+            vision_features_raw = original_embeddings[:, v_start:v_end+1, :]
+
+            # 提取question embeddings（用于question-aware merger和pruner）
+            # 结构: [0:v_start] = "USER: "
+            #       [v_start:v_end+1] = vision tokens
+            #       [v_end+1:answer_start] = "\n{question}\nASSISTANT: "
+            #       [answer_start:] = "{answer}"
+            # 我们只需要提取真正的question部分: [v_end+1:answer_start]
+            if answer_pos[0] < 0:
+                # 负索引转正索引
+                answer_start_abs = original_embeddings.shape[1] + answer_pos[0]
+            else:
+                answer_start_abs = answer_pos[0]
+
+            # 提取question部分（只包含"\n{question}\nASSISTANT: "）
+            question_embeddings_for_merger = original_embeddings[:, v_end+1:answer_start_abs, :]
+
+        # 1.2 Token Merge（可训练）
+        token_merger.train()
+        # 根据merger_type决定是否传入question_embeddings
+        if config.method_settings.merger_type == "question_aware":
+            merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
+        else:
+            merge_result = token_merger(vision_features_raw, use_gumbel=True)
+        merged_vision = merge_result['merged_features']  # (1, M, 1024) 或 (1, M, 4096)
+        # Note: merge_result['importance_logits'] 可用于额外的 merge sparsity loss，但当前未启用
+
+        # 1.3 投影到LLM维度（如果merge输出是1024维）
+        if merged_vision.shape[-1] != original_embeddings.shape[-1]:
+            merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (1, M, 4096)
+
+        # 1.4 替换vision部分
+        embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
+            original_embeddings,
+            original_vision_pos,
+            merged_vision,
+            emb_info['attention_mask']
+        )
+
+        # 1.5 提取question embeddings（用于layer pruners的cross-attention）
+        # 结构: [0:new_vision_pos[0]] = "USER: "
+        #       [new_vision_pos[0]:new_vision_pos[1]+1] = merged vision tokens
+        #       [new_vision_pos[1]+1:answer_start] = "\n{question}\nASSISTANT: "
+        #       [answer_start:] = "{answer}"
+        # 注意: answer_pos是相对于original_embeddings的，需要调整到embeddings_merged
+        num_removed_tokens = (original_vision_pos[1] - original_vision_pos[0] + 1) - (new_vision_pos[1] - new_vision_pos[0] + 1)
+        answer_start_merged = answer_start_abs - num_removed_tokens
+
+        # 只提取question部分（不包含"USER: "和answer）
+        question_embeddings = embeddings_merged[:, new_vision_pos[1]+1:answer_start_merged, :]
+
+        # ========== Phase 2: Layer-wise Pruning Forward（带hooks） ==========
+
+        # 2.1 创建mask收集器（用于sparsity loss）
+        pruning_masks = []
+
+        # 2.2 注册hooks到Layer 10/20/31
+        handles = register_multi_layer_hooks(
+            backbone,
+            layer_pruners,
+            new_vision_pos,
+            question_embeddings,
+            mask_collector=pruning_masks  # 收集每层的soft_mask
+        )
+
+        try:
+            # 2.2 Forward（fake sample - 带剪枝）
+            layer_pruners.train()
+            result_fake = backbone.forward(
+                embeddings=embeddings_merged,
+                attention_mask=new_attention_mask,
+                output_hidden_states=True
+            )
+
+            # 2.3 提取hidden states from target layers
+            fake_hidden_list = extract_target_hidden_states(
+                result_fake['all_hidden_states'],
+                answer_pos,
+                disc_target_layers,
+                batch_size=1
+            )
+
+        finally:
+            # 清理hooks
+            remove_hooks(handles)
+
+        # 2.4 Forward（real sample - 无剪枝）
+        with torch.no_grad():
+            result_real = backbone.forward(
+                embeddings=original_embeddings,
+                attention_mask=emb_info['attention_mask'],
+                output_hidden_states=True
+            )
+
+            real_hidden_list = extract_target_hidden_states(
+                result_real['all_hidden_states'],
+                answer_pos,
+                disc_target_layers,
+                batch_size=1
+            )
+
+        # ========== Phase 3: Discriminator Judgment ==========
+
+        discriminator.eval()
+
+        # 3.1 判别fake（用于generator loss）
+        for p in discriminator.parameters():
+            p.requires_grad = False
+
+        fake_pred_for_gen = discriminator(fake_hidden_list)  # (batch, seq_len)
+
+        for p in discriminator.parameters():
+            p.requires_grad = True
+
+        # 3.2 判别real
+        real_pred = discriminator(real_hidden_list)
+
+        # ========== Phase 4: Loss Computation ==========
+
+        # --- Generator Loss (Merger + Pruners统一优化) ---
+
+        # 1. Adversarial Loss: 骗过discriminator
+        generator_losses["adv_loss"] = generator_losses["adv_loss"] + F.binary_cross_entropy(
+            fake_pred_for_gen,
+            torch.ones_like(fake_pred_for_gen),
+            reduction='mean'
+        )
+
+        # 2. Task Loss: 保持任务性能
+        generator_losses["task_loss"] = generator_losses["task_loss"] + compute_task_loss(
+            result_fake['logits'],
+            answer_pos,
+            sample["answer"],
+            backbone.processor
+        )
+
+        # 3. Sparsity Loss: 控制每层剪枝的token保留率
+        # pruning_masks: list of (batch, n_vision) 每层的soft_mask
+        if len(pruning_masks) > 0:
+            # 获取配置
+            target_sparsity = config['method_settings'].get('target_sparsity')
+            use_token_num_target = config['method_settings'].get('use_token_num_target')
+            sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
+
+            # 计算目标保留率
+            if use_token_num_target:
+                # 基于绝对token数
+                target_token_num = config['method_settings'].get('target_token_num', 128)
+                # 计算每层平均每个样本的vision token数
+                n_vision = pruning_masks[0].shape[1]  # 假设所有层的vision token数相同
+                target_kept_ratio = target_token_num / n_vision
+            else:
+                # 基于稀疏度比例
+                target_kept_ratio = 1.0 - target_sparsity
+
+            # === Sparsity Loss 1: 约束保留率（强惩罚，只在超出时） ===
+            # 层级加权：越靠后的层权重越大，避免都在第一层剪完
+            sparsity_constraint_loss = torch.tensor(0.0, device=device)
+            layer_indices = layer_pruners.get_all_layers()  # [10, 20, 31]
+            num_layers = len(layer_indices)
+
+            for idx, mask in enumerate(pruning_masks):
+                current_kept_ratio = mask.mean()  # 当前保留比例
+
+                # 计算层级权重:后面的层权重更大
+                # 例如 [10, 20, 31] -> 权重 [1.0, 2.0, 3.0]
+                layer_weight = (idx + 1) / num_layers  # 归一化到 [1/n, 2/n, ..., 1]
+                layer_weight = layer_weight * num_layers  # 恢复到 [1, 2, ..., n]
+
+                if sparsity_loss_only_on_excess:
+                    # 只在保留率超过目标时惩罚
+                    excess = torch.relu(current_kept_ratio - target_kept_ratio)
+                    sparsity_constraint_loss = sparsity_constraint_loss + layer_weight * excess.to(sparsity_constraint_loss.device).pow(2)
+                else:
+                    # 双向惩罚（过多或过少都惩罚）
+                    sparsity_constraint_loss = sparsity_constraint_loss + layer_weight * (current_kept_ratio - target_kept_ratio).to(sparsity_constraint_loss.device).pow(2)
+
+            # 归一化（除以权重总和）
+            weight_sum = sum(range(1, num_layers + 1))  # 1 + 2 + ... + n
+            sparsity_constraint_loss = sparsity_constraint_loss / weight_sum
+            generator_losses["sparsity_loss"] = generator_losses["sparsity_loss"] + sparsity_constraint_loss
+
+            # === Sparsity Loss 2: Token总数惩罚（弱惩罚，鼓励减少token） ===
+            token_count_loss = torch.tensor(0.0, device=device)
+
+            for mask in pruning_masks:
+                # mask.sum() = 每层保留的token总数（考虑soft值）
+                token_count_loss = token_count_loss + mask.sum().to(token_count_loss.device)
+
+            # 平均到所有层
+            token_count_loss = token_count_loss / len(pruning_masks)
+
+            # 归一化到 [0, 1] 范围：除以vision token总数
+            # 这样loss变成"平均每层保留的token比例"，与学习率量级匹配
+            n_vision = pruning_masks[0].shape[1]  # 例如 460
+            token_count_loss = token_count_loss / n_vision
+
+            generator_losses["token_count_loss"] = generator_losses["token_count_loss"] + token_count_loss
+
+            # 统计信息
+            avg_kept_ratio = sum(m.mean().item() for m in pruning_masks) / len(pruning_masks)
+            avg_token_count = sum(m.sum().item() for m in pruning_masks) / len(pruning_masks)
+            stats["avg_kept_ratio"] += avg_kept_ratio
+            stats["avg_token_count"] += avg_token_count
+            stats["target_kept_ratio"] += target_kept_ratio
+
+        # --- Discriminator Loss ---
+
+        discriminator.train()
+
+        # Real loss
+        disc_losses["real_loss"] = disc_losses["real_loss"] + F.binary_cross_entropy(
+            real_pred,
+            torch.ones_like(real_pred),
+            reduction='mean'
+        )
+
+        # Fake loss（detach hidden states）
+        fake_hidden_detached = [h.detach() for h in fake_hidden_list]
+        fake_pred_for_disc = discriminator(fake_hidden_detached)
+        disc_losses["fake_loss"] = disc_losses["fake_loss"] + F.binary_cross_entropy(
+            fake_pred_for_disc,
+            torch.zeros_like(fake_pred_for_disc),
+            reduction='mean'
+        )
+
+        # 清理
+        del merged_vision, embeddings_merged, result_fake, result_real
+        del fake_hidden_list, real_hidden_list, fake_hidden_detached
+        del fake_pred_for_gen, real_pred, fake_pred_for_disc, pruning_masks
+
+    # ========== Phase 5: 归一化Loss并应用权重 ==========
+
+    if valid_samples > 0:
+        # Normalize (非 inplace 操作)
+        for k in generator_losses:
+            generator_losses[k] = generator_losses[k] / valid_samples
+        for k in disc_losses:
+            disc_losses[k] = disc_losses[k] / valid_samples
+        for k in stats:
+            stats[k] = stats[k] / valid_samples
+
+        # Apply weights (非 inplace 操作)
+        adv_weight = config['method_settings'].get('adv_loss_weight')
+        task_weight = config['method_settings'].get('task_loss_weight')
+        sparsity_weight = config['method_settings'].get('sparsity_weight')
+        token_count_weight = config['method_settings'].get('token_count_loss_weight')
+
+        generator_losses["adv_loss"] = generator_losses["adv_loss"] * adv_weight
+        generator_losses["task_loss"] = generator_losses["task_loss"] * task_weight
+        if "sparsity_loss" in generator_losses:
+            generator_losses["sparsity_loss"] = generator_losses["sparsity_loss"] * sparsity_weight
+        if "token_count_loss" in generator_losses:
+            generator_losses["token_count_loss"] = generator_losses["token_count_loss"] * token_count_weight
+
+    # 确保tensor在正确设备上
+    target_device = next(token_merger.parameters()).device
+    for losses_dict in [generator_losses, disc_losses]:
+        for k in losses_dict:
+            if isinstance(losses_dict[k], torch.Tensor):
+                losses_dict[k] = losses_dict[k].to(target_device)
+
+    torch.cuda.empty_cache()
+
+    return {
+        "generator": dict(generator_losses),      # Merger + Pruners 统一优化
+        "discriminator": dict(disc_losses)
+    }

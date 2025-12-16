@@ -1,0 +1,180 @@
+"""Vision Token Pruning with GAN - 主训练脚本
+
+使用新的Engine架构实现对抗训练的视觉token剪枝。
+"""
+
+import torch
+from typing import Dict, Any
+
+from engine.configs.loader import load_config
+
+# ===================== Manager函数 =====================
+
+def preload_fn(config: Dict) -> Dict[str, Any]:
+    """预加载重量级资源"""
+    from engine.datas.loader import load_dataset
+    from engine.backbones.loader import load_backbone
+
+    logger = config["logger"]
+    logger.info("预加载Backbone和Dataset...")
+    
+    backbone = load_backbone(config)
+    
+    # 冻结Backbone参数，避免梯度累积和显存浪费
+    logger.info("冻结Backbone参数...")
+    if hasattr(backbone, "model"):
+        for param in backbone.model.parameters():
+            param.requires_grad = False
+    
+    dataset_bundle = load_dataset(config)
+    
+    return {
+        "backbone": backbone,
+        "dataset_bundle": dataset_bundle
+    }
+
+
+def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
+    """执行训练"""
+    from engine.trainers.loader import load_trainer
+    from method import (
+        LearnableTokenMerger,
+        LearnableTokenMergerV2,
+        LayerSpecificPruner,
+        Discriminator,
+        train_step,
+        eval_step
+    )
+
+    logger = config["logger"]
+    backbone = cache["backbone"]
+    dataset_bundle = cache["dataset_bundle"]
+    device = config.get("global_settings", {}).get("device")
+
+    # 将dataset_bundle放入config供eval_step使用
+    config["_dataset_bundle"] = dataset_bundle
+
+    logger.info("创建Trainer...")
+    trainer = load_trainer(config, dataset_bundle)
+
+    # 获取 backbone 的输出设备
+    backbone_output_device = getattr(backbone, 'output_device', backbone.device)
+    model_dtype = torch.float16 if str(backbone_output_device).startswith('cuda') else torch.float32
+
+    # ==================== 创建两阶段剪枝模块 ====================
+
+    # 1. Token Merger
+    logger.info("创建Token Merger...")
+    merger_type = config["method_settings"].get("merger_type", "simple")
+
+    if merger_type == "question_aware":
+        token_merger = LearnableTokenMergerV2(
+            d_vision=config["backbone_settings"]["mllm_settings"]["vision_dim"],
+            d_text=config["backbone_settings"]["mllm_settings"]["hidden_dim"],
+            d_internal=config["method_settings"]["pruner_d_internal"],
+            num_heads=config["method_settings"]["pruner_num_heads"],
+            merge_ratio=config["method_settings"]["merge_ratio"]
+        ).to(device=device)
+    else:
+        token_merger = LearnableTokenMerger(
+            d_model=config["backbone_settings"]["mllm_settings"]["vision_dim"],
+            num_heads=config["method_settings"]["pruner_num_heads"],
+            merge_ratio=config["method_settings"]["merge_ratio"]
+        ).to(device=device)
+
+    # 2. Layer-Specific Pruners
+    logger.info("创建Layer-Specific Pruners...")
+    layer_pruners = LayerSpecificPruner(
+        d_model=config["backbone_settings"]["mllm_settings"]["hidden_dim"],
+        d_text=config["backbone_settings"]["mllm_settings"]["hidden_dim"],
+        layer_indices=config["method_settings"]["pruning_layers"],
+        d_internal=config["method_settings"]["pruner_d_internal"],
+        num_heads=config["method_settings"]["pruner_num_heads"]
+    ).to(device=device)
+
+    # 3. Discriminator
+    logger.info("创建Discriminator...")
+    discriminator = Discriminator(
+        d_model=config["backbone_settings"]["mllm_settings"]["hidden_dim"],
+        num_layers=config["method_settings"]["disc_num_layers"],
+        d_d=config["method_settings"]["disc_d_d"],
+        dropout=config["method_settings"]["disc_dropout"],
+        use_layer_norm=True,
+        use_spectral_norm=config["method_settings"]["disc_use_spectral_norm"]
+    ).to(device=device)
+
+    # ==================== 注册模型 ====================
+
+    trainer.register_model("token_merger", token_merger)
+    trainer.register_model("layer_pruners", layer_pruners)
+    trainer.register_model("discriminator", discriminator)
+    trainer.register_model("backbone", backbone)
+
+    # ==================== 添加参数组 ====================
+    # Generator = Token Merger + Layer Pruners（统一优化）
+
+    generator_params = list(token_merger.parameters()) + list(layer_pruners.parameters())
+    trainer.add_param_group("generator", generator_params)
+    trainer.add_param_group("discriminator", list(discriminator.parameters()))
+
+    # ==================== 创建优化器 ====================
+
+    trainer.setup_optimizers()
+
+    # ==================== 注册训练和评估函数 ====================
+
+    trainer.register_train_step(train_step)
+    trainer.register_eval_step(eval_step)
+
+    # ==================== 执行训练 ====================
+
+    logger.info("开始训练...")
+    logger.info(f"Token Merger类型: {merger_type}")
+    logger.info(f"Merge Ratio: {config['method_settings']['merge_ratio']}")
+    logger.info(f"Pruning Layers: {config['method_settings']['pruning_layers']}")
+    logger.info(f"Temperature: {config['method_settings']['temperature']} → {config['method_settings']['temperature_min']}")
+
+    result = trainer.run()
+
+    return result
+
+
+# ===================== 主函数 =====================
+
+def main():
+    """主函数"""
+    # 加载配置
+    config = load_config(override_file="configs/vision_token_pruning.yaml")
+    logger = config["logger"]
+    
+    from engine.managers.loader import load_manager
+    
+    logger.info("=" * 60)
+    logger.info("Vision Token Pruning with GAN")
+    logger.info("=" * 60)
+    
+    # 创建Manager
+    manager = load_manager(
+        config=config,
+        preload_fn=preload_fn,
+        run_fn=run_fn,
+        task_generator_fn=None,  # 单任务模式
+        result_handler_fn=None
+    )
+    
+    # 启动训练
+    manager.start()
+    manager.wait()
+    
+    # 获取结果摘要
+    summary = manager.get_summary()
+    logger.info("=" * 60)
+    logger.info("训练完成!")
+    logger.info(f"总任务数: {summary['total_tasks']}")
+    logger.info(f"已完成: {summary['completed']}")
+    logger.info(f"失败: {summary['failed']}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
