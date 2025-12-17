@@ -5,7 +5,7 @@
 
 from .models.generator import Generator
 from .models.discriminator import Discriminator
-from .models.token_merger import LearnableTokenMerger, LearnableTokenMergerV2
+from .models.token_merger import LearnableTokenMerger, LearnableTokenMergerV2, LearnableTokenMergerV3
 from .models.layer_pruner import LayerSpecificPruner, VisionPrunerHead, VisionPrunerHeadSimple
 from .training import train_step
 from .evaluation import eval_step
@@ -32,6 +32,7 @@ __all__ = [
     'Discriminator',
     'LearnableTokenMerger',
     'LearnableTokenMergerV2',
+    'LearnableTokenMergerV3',
     'LayerSpecificPruner',
     'VisionPrunerHead',
     'VisionPrunerHeadSimple',

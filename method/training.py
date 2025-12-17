@@ -109,8 +109,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # 1.2 Token Merge（可训练）
         token_merger.train()
-        # 根据merger_type决定是否传入question_embeddings
-        if config.method_settings.merger_type == "question_aware":
+        # V2和V3都需要question_embeddings，V1不需要
+        if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
             merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
         else:
             merge_result = token_merger(vision_features_raw, use_gumbel=True)

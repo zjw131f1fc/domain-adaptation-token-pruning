@@ -100,7 +100,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 question_embeddings_for_merger = original_embeddings[:, v_end+1:, :]
 
                 # Token Merge
-                if config.method_settings.merger_type == "question_aware":
+                if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
                     merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=False)
                 else:
                     merge_result = token_merger(vision_features_raw, use_gumbel=False)

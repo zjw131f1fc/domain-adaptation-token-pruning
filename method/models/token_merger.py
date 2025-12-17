@@ -256,3 +256,162 @@ class LearnableTokenMergerV2(nn.Module):
     def set_temperature(self, temperature: float):
         """设置temperature"""
         self.temperature = temperature
+
+
+class LearnableTokenMergerV3(nn.Module):
+    """固定输出M个tokens的可学习池化Merger（无top-k采样）
+
+    核心改进：
+    1. 预定义M个可学习查询向量（learnable pooling slots）
+    2. Question-aware：用问题嵌入调制这些查询
+    3. Cross-attention池化：查询关注所有vision tokens
+    4. 输出固定M个tokens，全程可导，无需Gumbel/top-k
+
+    优势：
+    - 训练/推理行为完全一致（无随机性）
+    - 梯度流畅通（无top-k断点）
+    - 输出维度固定，下游兼容性好
+
+    参数:
+        d_vision: vision特征维度（1024 for CLIP ViT-L/14）
+        d_text: text embedding维度（4096 for LLaMA-7B）
+        d_internal: 内部处理维度（建议256-512）
+        num_heads: 多头注意力头数
+        merge_ratio: 保留比例（用于计算M）
+        use_question: 是否使用question调制查询向量
+    """
+
+    def __init__(
+        self,
+        d_vision: int = 1024,
+        d_text: int = 4096,
+        d_internal: int = 512,
+        num_heads: int = 8,
+        merge_ratio: float = 0.5,
+        use_question: bool = True
+    ):
+        super().__init__()
+        self.d_vision = d_vision
+        self.d_internal = d_internal
+        self.merge_ratio = merge_ratio
+        self.use_question = use_question
+        self.num_heads = num_heads
+
+        # 假设N=576（CLIP ViT-L/14输出）
+        # 动态计算M（在forward中根据实际N计算）
+        self.M = None  # 在第一次forward时确定
+
+        # === 1. 基准查询向量（M个可学习槽位） ===
+        # 延迟初始化，在第一次forward时根据N*merge_ratio确定
+        self.register_buffer('pool_queries', None)  # 将在forward中初始化为 (M, d_internal)
+
+        # === 2. Question调制器（将question信息融入查询） ===
+        if self.use_question:
+            self.text_proj = nn.Linear(d_text, d_internal)
+            # Question条件化：生成查询的偏置/调制
+            self.query_modulator = nn.Sequential(
+                nn.Linear(d_internal, d_internal),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(d_internal, d_internal)
+            )
+
+        # === 3. Vision投影 ===
+        self.vision_proj = nn.Linear(d_vision, d_internal)
+
+        # === 4. Cross-Attention：查询关注所有vision tokens ===
+        self.pool_attention = nn.MultiheadAttention(
+            embed_dim=d_internal,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+
+        # === 5. 输出投影（回到vision维度） ===
+        self.output_proj = nn.Linear(d_internal, d_vision)
+
+        # === 6. Temperature（可选，用于控制attention的锐度） ===
+        self.temperature = 1.0
+
+    def _init_pool_queries(self, N: int, device: torch.device):
+        """初始化池化查询向量（第一次forward时调用）"""
+        if self.M is None:
+            self.M = max(1, int(N * self.merge_ratio))
+            # 初始化为标准正态分布
+            pool_queries = torch.randn(self.M, self.d_internal, device=device)
+            pool_queries = pool_queries / math.sqrt(self.d_internal)  # Xavier初始化
+            self.register_buffer('pool_queries', pool_queries)
+
+    def forward(
+        self,
+        vision_features: torch.Tensor,
+        question_embeddings: Optional[torch.Tensor] = None,
+        use_gumbel: bool = False  # 保留接口兼容性，但不使用
+    ) -> Dict[str, torch.Tensor]:
+        """前向传播
+
+        参数:
+            vision_features: (batch, N, d_vision) - CLIP输出
+            question_embeddings: (batch, n_text, d_text) - 可选，用于question-aware
+            use_gumbel: bool - 保留兼容性，但此版本不使用
+
+        返回:
+            {
+                'merged_features': (batch, M, d_vision) - 固定M个tokens
+                'merge_indices': None - 无显式索引（全软池化）
+                'merge_weights': (batch, M, N) - 池化权重矩阵
+                'importance_logits': None - 无显式重要性分数
+            }
+        """
+        batch, N, _ = vision_features.shape
+        device = vision_features.device
+
+        # === Step 1: 初始化池化查询（第一次调用） ===
+        if self.pool_queries is None:
+            self._init_pool_queries(N, device)
+
+        # === Step 2: 准备查询向量 ===
+        # 基准查询 (M, d_internal) -> (batch, M, d_internal)
+        queries = self.pool_queries.unsqueeze(0).expand(batch, -1, -1)
+
+        # Question调制（如果启用）
+        if self.use_question and question_embeddings is not None:
+            # 投影question到内部维度
+            Q_text = self.text_proj(question_embeddings)  # (batch, n_text, d_internal)
+
+            # 均值池化：提取全局question表示
+            Q_global = Q_text.mean(dim=1)  # (batch, d_internal)
+
+            # 生成查询调制向量
+            query_bias = self.query_modulator(Q_global)  # (batch, d_internal)
+
+            # 调制查询：queries = base_queries + question_bias
+            queries = queries + query_bias.unsqueeze(1)  # (batch, M, d_internal)
+
+        # === Step 3: 投影vision tokens ===
+        V_proj = self.vision_proj(vision_features)  # (batch, N, d_internal)
+
+        # === Step 4: Cross-Attention池化 ===
+        # queries关注所有vision tokens
+        pooled, attn_weights = self.pool_attention(
+            query=queries,        # (batch, M, d_internal) - 作为query
+            key=V_proj,           # (batch, N, d_internal) - vision作为key
+            value=V_proj,         # (batch, N, d_internal) - vision作为value
+            need_weights=True,
+            average_attn_weights=True  # 平均所有头的权重
+        )  # pooled: (batch, M, d_internal), attn_weights: (batch, M, N)
+
+        # === Step 5: 投影回vision维度 ===
+        merged_features = self.output_proj(pooled)  # (batch, M, d_vision)
+
+        # === Step 6: 返回结果（兼容原有接口） ===
+        return {
+            'merged_features': merged_features,
+            'merge_indices': None,  # 无显式索引（软池化）
+            'merge_weights': attn_weights,  # (batch, M, N) - 权重矩阵
+            'importance_logits': None  # 无显式重要性分数
+        }
+
+    def set_temperature(self, temperature: float):
+        """设置temperature（保留接口兼容性）"""
+        self.temperature = temperature

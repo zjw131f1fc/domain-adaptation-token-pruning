@@ -23,7 +23,7 @@ trainer_settings:  # 训练框架设置
         lr: "1e-04"  # 默认值，会被Optuna覆盖
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
-        lr: "1e-03"  # 默认1e-3，比layer_pruners高10倍
+        lr: "1e-04"  # 默认1e-3，比layer_pruners高10倍
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: "1e-04"  # 默认1e-4
@@ -39,7 +39,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [4,5,6]  # 更新可用GPU列表
+  available_gpus: [3,5,6]  # 更新可用GPU列表
   gpus_per_subtask: 4  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
@@ -148,7 +148,7 @@ backbone_settings:  # 多模态大模型骨架配置
 
 method_settings:
   # ==================== Token Merger配置（新增） ====================
-  merger_type: "simple"  # "simple" 或 "question_aware"（使用V2版本）
+  merger_type: "fixed_pooling"  # "simple" / "question_aware" / "fixed_pooling" (推荐V3)
   merge_ratio: 1.0  # 保留比例
 
   # ==================== Layer-wise Pruner配置（新增） ====================
