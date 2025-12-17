@@ -3,7 +3,7 @@
 global_settings:
   seed: 42
   device: "cuda"
-  dtype: "half"  # 训练数据类型: "half" (float16) 或 "float" (float32)
+  dtype: "float"  # 训练数据类型: "half" (float16) 或 "float" (float32)
   pytorch_cuda_alloc_conf: "expandable_segments:True"
   dataset_cache_dir: "/data/users/zjw/dataset_cache"
   hf_cache_dir: "/data/users/zjw/huggingface_cache"
@@ -18,25 +18,28 @@ trainer_settings:  # 训练框架设置
     epochs: 2  # 2个epochs
     batch_size: 8  # batch_size=8
     optimizers:
-      generator:  # Generator优化器（Token Merger + Layer Pruners）
-        type: "adam"
-        lr: "1e-04"  # 默认值，会被Optuna覆盖
       discriminator:  # Discriminator优化器
         type: "adam"
         lr: "1e-04"  # 默认值，会被Optuna覆盖
+      token_merger:  # Token Merger优化器（可以设置更高的学习率）
+        type: "adam"
+        lr: "1e-03"  # 默认1e-3，比layer_pruners高10倍
+      layer_pruners:  # Layer Pruners优化器
+        type: "adam"
+        lr: "1e-04"  # 默认1e-4
     print_loss_every_batches: 5  # 减少日志打印
     eval_every_batches: 10  # 每25个batch评估一次
     eval_max_samples: 15  # 每次评估50个样本
     save_every_batches: 0  # Optuna搜索时禁用保存（加速）
     save_every_epochs: 0  # Optuna搜索时禁用保存
     optuna_eval_interval_batches: 25  # Optuna评估间隔：每25个batch报告一次
-    grad_clip_max_norm: 1.0  # 梯度裁剪：1.0更保守，防止GAN训练不稳定
+    grad_clip_max_norm: null  # 梯度裁剪：null=关闭，1.0=启用
 
 manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [1,3,5,7]  # 更新可用GPU列表
+  available_gpus: [4,5,6]  # 更新可用GPU列表
   gpus_per_subtask: 4  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
@@ -56,7 +59,12 @@ search_settings:
     multivariate: true  # 考虑参数间相关性
   params:
     # 学习率（对数搜索，跨数量级）
-    trainer_settings.dl_settings.optimizers.generator.lr:
+    trainer_settings.dl_settings.optimizers.token_merger.lr:
+      type: "float"
+      low: 1.0e-5
+      high: 1.0e-2
+      log: true
+    trainer_settings.dl_settings.optimizers.layer_pruners.lr:
       type: "float"
       low: 1.0e-6
       high: 1.0e-3
@@ -134,13 +142,13 @@ backbone_settings:  # 多模态大模型骨架配置
     device_map: "balanced"  # 显存分配策略（balanced/auto）
     max_text_tokens: 128  # 最大文本token数
     max_vision_tokens: 1600  # 最大视觉token数（减少降低显存占用）
-    image_max_size: 800  # 图像最大尺寸（减少降低vision token数）
+    image_max_size: 1000  # 图像最大尺寸（减少降低vision token数）
     vision_dim: 1024  # CLIP Vision Encoder输出维度（ViT-L/14）
     hidden_dim: 4096  # LLaMA Hidden State维度（7B模型）
 
 method_settings:
   # ==================== Token Merger配置（新增） ====================
-  merger_type: "question_aware"  # "simple" 或 "question_aware"（使用V2版本）
+  merger_type: "simple"  # "simple" 或 "question_aware"（使用V2版本）
   merge_ratio: 1.0  # 保留比例
 
   # ==================== Layer-wise Pruner配置（新增） ====================
@@ -180,4 +188,4 @@ method_settings:
   task_loss_weight: 1 # 100.0 # 25.0  # 任务损失权重
 
 evaluation_settings:  # 评估配置
-  eval_mode: ["origin", "soft", "hard"]
+  eval_mode: ["origin", "merge_only", "soft", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝

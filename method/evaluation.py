@@ -19,8 +19,9 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
     评估模式：
     1. "origin" - Baseline（无剪枝）
-    2. "soft" - Soft pruning（软mask，continuous 0-1）
-    3. "hard" - Hard pruning（硬mask，binary 0/1）
+    2. "merge_only" - 只Token Merge，不做Layer Pruning
+    3. "soft" - Soft pruning（软mask，continuous 0-1）
+    4. "hard" - Hard pruning（硬mask，binary 0/1）
 
     参数:
         batch: 数据batch
@@ -45,6 +46,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
     results = {
         "accuracy_baseline": 0.0,
+        "accuracy_merge_only": 0.0,
         "accuracy_soft": 0.0,
         "accuracy_hard": 0.0,
         "keep_ratio_merge": 0.0,
@@ -76,7 +78,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 results["accuracy_baseline"] += judge_result["accuracy"]
 
         # ============ Soft/Hard Pruning评估 ============
-        if ("soft" in eval_modes or "hard" in eval_modes):
+        if ("merge_only" in eval_modes or "soft" in eval_modes or "hard" in eval_modes):
             valid_samples += 1
 
             # --- Phase 1: Token Merge ---
@@ -126,6 +128,17 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 results["avg_original_tokens"] += float(num_original_tokens)
                 results["avg_merged_tokens"] += float(num_merged_tokens)
                 results["keep_ratio_merge"] += float(num_merged_tokens) / float(num_original_tokens)
+
+            # --- Phase 1.5: Merge Only（只merge，不pruning） ---
+            if "merge_only" in eval_modes and judge_fn:
+                with torch.no_grad():
+                    pred_merge_only = backbone.generate(
+                        embeddings=embeddings_merged,
+                        attention_mask=new_attention_mask,
+                        max_new_tokens=20
+                    )
+                judge_result = judge_fn(pred_merge_only, ref_answer, sample)
+                results["accuracy_merge_only"] += judge_result["accuracy"]
 
             # --- Phase 2: Soft Pruning（带layer pruners） ---
             if "soft" in eval_modes and judge_fn:
@@ -194,6 +207,8 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
             results["accuracy_baseline"] /= total_samples
 
     if valid_samples > 0:
+        if "merge_only" in eval_modes:
+            results["accuracy_merge_only"] /= valid_samples
         if "soft" in eval_modes:
             results["accuracy_soft"] /= valid_samples
         if "hard" in eval_modes:

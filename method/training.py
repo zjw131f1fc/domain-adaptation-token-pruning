@@ -62,7 +62,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     update_temperature_for_all(token_merger, layer_pruners, config, current_step, total_steps)
 
     # === 初始化损失累加器 ===
-    generator_losses = defaultdict(lambda: torch.tensor(0.0, device=device))  # Generator = Merger + Pruners
+    # 拆分为3个独立损失组（支持不同学习率）
+    token_merger_losses = defaultdict(lambda: torch.tensor(0.0, device=device))
+    layer_pruners_losses = defaultdict(lambda: torch.tensor(0.0, device=device))
     disc_losses = defaultdict(lambda: torch.tensor(0.0, device=device))
     stats = defaultdict(float)
 
@@ -207,22 +209,31 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # ========== Phase 4: Loss Computation ==========
 
-        # --- Generator Loss (Merger + Pruners统一优化) ---
+        # --- Token Merger Loss ---
+        # Merger只需要优化adv_loss和task_loss（保证合并后的tokens质量）
 
         # 1. Adversarial Loss: 骗过discriminator
-        generator_losses["adv_loss"] = generator_losses["adv_loss"] + F.binary_cross_entropy(
+        adv_loss = F.binary_cross_entropy(
             fake_pred_for_gen,
             torch.ones_like(fake_pred_for_gen),
             reduction='mean'
         )
+        token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] + adv_loss
 
         # 2. Task Loss: 保持任务性能
-        generator_losses["task_loss"] = generator_losses["task_loss"] + compute_task_loss(
+        task_loss = compute_task_loss(
             result_fake['logits'],
             answer_pos,
             sample["answer"],
             backbone.processor
         )
+        token_merger_losses["task_loss"] = token_merger_losses["task_loss"] + task_loss
+
+        # --- Layer Pruners Loss ---
+        # Pruners需要优化adv_loss、task_loss、以及sparsity相关的loss
+
+        layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] + adv_loss
+        layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] + task_loss
 
         # 3. Sparsity Loss: 控制每层剪枝的token保留率
         # pruning_masks: list of (batch, n_vision) 每层的soft_mask
@@ -268,7 +279,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             # 归一化（除以权重总和）
             weight_sum = sum(range(1, num_layers + 1))  # 1 + 2 + ... + n
             sparsity_constraint_loss = sparsity_constraint_loss / weight_sum
-            generator_losses["sparsity_loss"] = generator_losses["sparsity_loss"] + sparsity_constraint_loss
+            layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] + sparsity_constraint_loss
 
             # === Sparsity Loss 2: Token总数惩罚（弱惩罚，鼓励减少token） ===
             token_count_loss = torch.tensor(0.0, device=device)
@@ -285,7 +296,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             n_vision = pruning_masks[0].shape[1]  # 例如 460
             token_count_loss = token_count_loss / n_vision
 
-            generator_losses["token_count_loss"] = generator_losses["token_count_loss"] + token_count_loss
+            layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] + token_count_loss
 
             # 统计信息
             avg_kept_ratio = sum(m.mean().item() for m in pruning_masks) / len(pruning_masks)
@@ -323,8 +334,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     if valid_samples > 0:
         # Normalize (非 inplace 操作)
-        for k in generator_losses:
-            generator_losses[k] = generator_losses[k] / valid_samples
+        for k in token_merger_losses:
+            token_merger_losses[k] = token_merger_losses[k] / valid_samples
+        for k in layer_pruners_losses:
+            layer_pruners_losses[k] = layer_pruners_losses[k] / valid_samples
         for k in disc_losses:
             disc_losses[k] = disc_losses[k] / valid_samples
         for k in stats:
@@ -336,23 +349,31 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         sparsity_weight = config['method_settings'].get('sparsity_weight')
         token_count_weight = config['method_settings'].get('token_count_loss_weight')
 
-        generator_losses["adv_loss"] = generator_losses["adv_loss"] * adv_weight
-        generator_losses["task_loss"] = generator_losses["task_loss"] * task_weight
-        if "sparsity_loss" in generator_losses:
-            generator_losses["sparsity_loss"] = generator_losses["sparsity_loss"] * sparsity_weight
-        if "token_count_loss" in generator_losses:
-            generator_losses["token_count_loss"] = generator_losses["token_count_loss"] * token_count_weight
+        # Token Merger权重
+        token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] * adv_weight
+        token_merger_losses["task_loss"] = token_merger_losses["task_loss"] * task_weight
+
+        # Layer Pruners权重
+        layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] * adv_weight
+        layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] * task_weight
+        if "sparsity_loss" in layer_pruners_losses:
+            layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] * sparsity_weight
+        if "token_count_loss" in layer_pruners_losses:
+            layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] * token_count_weight
 
     # 确保tensor在正确设备上
     target_device = next(token_merger.parameters()).device
-    for losses_dict in [generator_losses, disc_losses]:
+    for losses_dict in [token_merger_losses, layer_pruners_losses, disc_losses]:
         for k in losses_dict:
             if isinstance(losses_dict[k], torch.Tensor):
                 losses_dict[k] = losses_dict[k].to(target_device)
 
     torch.cuda.empty_cache()
 
+    # 返回3个独立的优化器组，按顺序: discriminator → token_merger → layer_pruners
+    # 这样discriminator先释放计算图，减少显存峰值
     return {
-        "generator": dict(generator_losses),      # Merger + Pruners 统一优化
-        "discriminator": dict(disc_losses)
+        "discriminator": dict(disc_losses),      # 第1个：独立计算图，先backward先释放
+        "token_merger": dict(token_merger_losses),  # 第2个：共享计算图
+        "layer_pruners": dict(layer_pruners_losses) # 第3个：共享计算图，最后释放
     }
