@@ -310,7 +310,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                                                     attention_mask=attention_mask,
                                                     max_new_tokens=max_new_tokens,
                                                     do_sample=do_sample, **generation_kwargs)
-                input_length = embeddings.shape[1]
+                input_length = 0
             else:
                 raise ValueError("必须提供 (image, question) 或 (embeddings, attention_mask)")
 
