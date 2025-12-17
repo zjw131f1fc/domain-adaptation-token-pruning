@@ -43,12 +43,13 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     """
     config = info["config"]
     backbone = info["models"]["backbone"]
-    token_merger = info["models"]["token_merger"]
+    token_merger = info["models"].get("token_merger", None)  # 可能为None
     layer_pruners = info["models"]["layer_pruners"]
     discriminator = info["models"]["discriminator"]
     current_step = info["global_batch_index"]
 
     # === 配置参数 ===
+    enable_token_merger = config["method_settings"].get("enable_token_merger", True)
     disc_target_layers = config["method_settings"]["disc_target_layers"]
     disc_reinit_prob = config["method_settings"]["disc_reinit_prob"]
     total_steps = config["trainer_settings"]["dl_settings"]["epochs"] * info.get("total_planned_batches", 1000)
@@ -59,7 +60,24 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         discriminator._init_weights()
 
     # === Temperature Annealing ===
-    update_temperature_for_all(token_merger, layer_pruners, config, current_step, total_steps)
+    # 只在token_merger存在且启用时更新其temperature
+    if token_merger is not None and enable_token_merger:
+        update_temperature_for_all(token_merger, layer_pruners, config, current_step, total_steps)
+    else:
+        # 只更新layer_pruners的temperature
+        temperature = config['method_settings'].get('temperature', 1.0)
+        temperature_min = config['method_settings'].get('temperature_min', 0.1)
+        anneal_rate = config['method_settings'].get('temperature_anneal_rate', 0.5)
+
+        progress = current_step / total_steps
+        if progress < anneal_rate:
+            current_temp = temperature - (progress / anneal_rate) * (temperature - temperature_min)
+        else:
+            current_temp = temperature_min
+
+        for layer_idx in layer_pruners.get_all_layers():
+            pruner = layer_pruners.get_pruner(layer_idx)
+            pruner.set_temperature(current_temp)
 
     # === 初始化损失累加器 ===
     # 拆分为3个独立损失组（支持不同学习率）
@@ -76,21 +94,18 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # ========== Phase 1: Token Merge（LLM输入前） ==========
 
-        # 1.1 获取原始embeddings
+        # 1.1 获取原始embeddings和raw vision features
         with torch.no_grad():
             emb_info = backbone.preprocess(sample["image"], sample["question"], sample["answer"])
             original_embeddings = emb_info['embeddings']  # (1, seq_len, 4096)
             original_vision_pos = emb_info['vision_token_positions']  # (start, end)
             answer_pos = emb_info['answer_token_positions']
 
-            # 提取vision features（投影前，来自CLIP）
-            # if hasattr(backbone.model, 'vision_tower'):
-            #     pixel_values = backbone.processor(images=sample["image"], return_tensors="pt")['pixel_values'].to(device)
-            #     vision_features_raw = backbone.model.vision_tower(pixel_values)  # (1, 576, 1024)
-            # else:
-                # Fallback: 从embeddings中提取（已投影到4096维）
-            v_start, v_end = original_vision_pos
-            vision_features_raw = original_embeddings[:, v_start:v_end+1, :]
+            # 获取未投影的vision features (1024维，CLIP输出)
+            vision_features_raw = emb_info['raw_vision_features']  # (1, 576, 1024)
+
+            if vision_features_raw is None:
+                raise ValueError("backbone未返回raw_vision_features，请检查backbone实现")
 
             # 提取question embeddings（用于question-aware merger和pruner）
             # 结构: [0:v_start] = "USER: "
@@ -98,6 +113,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             #       [v_end+1:answer_start] = "\n{question}\nASSISTANT: "
             #       [answer_start:] = "{answer}"
             # 我们只需要提取真正的question部分: [v_end+1:answer_start]
+            v_start, v_end = original_vision_pos
             if answer_pos[0] < 0:
                 # 负索引转正索引
                 answer_start_abs = original_embeddings.shape[1] + answer_pos[0]
@@ -107,27 +123,38 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             # 提取question部分（只包含"\n{question}\nASSISTANT: "）
             question_embeddings_for_merger = original_embeddings[:, v_end+1:answer_start_abs, :]
 
-        # 1.2 Token Merge（可训练）
-        token_merger.train()
-        # V2和V3都需要question_embeddings，V1不需要
-        if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
-            merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
-        else:
-            merge_result = token_merger(vision_features_raw, use_gumbel=True)
-        merged_vision = merge_result['merged_features']  # (1, M, 1024) 或 (1, M, 4096)
-        # Note: merge_result['importance_logits'] 可用于额外的 merge sparsity loss，但当前未启用
+        # 1.2 Token Merge（可训练，在1024维空间操作）
+        if enable_token_merger and token_merger is not None:
+            token_merger.train()
+            # V2和V3都需要question_embeddings，V1不需要
+            if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
+                merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
+            else:
+                merge_result = token_merger(vision_features_raw, use_gumbel=True)
+            merged_vision = merge_result['merged_features']  # (1, M, 1024)
+            # Note: merge_result['importance_logits'] 可用于额外的 merge sparsity loss，但当前未启用
 
-        # 1.3 投影到LLM维度（如果merge输出是1024维）
-        if merged_vision.shape[-1] != original_embeddings.shape[-1]:
+            # 1.3 投影到LLM维度 (1024 → 4096)
+            # Token merge输出是1024维，需要投影到4096维
             merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (1, M, 4096)
 
-        # 1.4 替换vision部分
-        embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
-            original_embeddings,
-            original_vision_pos,
-            merged_vision,
-            emb_info['attention_mask']
-        )
+            # 1.4 替换vision部分
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
+                original_embeddings,
+                original_vision_pos,
+                merged_vision,
+                emb_info['attention_mask']
+            )
+        else:
+            # 禁用token merger，直接使用原始vision features
+            # 需要先投影到LLM维度
+            vision_features_projected = backbone.model.multi_modal_projector(vision_features_raw)  # (1, 576, 4096)
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
+                original_embeddings,
+                original_vision_pos,
+                vision_features_projected,
+                emb_info['attention_mask']
+            )
 
         # 1.5 提取question embeddings（用于layer pruners的cross-attention）
         # 结构: [0:new_vision_pos[0]] = "USER: "
@@ -211,27 +238,43 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # --- Token Merger Loss ---
         # Merger只需要优化adv_loss和task_loss（保证合并后的tokens质量）
+        # 只有在启用token merger时才计算相关loss
+        if enable_token_merger:
+            # 1. Adversarial Loss: 骗过discriminator
+            adv_loss = F.binary_cross_entropy(
+                fake_pred_for_gen,
+                torch.ones_like(fake_pred_for_gen),
+                reduction='mean'
+            )
+            token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] + adv_loss
 
-        # 1. Adversarial Loss: 骗过discriminator
+            # 2. Task Loss: 保持任务性能
+            task_loss = compute_task_loss(
+                result_fake['logits'],
+                answer_pos,
+                sample["answer"],
+                backbone.processor
+            )
+            token_merger_losses["task_loss"] = token_merger_losses["task_loss"] + task_loss
+
+        # --- Layer Pruners Loss ---
+        # Pruners需要优化adv_loss、task_loss、以及sparsity相关的loss
+
+        # 如果未启用token merger，layer pruners也需要计算task loss
+        if not enable_token_merger:
+            task_loss = compute_task_loss(
+                result_fake['logits'],
+                answer_pos,
+                sample["answer"],
+                backbone.processor
+            )
+
+        # Adversarial loss (总是需要)
         adv_loss = F.binary_cross_entropy(
             fake_pred_for_gen,
             torch.ones_like(fake_pred_for_gen),
             reduction='mean'
         )
-        token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] + adv_loss
-
-        # 2. Task Loss: 保持任务性能
-        task_loss = compute_task_loss(
-            result_fake['logits'],
-            answer_pos,
-            sample["answer"],
-            backbone.processor
-        )
-        token_merger_losses["task_loss"] = token_merger_losses["task_loss"] + task_loss
-
-        # --- Layer Pruners Loss ---
-        # Pruners需要优化adv_loss、task_loss、以及sparsity相关的loss
-
         layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] + adv_loss
         layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] + task_loss
 
@@ -326,7 +369,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         )
 
         # 清理
-        del merged_vision, embeddings_merged, result_fake, result_real
+        del embeddings_merged, result_fake, result_real
         del fake_hidden_list, real_hidden_list, fake_hidden_detached
         del fake_pred_for_gen, real_pred, fake_pred_for_disc, pruning_masks
 
@@ -349,9 +392,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         sparsity_weight = config['method_settings'].get('sparsity_weight')
         token_count_weight = config['method_settings'].get('token_count_loss_weight')
 
-        # Token Merger权重
-        token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] * adv_weight
-        token_merger_losses["task_loss"] = token_merger_losses["task_loss"] * task_weight
+        # Token Merger权重（只有在启用时才应用）
+        if enable_token_merger:
+            token_merger_losses["adv_loss"] = token_merger_losses["adv_loss"] * adv_weight
+            token_merger_losses["task_loss"] = token_merger_losses["task_loss"] * task_weight
 
         # Layer Pruners权重
         layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] * adv_weight
@@ -362,7 +406,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] * token_count_weight
 
     # 确保tensor在正确设备上
-    target_device = next(token_merger.parameters()).device
+    # 使用layer_pruners而不是token_merger来获取设备（因为token_merger可能为None）
+    target_device = next(layer_pruners.parameters()).device
     for losses_dict in [token_merger_losses, layer_pruners_losses, disc_losses]:
         for k in losses_dict:
             if isinstance(losses_dict[k], torch.Tensor):

@@ -71,9 +71,10 @@ class LayerSpecificPruner(nn.Module):
 class VisionPrunerHead(nn.Module):
     """单层Vision Token剪枝头
 
-    架构：Cross-Attention + MLP
+    架构：Cross-Attention + MLP + 多层LayerNorm
     - Vision tokens关注question embeddings（cross-attention）
     - 基于融合后的表示预测每个vision token的保留/丢弃决策
+    - 多层归一化保证训练稳定性
 
     参数:
         d_vision: vision token的hidden state维度
@@ -92,11 +93,19 @@ class VisionPrunerHead(nn.Module):
         super().__init__()
         self.d_internal = d_internal
 
-        # === Feature投影 ===
+        # === 1. 输入归一化层 ===
+        self.vision_input_norm = nn.LayerNorm(d_vision)
+        self.text_input_norm = nn.LayerNorm(d_text)
+
+        # === 2. Feature投影 ===
         self.vision_proj = nn.Linear(d_vision, d_internal)
         self.text_proj = nn.Linear(d_text, d_internal)
 
-        # === Cross-Attention: vision tokens关注question ===
+        # === 3. 投影后归一化 ===
+        self.vision_proj_norm = nn.LayerNorm(d_internal)
+        self.text_proj_norm = nn.LayerNorm(d_internal)
+
+        # === 4. Cross-Attention: vision tokens关注question ===
         # 这使得剪枝决策能够基于问题内容
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_internal,
@@ -105,15 +114,21 @@ class VisionPrunerHead(nn.Module):
             batch_first=True
         )
 
-        # === Mask预测头 ===
+        # === 5. Attention后归一化 ===
+        self.post_attn_norm = nn.LayerNorm(d_internal)
+
+        # === 6. Mask预测头 ===
         # 输入: cross-attention后的vision features
         # 输出: 每个token的keep/drop logit
-        self.mask_predictor = nn.Sequential(
-            nn.Linear(d_internal, d_internal // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_internal // 2, 1)
-        )
+        self.mask_fc1 = nn.Linear(d_internal, d_internal // 2)
+        self.mask_act = nn.GELU()
+        self.mask_dropout = nn.Dropout(0.1)
+        self.mask_fc2 = nn.Linear(d_internal // 2, 1)
+
+        # 关键：初始化最后一层bias为正值，让初始输出倾向于"保留"
+        # sigmoid(2.0) ≈ 0.88，即默认保留 88% 的 tokens
+        nn.init.zeros_(self.mask_fc2.weight)
+        nn.init.constant_(self.mask_fc2.bias, 2.0)
 
         # Temperature（外部动态更新）
         self.temperature = 1.0
@@ -139,12 +154,19 @@ class VisionPrunerHead(nn.Module):
             self.to(llm_device)
         if question_embeddings.device != llm_device:
             question_embeddings = question_embeddings.to(llm_device)
-        
-        # === Step 1: 投影到内部维度 ===
-        V = self.vision_proj(vision_hidden)         # (batch, n_vision, d_internal)
-        Q = self.text_proj(question_embeddings)     # (batch, n_text, d_internal)
 
-        # === Step 2: Cross-Attention - vision关注question ===
+        # === Step 1: 输入归一化 ===
+        vision_normed = self.vision_input_norm(vision_hidden)  # (batch, n_vision, d_vision)
+        text_normed = self.text_input_norm(question_embeddings)  # (batch, n_text, d_text)
+
+        # === Step 2: 投影到内部维度 + 归一化 ===
+        V = self.vision_proj(vision_normed)  # (batch, n_vision, d_internal)
+        V = self.vision_proj_norm(V)
+
+        Q = self.text_proj(text_normed)  # (batch, n_text, d_internal)
+        Q = self.text_proj_norm(Q)
+
+        # === Step 3: Cross-Attention - vision关注question ===
         # query=V (vision tokens), key=Q, value=Q (question)
         attended_V, attn_weights = self.cross_attn(
             query=V,
@@ -153,10 +175,16 @@ class VisionPrunerHead(nn.Module):
             need_weights=False
         )  # (batch, n_vision, d_internal)
 
-        # === Step 3: 预测keep/drop logits ===
-        keep_logits = self.mask_predictor(attended_V).squeeze(-1)  # (batch, n_vision)
+        # === Step 4: Post-Attention归一化 + 残差连接 ===
+        attended_V = self.post_attn_norm(V + attended_V)  # 残差 + 归一化
 
-        # === Step 4: Gumbel-Softmax（可微分的二分类） ===
+        # === Step 5: 预测keep/drop logits ===
+        mask_hidden = self.mask_fc1(attended_V)
+        mask_hidden = self.mask_act(mask_hidden)
+        mask_hidden = self.mask_dropout(mask_hidden)
+        keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
+
+        # === Step 6: Gumbel-Softmax（可微分的二分类） ===
         if use_gumbel and self.training:
             # 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
             stacked_logits = torch.stack([

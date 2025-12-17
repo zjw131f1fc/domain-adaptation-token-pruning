@@ -202,7 +202,7 @@ AUTO_NAME_FIELDS = [
 # 根据 backbone 名称自动设置 hidden_dim 和 vision_dim
 BACKBONE_DIM_MAP = {
     "qwen-2.5-3b": {"hidden_dim": 2048, "vision_dim": 2048},
-    "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 4096},
+    "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 1024},
 }
 
 

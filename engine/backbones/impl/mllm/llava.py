@@ -370,8 +370,21 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             
             # 1) 获取文本 token 的嵌入
             text_token_embeds = self.model.get_input_embeddings()(input_ids)  # (1, T_text, D)
-            
-            # 2) 通过 model.get_image_features 获取图像特征（已经过 vision tower + projector）
+
+            # 2) 获取raw vision features (CLIP输出，未投影，1024维)
+            # 直接调用vision_tower，不经过projector
+            if hasattr(self.model, 'vision_tower'):
+                vision_tower = self.model.vision_tower
+                if hasattr(vision_tower, 'forward'):
+                    # 调用vision_tower获取原始1024维features
+                    raw_vision_features = vision_tower(pixel_values).last_hidden_state  # (1, 576, 1024) for CLIP ViT-L/14
+                else:
+                    # Fallback: 使用get_image_features (已投影)
+                    raw_vision_features = None
+            else:
+                raw_vision_features = None
+
+            # 3) 通过 model.get_image_features 获取图像特征（已经过 vision tower + projector）
             # 返回的是 list，每个元素对应一张图像，shape 为 (num_patches, hidden_dim)
             image_features_list = self.model.get_image_features(pixel_values=pixel_values)
             # 拼接成 tensor: (batch, num_patches, hidden_dim)
@@ -432,6 +445,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                 "embeddings": full_embeddings.to(self.output_device),
                 "attention_mask": full_attention_mask.to(self.output_device),
                 "vision_token_positions": (vision_start, vision_end),
+                "raw_vision_features": raw_vision_features.to(self.output_device) if raw_vision_features is not None else None,  # 添加未投影的vision features
             }
 
             # 如果提供了 answer，计算 answer token 位置

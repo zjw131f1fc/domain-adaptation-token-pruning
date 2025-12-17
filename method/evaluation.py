@@ -33,13 +33,17 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
     """
     config = info["config"]
     backbone = info["models"]["backbone"]
-    token_merger = info["models"]["token_merger"]
+    token_merger = info["models"].get("token_merger", None)  # 可能为None
     layer_pruners = info["models"]["layer_pruners"]
     dataset_bundle = config.get("_dataset_bundle")
     judge_fn = dataset_bundle["judge"] if dataset_bundle else None
 
+    # 获取配置
+    enable_token_merger = config["method_settings"].get("enable_token_merger", True)
+
     # 设置为eval模式
-    token_merger.eval()
+    if token_merger is not None:
+        token_merger.eval()
     layer_pruners.eval()  # 评估使用确定性mask（禁用gumbel/dropout）
 
     eval_modes = config["evaluation_settings"]["eval_mode"]
@@ -87,36 +91,47 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 original_embeddings = emb_info['embeddings']
                 original_vision_pos = emb_info['vision_token_positions']
 
-                # 获取vision features（与training.py保持一致）
-                # 直接从embeddings中提取已投影的vision features
-                v_start, v_end = original_vision_pos
-                vision_features_raw = original_embeddings[:, v_start:v_end+1, :]
+                # 获取未投影的vision features (1024维，CLIP输出)
+                vision_features_raw = emb_info['raw_vision_features']  # (1, 576, 1024)
 
-                # 提取question embeddings（用于question-aware merger）
-                # 结构(answer=None): [0:v_start] = "USER: "
-                #                   [v_start:v_end+1] = vision tokens
-                #                   [v_end+1:] = "\n{question}\nASSISTANT:"
-                # 只提取真正的question部分
-                question_embeddings_for_merger = original_embeddings[:, v_end+1:, :]
+                if vision_features_raw is None:
+                    raise ValueError("backbone未返回raw_vision_features，请检查backbone实现")
 
-                # Token Merge
-                if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
-                    merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=False)
+                if enable_token_merger and token_merger is not None:
+                    # 提取question embeddings（用于question-aware merger）
+                    # 结构(answer=None): [0:v_start] = "USER: "
+                    #                   [v_start:v_end+1] = vision tokens
+                    #                   [v_end+1:] = "\n{question}\nASSISTANT:"
+                    # 只提取真正的question部分
+                    _, v_end = original_vision_pos
+                    question_embeddings_for_merger = original_embeddings[:, v_end+1:, :]
+
+                    # Token Merge (在1024维空间操作)
+                    if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
+                        merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=False)
+                    else:
+                        merge_result = token_merger(vision_features_raw, use_gumbel=False)
+                    merged_vision = merge_result['merged_features']  # (1, M, 1024)
+
+                    # 投影到LLM维度 (1024 → 4096)
+                    merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (1, M, 4096)
+
+                    # 替换vision部分
+                    embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
+                        original_embeddings,
+                        original_vision_pos,
+                        merged_vision,
+                        emb_info['attention_mask']
+                    )
                 else:
-                    merge_result = token_merger(vision_features_raw, use_gumbel=False)
-                merged_vision = merge_result['merged_features']
-
-                # 投影到LLM维度
-                if merged_vision.shape[-1] != original_embeddings.shape[-1]:
-                    merged_vision = backbone.model.multi_modal_projector(merged_vision)
-
-                # 替换vision部分
-                embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
-                    original_embeddings,
-                    original_vision_pos,
-                    merged_vision,
-                    emb_info['attention_mask']
-                )
+                    # 禁用token merger，直接使用原始vision features
+                    vision_features_projected = backbone.model.multi_modal_projector(vision_features_raw)  # (1, 576, 4096)
+                    embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
+                        original_embeddings,
+                        original_vision_pos,
+                        vision_features_projected,
+                        emb_info['attention_mask']
+                    )
 
                 # 提取question embeddings（用于layer pruners）
                 # merge后序列长度变化，只提取question部分（不包含"USER: "）
@@ -124,13 +139,14 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
                 # 统计
                 num_original_tokens = original_vision_pos[1] - original_vision_pos[0] + 1
-                num_merged_tokens = merged_vision.shape[1]
+                num_merged_tokens = new_vision_pos[1] - new_vision_pos[0] + 1
                 results["avg_original_tokens"] += float(num_original_tokens)
                 results["avg_merged_tokens"] += float(num_merged_tokens)
                 results["keep_ratio_merge"] += float(num_merged_tokens) / float(num_original_tokens)
 
             # --- Phase 1.5: Merge Only（只merge，不pruning） ---
-            if "merge_only" in eval_modes and judge_fn:
+            # 只在启用token merger时才有merge_only评估模式
+            if "merge_only" in eval_modes and judge_fn and enable_token_merger and token_merger is not None:
                 with torch.no_grad():
                     pred_merge_only = backbone.generate(
                         embeddings=embeddings_merged,
@@ -197,7 +213,10 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                     restore_fn()
 
             # 清理
-            del vision_features_raw, merged_vision, embeddings_merged
+            del vision_features_raw, embeddings_merged
+            # merged_vision 只在启用token_merger时存在
+            if enable_token_merger and token_merger is not None:
+                del merged_vision
             torch.cuda.empty_cache()
 
     # 归一化结果
@@ -207,7 +226,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
             results["accuracy_baseline"] /= total_samples
 
     if valid_samples > 0:
-        if "merge_only" in eval_modes:
+        if "merge_only" in eval_modes and enable_token_merger:
             results["accuracy_merge_only"] /= valid_samples
         if "soft" in eval_modes:
             results["accuracy_soft"] /= valid_samples
@@ -222,7 +241,11 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
     # 计算score用于Optuna优化
     if valid_samples > 0 and "hard" in eval_modes and "origin" in eval_modes:
         acc_drop = results["accuracy_baseline"] - results["accuracy_hard"]
-        raw_score = -acc_drop - 0.5 * results["keep_ratio_merge"]
+        # 当禁用token merger时，keep_ratio_merge = 1.0（无merge）
+        # 当启用时，keep_ratio_merge < 1.0（有merge）
+        # hard_keep_ratio_total 是最终的总体保留率（merge + layer pruning）
+        # 我们希望最小化accuracy下降，同时鼓励更少的token（更小的keep ratio）
+        raw_score = -acc_drop - 0.5 * results["hard_keep_ratio_total"]
 
         # 使用EMA平滑score
         persistent_state = info["persistent_state"]

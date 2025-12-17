@@ -266,11 +266,13 @@ class LearnableTokenMergerV3(nn.Module):
     2. Question-aware：用问题嵌入调制这些查询
     3. Cross-attention池化：查询关注所有vision tokens
     4. 输出固定M个tokens，全程可导，无需Gumbel/top-k
+    5. 多层LayerNorm稳定训练
 
     优势：
     - 训练/推理行为完全一致（无随机性）
     - 梯度流畅通（无top-k断点）
     - 输出维度固定，下游兼容性好
+    - LayerNorm保证训练稳定性
 
     参数:
         d_vision: vision特征维度（1024 for CLIP ViT-L/14）
@@ -305,21 +307,30 @@ class LearnableTokenMergerV3(nn.Module):
         # 延迟初始化，在第一次forward时根据N*merge_ratio确定
         self.register_buffer('pool_queries', None)  # 将在forward中初始化为 (M, d_internal)
 
-        # === 2. Question调制器（将question信息融入查询） ===
+        # === 2. 输入归一化层 ===
+        self.vision_input_norm = nn.LayerNorm(d_vision)  # vision输入归一化
+
+        # === 3. Question调制器（将question信息融入查询） ===
         if self.use_question:
+            self.text_input_norm = nn.LayerNorm(d_text)  # text输入归一化
             self.text_proj = nn.Linear(d_text, d_internal)
+            self.text_proj_norm = nn.LayerNorm(d_internal)  # text投影后归一化
             # Question条件化：生成查询的偏置/调制
             self.query_modulator = nn.Sequential(
                 nn.Linear(d_internal, d_internal),
-                nn.ReLU(),
+                nn.GELU(),  # GELU比ReLU更平滑
                 nn.Dropout(0.1),
                 nn.Linear(d_internal, d_internal)
             )
 
-        # === 3. Vision投影 ===
+        # === 4. Vision投影 ===
         self.vision_proj = nn.Linear(d_vision, d_internal)
+        self.vision_proj_norm = nn.LayerNorm(d_internal)  # vision投影后归一化
 
-        # === 4. Cross-Attention：查询关注所有vision tokens ===
+        # === 5. Query归一化（attention前） ===
+        self.query_norm = nn.LayerNorm(d_internal)
+
+        # === 6. Cross-Attention：查询关注所有vision tokens ===
         self.pool_attention = nn.MultiheadAttention(
             embed_dim=d_internal,
             num_heads=num_heads,
@@ -327,11 +338,32 @@ class LearnableTokenMergerV3(nn.Module):
             batch_first=True
         )
 
-        # === 5. 输出投影（回到vision维度） ===
-        self.output_proj = nn.Linear(d_internal, d_vision)
+        # === 7. Attention后归一化（Post-LN风格） ===
+        self.post_attn_norm = nn.LayerNorm(d_internal)
 
-        # === 6. Temperature（可选，用于控制attention的锐度） ===
+        # === 8. FFN层（增加表达能力） ===
+        self.ffn = nn.Sequential(
+            nn.Linear(d_internal, d_internal * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_internal * 4, d_internal),
+            nn.Dropout(0.1)
+        )
+        self.post_ffn_norm = nn.LayerNorm(d_internal)
+
+        # === 9. 输出投影（回到vision维度） ===
+        self.output_proj = nn.Linear(d_internal, d_vision)
+        self.output_norm = nn.LayerNorm(d_vision)  # 最终输出归一化
+
+        # 关键：初始化输出投影为接近零，让残差连接主导初始输出
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+        # === 10. Temperature（可选，用于控制attention的锐度） ===
         self.temperature = 1.0
+
+        # === 11. 残差缩放因子（可学习，初始化为小值让残差主导） ===
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
 
     def _init_pool_queries(self, N: int, device: torch.device):
         """初始化池化查询向量（第一次forward时调用）"""
@@ -370,14 +402,21 @@ class LearnableTokenMergerV3(nn.Module):
         if self.pool_queries is None:
             self._init_pool_queries(N, device)
 
-        # === Step 2: 准备查询向量 ===
+        # === Step 2: Vision输入归一化 + 投影 ===
+        vision_normed = self.vision_input_norm(vision_features)  # (batch, N, d_vision)
+        V_proj = self.vision_proj(vision_normed)  # (batch, N, d_internal)
+        V_proj = self.vision_proj_norm(V_proj)  # 投影后归一化
+
+        # === Step 3: 准备查询向量 ===
         # 基准查询 (M, d_internal) -> (batch, M, d_internal)
         queries = self.pool_queries.unsqueeze(0).expand(batch, -1, -1)
 
         # Question调制（如果启用）
         if self.use_question and question_embeddings is not None:
-            # 投影question到内部维度
-            Q_text = self.text_proj(question_embeddings)  # (batch, n_text, d_internal)
+            # 输入归一化 + 投影question到内部维度
+            Q_text_normed = self.text_input_norm(question_embeddings)  # (batch, n_text, d_text)
+            Q_text = self.text_proj(Q_text_normed)  # (batch, n_text, d_internal)
+            Q_text = self.text_proj_norm(Q_text)  # 投影后归一化
 
             # 均值池化：提取全局question表示
             Q_global = Q_text.mean(dim=1)  # (batch, d_internal)
@@ -388,10 +427,10 @@ class LearnableTokenMergerV3(nn.Module):
             # 调制查询：queries = base_queries + question_bias
             queries = queries + query_bias.unsqueeze(1)  # (batch, M, d_internal)
 
-        # === Step 3: 投影vision tokens ===
-        V_proj = self.vision_proj(vision_features)  # (batch, N, d_internal)
+        # === Step 4: Query归一化（attention前） ===
+        queries = self.query_norm(queries)  # (batch, M, d_internal)
 
-        # === Step 4: Cross-Attention池化 ===
+        # === Step 5: Cross-Attention池化 ===
         # queries关注所有vision tokens
         pooled, attn_weights = self.pool_attention(
             query=queries,        # (batch, M, d_internal) - 作为query
@@ -401,10 +440,29 @@ class LearnableTokenMergerV3(nn.Module):
             average_attn_weights=True  # 平均所有头的权重
         )  # pooled: (batch, M, d_internal), attn_weights: (batch, M, N)
 
-        # === Step 5: 投影回vision维度 ===
-        merged_features = self.output_proj(pooled)  # (batch, M, d_vision)
+        # === Step 6: Post-Attention归一化 ===
+        pooled = self.post_attn_norm(pooled)  # (batch, M, d_internal)
 
-        # === Step 6: 返回结果（兼容原有接口） ===
+        # === Step 7: FFN + 残差连接 ===
+        ffn_out = self.ffn(pooled)
+        pooled = self.post_ffn_norm(pooled + ffn_out)  # 残差 + 归一化
+
+        # === Step 8: 投影回vision维度 ===
+        transformed = self.output_proj(pooled)  # (batch, M, d_vision)
+
+        # === Step 9: 残差连接 - 直接从原始vision聚合 ===
+        # 使用 attention weights 从原始 vision_features 聚合（跳过所有变换）
+        # attn_weights: (batch, M, N), vision_features: (batch, N, d_vision)
+        # 结果: (batch, M, d_vision) - 原始特征的加权平均
+        residual = torch.bmm(attn_weights, vision_features)  # 直接聚合原始特征
+
+        # 合并：transformed（学习的变换）+ residual（原始信息）
+        # 初始化时 transformed ≈ 0，所以输出 ≈ residual（原始特征的聚合）
+        merged_features = self.residual_scale * transformed + residual
+
+        # 不做 output_norm，保持原始 CLIP 特征分布
+
+        # === Step 10: 返回结果（兼容原有接口） ===
         return {
             'merged_features': merged_features,
             'merge_indices': None,  # 无显式索引（软池化）

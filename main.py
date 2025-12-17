@@ -118,7 +118,7 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
 
     # ==================== 注册模型 ====================
 
-    trainer.register_model("token_merger", token_merger)
+    # trainer.register_model("token_merger", token_merger)
     trainer.register_model("layer_pruners", layer_pruners)
     trainer.register_model("discriminator", discriminator)
     trainer.register_model("backbone", backbone)
@@ -129,7 +129,7 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
     # 2. layer_pruners: 逐层剪枝器（LLM内部剪枝）
     # 3. discriminator: 判别器
 
-    trainer.add_param_group("token_merger", list(token_merger.parameters()))
+    # trainer.add_param_group("token_merger", list(token_merger.parameters()))
     trainer.add_param_group("layer_pruners", list(layer_pruners.parameters()))
     trainer.add_param_group("discriminator", list(discriminator.parameters()))
 

@@ -28,12 +28,12 @@ trainer_settings:  # 训练框架设置
         type: "adam"
         lr: "1e-04"  # 默认1e-4
     print_loss_every_batches: 5  # 减少日志打印
-    eval_every_batches: 10  # 每25个batch评估一次
+    eval_every_batches: 2  # 每25个batch评估一次
     eval_max_samples: 15  # 每次评估50个样本
     save_every_batches: 0  # Optuna搜索时禁用保存（加速）
     save_every_epochs: 0  # Optuna搜索时禁用保存
     optuna_eval_interval_batches: 25  # Optuna评估间隔：每25个batch报告一次
-    grad_clip_max_norm: null  # 梯度裁剪：null=关闭，1.0=启用
+    grad_clip_max_norm: 1.0  # 梯度裁剪：null=关闭，1.0=启用
 
 manager_settings:
   name: "basic"
@@ -59,16 +59,21 @@ search_settings:
     multivariate: true  # 考虑参数间相关性
   params:
     # 学习率（对数搜索，跨数量级）
-    trainer_settings.dl_settings.optimizers.token_merger.lr:
-      type: "float"
-      low: 1.0e-5
-      high: 1.0e-2
-      log: true
+    # Token Merger 学习率（已禁用token merger，注释掉）
+    # trainer_settings.dl_settings.optimizers.token_merger.lr:
+    #   type: "float"
+    #   low: 1.0e-5
+    #   high: 1.0e-2
+    #   log: true
+
+    # Layer Pruners 学习率
     trainer_settings.dl_settings.optimizers.layer_pruners.lr:
       type: "float"
       low: 1.0e-6
       high: 1.0e-3
       log: true
+
+    # Discriminator 学习率
     trainer_settings.dl_settings.optimizers.discriminator.lr:
       type: "float"
       low: 1.0e-6
@@ -98,12 +103,12 @@ search_settings:
       high: 10.0
       log: true
 
-    # Token Merge配置
-    method_settings.merge_ratio:
-      type: "float"
-      low: 0.3
-      high: 0.9
-      log: false
+    # Token Merge配置（已禁用token merger，注释掉）
+    # method_settings.merge_ratio:
+    #   type: "float"
+    #   low: 0.3
+    #   high: 0.9
+    #   log: false
 
     # Discriminator配置
     method_settings.disc_reinit_prob:
@@ -143,19 +148,22 @@ backbone_settings:  # 多模态大模型骨架配置
     max_text_tokens: 128  # 最大文本token数
     max_vision_tokens: 1600  # 最大视觉token数（减少降低显存占用）
     image_max_size: 1000  # 图像最大尺寸（减少降低vision token数）
-    vision_dim: 1024  # CLIP Vision Encoder输出维度（ViT-L/14）
-    hidden_dim: 4096  # LLaMA Hidden State维度（7B模型）
+
 
 method_settings:
   # ==================== Token Merger配置（新增） ====================
+  enable_token_merger: false  # 是否启用token merger（true=启用, false=禁用）
   merger_type: "fixed_pooling"  # "simple" / "question_aware" / "fixed_pooling" (推荐V3)
   merge_ratio: 1.0  # 保留比例
+  merger_dropout: 0.1  # Token Merger 的 dropout（防过拟合）
+  merger_d_internal: 512  # Merger内部维度
 
   # ==================== Layer-wise Pruner配置（新增） ====================
   pruning_layers: [5, 10, 15]  # 要剪枝的LLM层索引
   pruner_d_internal: 512  # Pruner内部维度
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
+  pruner_dropout: 0.1  # Layer Pruner 的 dropout（防过拟合）
 
   # ==================== 剪枝目标配置 ====================
   use_token_num_target: true  # true=使用绝对token数目标, false=使用稀疏度比例
