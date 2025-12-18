@@ -278,74 +278,53 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] + adv_loss
         layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] + task_loss
 
-        # 3. Sparsity Loss: 控制每层剪枝的token保留率
+        # 3. Sparsity Loss: 只在最后一层约束token保留率
         # pruning_masks: list of (batch, n_vision) 每层的soft_mask
+        # 由于mask是累积乘法的，最后一层的约束会通过梯度传播到前面的层
         if len(pruning_masks) > 0:
             # 获取配置
             target_sparsity = config['method_settings'].get('target_sparsity')
             use_token_num_target = config['method_settings'].get('use_token_num_target')
             sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
 
+            # 获取原始vision token数（第一层的输入）
+            n_vision = pruning_masks[0].shape[1]
+
             # 计算目标保留率
             if use_token_num_target:
                 # 基于绝对token数
                 target_token_num = config['method_settings'].get('target_token_num', 128)
-                # 计算每层平均每个样本的vision token数
-                n_vision = pruning_masks[0].shape[1]  # 假设所有层的vision token数相同
                 target_kept_ratio = target_token_num / n_vision
             else:
                 # 基于稀疏度比例
                 target_kept_ratio = 1.0 - target_sparsity
 
-            # === Sparsity Loss 1: 约束保留率（强惩罚，只在超出时） ===
-            # 层级加权：越靠后的层权重越大，避免都在第一层剪完
-            sparsity_constraint_loss = torch.tensor(0.0, device=device)
-            layer_indices = layer_pruners.get_all_layers()  # [10, 20, 31]
-            num_layers = len(layer_indices)
+            # === Sparsity Loss: 只在最后一层约束 ===
+            # 最后一层的mask反映了累积剪枝后的效果
+            # 梯度会通过hidden states传播到前面的层
+            final_mask = pruning_masks[-1]  # 最后一层的soft_mask
+            final_kept_ratio = final_mask.mean()  # 最后一层的保留比例
 
-            for idx, mask in enumerate(pruning_masks):
-                current_kept_ratio = mask.mean()  # 当前保留比例
+            if sparsity_loss_only_on_excess:
+                # 只在保留率超过目标时惩罚
+                excess = torch.relu(final_kept_ratio - target_kept_ratio)
+                sparsity_constraint_loss = excess.to(device).pow(2)
+            else:
+                # 双向惩罚（过多或过少都惩罚）
+                sparsity_constraint_loss = (final_kept_ratio - target_kept_ratio).to(device).pow(2)
 
-                # 计算层级权重:后面的层权重更大
-                # 例如 [10, 20, 31] -> 权重 [1.0, 2.0, 3.0]
-                layer_weight = (idx + 1) / num_layers  # 归一化到 [1/n, 2/n, ..., 1]
-                layer_weight = layer_weight * num_layers  # 恢复到 [1, 2, ..., n]
-
-                if sparsity_loss_only_on_excess:
-                    # 只在保留率超过目标时惩罚
-                    excess = torch.relu(current_kept_ratio - target_kept_ratio)
-                    sparsity_constraint_loss = sparsity_constraint_loss + layer_weight * excess.to(sparsity_constraint_loss.device).pow(2)
-                else:
-                    # 双向惩罚（过多或过少都惩罚）
-                    sparsity_constraint_loss = sparsity_constraint_loss + layer_weight * (current_kept_ratio - target_kept_ratio).to(sparsity_constraint_loss.device).pow(2)
-
-            # 归一化（除以权重总和）
-            weight_sum = sum(range(1, num_layers + 1))  # 1 + 2 + ... + n
-            sparsity_constraint_loss = sparsity_constraint_loss / weight_sum
             layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] + sparsity_constraint_loss
 
-            # === Sparsity Loss 2: Token总数惩罚（弱惩罚，鼓励减少token） ===
-            token_count_loss = torch.tensor(0.0, device=device)
-
-            for mask in pruning_masks:
-                # mask.sum() = 每层保留的token总数（考虑soft值）
-                token_count_loss = token_count_loss + mask.sum().to(token_count_loss.device)
-
-            # 平均到所有层
-            token_count_loss = token_count_loss / len(pruning_masks)
-
-            # 归一化到 [0, 1] 范围：除以vision token总数
-            # 这样loss变成"平均每层保留的token比例"，与学习率量级匹配
-            n_vision = pruning_masks[0].shape[1]  # 例如 460
-            token_count_loss = token_count_loss / n_vision
-
+            # === Token Count Loss: 只在最后一层计算 ===
+            # 最后一层保留的token总数
+            token_count_loss = final_mask.sum().to(device) / n_vision
             layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] + token_count_loss
 
-            # 统计信息
-            avg_kept_ratio = sum(m.mean().item() for m in pruning_masks) / len(pruning_masks)
-            avg_token_count = sum(m.sum().item() for m in pruning_masks) / len(pruning_masks)
-            stats["avg_kept_ratio"] += avg_kept_ratio
-            stats["avg_token_count"] += avg_token_count
+            # 统计信息：记录每层的保留率
+            for idx, mask in enumerate(pruning_masks):
+                stats[f"layer_{idx}_kept_ratio"] += mask.mean().item()
+            stats["final_kept_ratio"] += final_kept_ratio.item()
+            stats["final_token_count"] += final_mask.sum().item()
             stats["target_kept_ratio"] += target_kept_ratio
 
         # --- Discriminator Loss ---

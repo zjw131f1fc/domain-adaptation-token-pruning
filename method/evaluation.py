@@ -206,7 +206,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                     final_v_start, final_v_end = hard_context.get_positions()
                     final_tokens = final_v_end - final_v_start + 1 if final_v_end >= final_v_start else 0
                     results["hard_final_tokens"] += float(final_tokens)
-                    results["hard_keep_ratio_total"] += float(final_tokens) / float(num_original_tokens) if num_original_tokens > 0 else 0.0
+                    results["hard_keep_ratio_total"] += float(final_tokens) / float(num_merged_tokens) if num_merged_tokens > 0 else 0.0
 
                 finally:
                     # 恢复原始forward方法

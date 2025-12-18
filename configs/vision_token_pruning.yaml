@@ -16,7 +16,7 @@ trainer_settings:  # 训练框架设置
   name: "basic-pytorch"
   dl_settings:
     epochs: 2  # 2个epochs
-    batch_size: 8  # batch_size=8
+    batch_size: 10  # batch_size=8
     optimizers:
       discriminator:  # Discriminator优化器
         type: "adam"
@@ -27,27 +27,27 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: "1e-04"  # 默认1e-4
-    print_loss_every_batches: 5  # 减少日志打印
-    eval_every_batches: 2  # 每25个batch评估一次
-    eval_max_samples: 15  # 每次评估50个样本
+    print_loss_every_batches: 20  # 减少日志打印
+    eval_every_batches: 40  # 每25个batch评估一次
+    eval_max_samples: 80  # 每次评估50个样本
     save_every_batches: 0  # Optuna搜索时禁用保存（加速）
     save_every_epochs: 0  # Optuna搜索时禁用保存
-    optuna_eval_interval_batches: 25  # Optuna评估间隔：每25个batch报告一次
+    optuna_eval_interval_batches: 40  # Optuna评估间隔：每25个batch报告一次
     grad_clip_max_norm: 1.0  # 梯度裁剪：null=关闭，1.0=启用
 
 manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [3,5,6]  # 更新可用GPU列表
-  gpus_per_subtask: 4  # 每个trial使用3个GPU
+  available_gpus: [3,4,5]  # 更新可用GPU列表
+  gpus_per_subtask: 3  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
 search_settings:
   enable: false
   type: "optuna"
   n_trials: 200  # 减少trial数量（单worker串行执行）
-  study_name: "gan_vtp_hp_search"
+  study_name: "gan_vtp_hp_layer_wise_search2"
   pruner:
     type: "successive_halving"
     min_resource: 2  # 最少跑2个评估点才能被剪枝
@@ -55,71 +55,68 @@ search_settings:
     min_early_stopping_rate: 0
   sampler:
     type: "tpe"
-    n_startup_trials: 10  # TPE warmup：前10个trial随机采样
+    n_startup_trials: 15  # TPE warmup：前10个trial随机采样
     multivariate: true  # 考虑参数间相关性
   params:
-    # 学习率（对数搜索，跨数量级）
-    # Token Merger 学习率（已禁用token merger，注释掉）
-    # trainer_settings.dl_settings.optimizers.token_merger.lr:
-    #   type: "float"
-    #   low: 1.0e-5
-    #   high: 1.0e-2
-    #   log: true
+    # 搜索范围：基于最优参数上下两个数量级
+    # 最优参数来源: best_params.json (trial)
 
-    # Layer Pruners 学习率
+    # Layer Pruners 学习率 (最优: 1.27e-4)
     trainer_settings.dl_settings.optimizers.layer_pruners.lr:
       type: "float"
-      low: 1.0e-6
-      high: 1.0e-3
+      low: 1.0e-6   # 1.27e-4 / 100
+      high: 1.0e-2  # 1.27e-4 * 100
       log: true
 
-    # Discriminator 学习率
+    # Discriminator 学习率 (最优: 1.30e-4)
     trainer_settings.dl_settings.optimizers.discriminator.lr:
       type: "float"
-      low: 1.0e-6
-      high: 1.0e-3
+      low: 1.0e-6   # 1.30e-4 / 100
+      high: 1.0e-2  # 1.30e-4 * 100
       log: true
 
-    # Loss权重（对数搜索，跨3-4个数量级）
-    # 让Optuna自动探索最优尺度，不做过多假设
+    # Loss权重（基于最优参数上下两个数量级）
+    # adv_loss_weight (最优: 29.1)
     method_settings.adv_loss_weight:
       type: "float"
-      low: 0.01
-      high: 100.0
+      low: 0.3      # 29.1 / 100
+      high: 3000.0  # 29.1 * 100
       log: true
+
+    # task_loss_weight (最优: 3.87)
     method_settings.task_loss_weight:
       type: "float"
-      low: 0.1
-      high: 100.0
+      low: 0.04     # 3.87 / 100
+      high: 400.0   # 3.87 * 100
       log: true
+
+    # sparsity_weight (最优: 0.212)
     method_settings.sparsity_weight:
       type: "float"
-      low: 1.0e-4
-      high: 10.0
+      low: 0.002    # 0.212 / 100
+      high: 20.0    # 0.212 * 100
       log: true
+
+    # token_count_loss_weight (最优: 7.02)
     method_settings.token_count_loss_weight:
       type: "float"
-      low: 1.0e-4
-      high: 10.0
+      low: 0.07     # 7.02 / 100
+      high: 700.0   # 7.02 * 100
       log: true
 
-    # Token Merge配置（已禁用token merger，注释掉）
-    # method_settings.merge_ratio:
-    #   type: "float"
-    #   low: 0.3
-    #   high: 0.9
-    #   log: false
-
-    # Discriminator配置
+    # Discriminator配置（线性搜索，±0.1范围）
+    # disc_reinit_prob (最优: 0.084)
     method_settings.disc_reinit_prob:
       type: "float"
-      low: 0.0
-      high: 0.3
+      low: 0.0      # max(0, 0.084 - 0.1)
+      high: 0.18    # 0.084 + 0.1
       log: false
+
+    # disc_dropout (最优: 0.115)
     method_settings.disc_dropout:
       type: "float"
-      low: 0.05
-      high: 0.4
+      low: 0.02     # max(0, 0.115 - 0.1)
+      high: 0.22    # 0.115 + 0.1
       log: false
 
 dataset_settings:  # 数据集配置
@@ -159,7 +156,7 @@ method_settings:
   merger_d_internal: 512  # Merger内部维度
 
   # ==================== Layer-wise Pruner配置（新增） ====================
-  pruning_layers: [5, 10, 15]  # 要剪枝的LLM层索引
+  pruning_layers: [5,10,15,20]  # 要剪枝的LLM层索引
   pruner_d_internal: 512  # Pruner内部维度
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
