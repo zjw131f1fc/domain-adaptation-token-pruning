@@ -764,9 +764,13 @@ class BasicManager:
                     param_config["low"],
                     param_config["high"]
                 )
+            elif param_type == "bool":
+                # 布尔类型：使用categorical实现，但choices固定为[True, False]
+                value = trial.suggest_categorical(config_path, [True, False])
             else:
+                # categorical类型：需要提供choices
                 value = trial.suggest_categorical(config_path, param_config["choices"])
-            
+
             suggested_params[config_path] = value
         
         # 记录trial信息到state

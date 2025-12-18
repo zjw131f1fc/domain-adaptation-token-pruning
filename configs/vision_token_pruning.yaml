@@ -47,7 +47,7 @@ search_settings:
   enable: false
   type: "optuna"
   n_trials: 200  # 减少trial数量（单worker串行执行）
-  study_name: "attn_residual"
+  study_name: "attn_bias_search"
   pruner:
     type: "successive_halving"
     min_resource: 2  # 最少跑2个评估点才能被剪枝
@@ -118,6 +118,15 @@ search_settings:
       low: 0.02     # max(0, 0.115 - 0.1)
       high: 0.22    # 0.115 + 0.1
       log: false
+
+    # Attention Bias相关参数（新增）
+    # use_attn_residual: 是否启用attention residual
+    method_settings.use_attn_residual:
+      type: "bool"
+
+    # learnable_attn_weight: attention weight是否可学习
+    method_settings.learnable_attn_weight:
+      type: "bool"
 
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
