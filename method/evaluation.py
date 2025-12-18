@@ -246,8 +246,36 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
         # 当禁用token merger时，keep_ratio_merge = 1.0（无merge）
         # 当启用时，keep_ratio_merge < 1.0（有merge）
         # hard_keep_ratio_total 是最终的总体保留率（merge + layer pruning）
-        # 我们希望最小化accuracy下降，同时鼓励更少的token（更小的keep ratio）
-        raw_score = -acc_drop - 0.5 * results["hard_keep_ratio_total"]
+
+        # 修改score计算：
+        # 1. 更突出"不掉点"（对acc_drop进行惩罚性加权）
+        # 2. hard_keep_ratio必须在[0.10, 0.60]区间，区间内越小越好
+
+        # === 准确率惩罚 ===
+        # 当 acc_drop > 0 时（性能下降），使用指数惩罚
+        if acc_drop > 0:
+            # 指数惩罚：掉点越多，惩罚越重
+            # 例如：acc_drop=0.01 -> penalty≈1.5, acc_drop=0.05 -> penalty≈8
+            acc_penalty = acc_drop * (1 + 50 * acc_drop)
+        else:
+            # 性能提升（极少见），给予奖励
+            acc_penalty = acc_drop
+
+        # === Keep Ratio约束 ===
+        keep_ratio = results["hard_keep_ratio_total"]
+        # 要求keep_ratio在[0.10, 0.60]区间
+        if keep_ratio < 0.10:
+            # 小于10%：严重惩罚（可能信息丢失过多）
+            keep_ratio_penalty = 10.0 * (0.10 - keep_ratio)  # 距离下界越远，惩罚越重
+        elif keep_ratio > 0.60:
+            # 大于60%：严重惩罚（剪枝不足）
+            keep_ratio_penalty = 10.0 * (keep_ratio - 0.60)  # 距离上界越远，惩罚越重
+        else:
+            # 在区间内：鼓励更小的值（权重较小）
+            keep_ratio_penalty = 0.1 * keep_ratio
+
+        # 总分 = -准确率惩罚 - keep ratio惩罚
+        raw_score = -acc_penalty - keep_ratio_penalty
 
         # 使用EMA平滑score
         persistent_state = info["persistent_state"]

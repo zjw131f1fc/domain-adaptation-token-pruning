@@ -28,8 +28,8 @@ trainer_settings:  # 训练框架设置
         type: "adam"
         lr: "1e-04"  # 默认1e-4
     print_loss_every_batches: 20  # 减少日志打印
-    eval_every_batches: 40  # 每25个batch评估一次
-    eval_max_samples: 80  # 每次评估50个样本
+    eval_every_batches: 30  # 每25个batch评估一次
+    eval_max_samples: 100  # 每次评估50个样本
     save_every_batches: 0  # Optuna搜索时禁用保存（加速）
     save_every_epochs: 0  # Optuna搜索时禁用保存
     optuna_eval_interval_batches: 40  # Optuna评估间隔：每25个batch报告一次
@@ -39,7 +39,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [3,4,5]  # 更新可用GPU列表
+  available_gpus: [4,5,6]  # 更新可用GPU列表
   gpus_per_subtask: 3  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
@@ -93,15 +93,15 @@ search_settings:
     # sparsity_weight (最优: 0.212)
     method_settings.sparsity_weight:
       type: "float"
-      low: 0.002    # 0.212 / 100
-      high: 20.0    # 0.212 * 100
+      low: 0.001    # 0.212 / 100
+      high: 100.0    # 0.212 * 100
       log: true
 
     # token_count_loss_weight (最优: 7.02)
     method_settings.token_count_loss_weight:
       type: "float"
-      low: 0.07     # 7.02 / 100
-      high: 700.0   # 7.02 * 100
+      low: 0.001    # 7.02 / 100
+      high: 100.0   # 7.02 * 100
       log: true
 
     # Discriminator配置（线性搜索，±0.1范围）
@@ -131,7 +131,7 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 800  # 训练集：800样本（充分训练）
+    train: 600  # 训练集：800样本（充分训练）
     test: 200  # 测试集：200样本（准确评估）
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
