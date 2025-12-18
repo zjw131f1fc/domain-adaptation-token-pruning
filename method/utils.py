@@ -457,14 +457,9 @@ def register_multi_layer_hooks_v2(
 ) -> List[Any]:
     """在多个LLM层注册剪枝hooks（V2版本 - 更稳健）
 
-    新方案：使用 Pre-hook + Post-hook 组合
-    - Pre-hook: 保存Layer输入的hidden_states
-    - Post-hook: 在Layer执行完后，手动计算attention，调用pruner，应用mask
-
-    这样可以确保：
-    1. attention在Layer真正执行后计算（基于layernorm后的输入）
-    2. mask应用在Layer输出上（已经完成了attention计算）
-    3. 时序清晰，不会出现attention未计算就读取的问题
+    方案：
+    - 如果模型使用eager attention：直接从self_attn post-hook捕获attention weights
+    - 如果模型使用sdpa/flash attention：在Layer post-hook中手动计算attention
 
     参数:
         backbone: LLaVA backbone实例
@@ -480,77 +475,101 @@ def register_multi_layer_hooks_v2(
     handles = []
     v_start, v_end = vision_positions
 
+    # 检查attention实现类型
+    attn_impl = backbone.model.model.language_model.config._attn_implementation
+    use_eager_attn = (attn_impl == "eager")
+
     for layer_idx in layer_pruners.get_all_layers():
         # 1. 获取该层的pruner和target layer
         pruner = layer_pruners.get_pruner(layer_idx)
         target_layer = backbone.model.model.language_model.layers[layer_idx]
         self_attn = target_layer.self_attn
 
-        # 2. 创建该层的context（存储输入hidden_states）
-        layer_context = {'input_hidden_states': None}
+        # 2. 创建该层的context
+        layer_context = {
+            'attn_weights': None,        # 用于eager模式捕获
+            'input_hidden_states': None  # 用于sdpa模式手动计算
+        }
 
-        # 3. Pre-hook: 保存输入
-        def create_pre_hook(ctx):
-            def pre_hook(module, args, kwargs):
-                if len(args) > 0:
-                    hidden_states = args[0]
-                else:
-                    hidden_states = kwargs.get('hidden_states')
-                ctx['input_hidden_states'] = hidden_states
-                return args, kwargs
-            return pre_hook
+        # 3. 根据attention实现类型选择策略
+        if use_attn_residual:
+            if use_eager_attn:
+                # === Eager模式：直接捕获attention weights ===
+                def create_attn_post_hook(ctx):
+                    def attn_post_hook(module, args, kwargs, output):
+                        attn_output, attn_weights = output
+                        ctx['attn_weights'] = attn_weights
+                        return output
+                    return attn_post_hook
 
-        # 4. Post-hook: 计算attention + 剪枝 + 应用mask
-        def create_post_hook(ctx, pruner_ref, layer_ref, attn_ref, layer_idx_ref, collector_ref, use_attn_ref):
+                attn_handle = self_attn.register_forward_hook(
+                    create_attn_post_hook(layer_context),
+                    with_kwargs=True
+                )
+                handles.append(attn_handle)
+            else:
+                # === SDPA模式：需要保存输入用于手动计算 ===
+                def create_pre_hook(ctx):
+                    def pre_hook(module, args, kwargs):
+                        if len(args) > 0:
+                            hidden_states = args[0]
+                        else:
+                            hidden_states = kwargs.get('hidden_states')
+                        ctx['input_hidden_states'] = hidden_states
+                        return args, kwargs
+                    return pre_hook
+
+                pre_handle = target_layer.register_forward_pre_hook(
+                    create_pre_hook(layer_context),
+                    with_kwargs=True
+                )
+                handles.append(pre_handle)
+
+        # 4. Layer post-hook: 使用attention + 剪枝 + 应用mask
+        def create_layer_post_hook(ctx, pruner_ref, layer_ref, attn_ref, layer_idx_ref, collector_ref, use_attn_ref, is_eager):
             def post_hook(module, args, kwargs, output):
-                hidden_states_out = output  # Layer输出
-                hidden_states_in = ctx['input_hidden_states']  # Layer输入
+                hidden_states_out = output
 
                 # 提取vision hidden states
                 vision_hidden = hidden_states_out[:, v_start:v_end+1, :]
 
                 text_to_vision_attn = None
                 if use_attn_ref:
-                    # 手动计算attention weights
-                    # 使用Layer输入（经过input_layernorm后的）
-                    with torch.no_grad():
-                        normed_input = layer_ref.input_layernorm(hidden_states_in)
+                    attn_weights = None
 
-                        batch, seq_len, d_model = normed_input.shape
-                        num_heads = attn_ref.config.num_attention_heads
-                        head_dim = attn_ref.head_dim
+                    if is_eager and ctx['attn_weights'] is not None:
+                        # Eager模式：使用捕获的attention weights
+                        attn_weights = ctx['attn_weights']
+                        ctx['attn_weights'] = None
+                    elif not is_eager and ctx['input_hidden_states'] is not None:
+                        # SDPA模式：手动计算attention weights
+                        with torch.no_grad():
+                            hidden_states_in = ctx['input_hidden_states']
+                            normed_input = layer_ref.input_layernorm(hidden_states_in)
 
-                        # 计算Q, K
-                        Q = attn_ref.q_proj(normed_input)
-                        K = attn_ref.k_proj(normed_input)
+                            batch, seq_len, d_model = normed_input.shape
+                            num_heads = attn_ref.config.num_attention_heads
+                            head_dim = attn_ref.head_dim
 
-                        # Reshape to (batch, num_heads, seq_len, head_dim)
-                        Q = Q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
-                        K = K.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+                            Q = attn_ref.q_proj(normed_input)
+                            K = attn_ref.k_proj(normed_input)
 
-                        # 计算attention scores
-                        scaling = 1.0 / (head_dim ** 0.5)
-                        attn_weights = torch.matmul(Q, K.transpose(-2, -1)) * scaling
-                        attn_weights = torch.softmax(attn_weights, dim=-1)
-                        # (batch, num_heads, seq_len, seq_len)
+                            Q = Q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+                            K = K.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
 
-                        # 提取question→vision的attention
-                        # question位置: [v_end+1, seq_len)，但我们用传入的question_embeddings来确定范围
-                        # 这里简化：使用vision之后的所有token作为question
+                            scaling = 1.0 / (head_dim ** 0.5)
+                            attn_weights = torch.matmul(Q, K.transpose(-2, -1)) * scaling
+                            attn_weights = torch.softmax(attn_weights, dim=-1)
+
+                        ctx['input_hidden_states'] = None
+
+                    # 从attention weights提取text→vision部分
+                    if attn_weights is not None:
+                        seq_len = attn_weights.shape[-1]
                         q_start = v_end + 1
-                        q_end = seq_len  # 包括answer部分
-
                         if q_start < seq_len:
-                            question_indices = list(range(q_start, q_end))
-                            vision_indices = list(range(v_start, v_end + 1))
-
-                            # attn_weights[batch, heads, from, to]
-                            # 提取 question → vision
-                            q_to_v = attn_weights[:, :, question_indices, :][:, :, :, vision_indices]
-                            # (batch, num_heads, n_question, n_vision)
-
-                            # 平均跨heads和question tokens
-                            text_to_vision_attn = q_to_v.mean(dim=(1, 2))  # (batch, n_vision)
+                            q_to_v = attn_weights[:, :, q_start:, v_start:v_end+1]
+                            text_to_vision_attn = q_to_v.mean(dim=(1, 2))
 
                 # 调用pruner生成soft_mask
                 with torch.enable_grad():
@@ -558,7 +577,7 @@ def register_multi_layer_hooks_v2(
                         vision_hidden,
                         question_embeddings,
                         text_to_vision_attn=text_to_vision_attn
-                    )  # (batch, n_vision)
+                    )
 
                 # 收集mask
                 if collector_ref is not None:
@@ -573,21 +592,15 @@ def register_multi_layer_hooks_v2(
 
             return post_hook
 
-        # 5. 注册hooks
-        pre_handle = target_layer.register_forward_pre_hook(
-            create_pre_hook(layer_context),
-            with_kwargs=True
-        )
-        post_handle = target_layer.register_forward_hook(
-            create_post_hook(
+        # 5. 注册Layer post-hook
+        layer_handle = target_layer.register_forward_hook(
+            create_layer_post_hook(
                 layer_context, pruner, target_layer, self_attn,
-                layer_idx, mask_collector, use_attn_residual
+                layer_idx, mask_collector, use_attn_residual, use_eager_attn
             ),
             with_kwargs=True
         )
-
-        handles.append(pre_handle)
-        handles.append(post_handle)
+        handles.append(layer_handle)
 
     return handles
 
