@@ -102,7 +102,10 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
         d_text=config["backbone_settings"]["mllm_settings"]["hidden_dim"],
         layer_indices=config["method_settings"]["pruning_layers"],
         d_internal=config["method_settings"]["pruner_d_internal"],
-        num_heads=config["method_settings"]["pruner_num_heads"]
+        num_heads=config["method_settings"]["pruner_num_heads"],
+        use_attn_residual=config["method_settings"].get("use_attn_residual", False),
+        attn_residual_weight=config["method_settings"].get("attn_residual_weight", 0.5),
+        learnable_attn_weight=config["method_settings"].get("learnable_attn_weight", False)
     ).to(device=device)
 
     # 3. Discriminator

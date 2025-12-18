@@ -35,7 +35,10 @@ class LayerSpecificPruner(nn.Module):
         d_text: int = 4096,
         layer_indices: List[int] = [10, 20, 31],
         d_internal: int = 512,
-        num_heads: int = 4
+        num_heads: int = 4,
+        use_attn_residual: bool = False,
+        attn_residual_weight: float = 0.5,
+        learnable_attn_weight: bool = False
     ):
         super().__init__()
         self.layer_indices = layer_indices
@@ -46,7 +49,10 @@ class LayerSpecificPruner(nn.Module):
                 d_vision=d_model,
                 d_text=d_text,
                 d_internal=d_internal,
-                num_heads=num_heads
+                num_heads=num_heads,
+                use_attn_residual=use_attn_residual,
+                attn_residual_weight=attn_residual_weight,
+                learnable_attn_weight=learnable_attn_weight
             )
             for layer_idx in layer_indices
         })
@@ -75,12 +81,16 @@ class VisionPrunerHead(nn.Module):
     - Vision tokens关注question embeddings（cross-attention）
     - 基于融合后的表示预测每个vision token的保留/丢弃决策
     - 多层归一化保证训练稳定性
+    - **可选**: 残差连接text→vision attention作为额外信号
 
     参数:
         d_vision: vision token的hidden state维度
         d_text: text embedding维度
         d_internal: 内部处理维度
         num_heads: cross-attention头数
+        use_attn_residual: 是否使用attention residual（默认False）
+        attn_residual_weight: residual权重（可以是固定值或可学习参数）
+        learnable_attn_weight: residual weight是否可学习
     """
 
     def __init__(
@@ -88,10 +98,14 @@ class VisionPrunerHead(nn.Module):
         d_vision: int = 4096,
         d_text: int = 4096,
         d_internal: int = 512,
-        num_heads: int = 4
+        num_heads: int = 4,
+        use_attn_residual: bool = False,
+        attn_residual_weight: float = 0.5,
+        learnable_attn_weight: bool = False
     ):
         super().__init__()
         self.d_internal = d_internal
+        self.use_attn_residual = use_attn_residual
 
         # === 1. 输入归一化层 ===
         self.vision_input_norm = nn.LayerNorm(d_vision)
@@ -130,6 +144,15 @@ class VisionPrunerHead(nn.Module):
         nn.init.zeros_(self.mask_fc2.weight)
         nn.init.constant_(self.mask_fc2.bias, 2.0)
 
+        # === 7. Attention Residual配置（可选） ===
+        if self.use_attn_residual:
+            if learnable_attn_weight:
+                # 可学习的residual weight
+                self.attn_residual_weight = nn.Parameter(torch.tensor(attn_residual_weight))
+            else:
+                # 固定的residual weight（注册为buffer，不参与优化）
+                self.register_buffer('attn_residual_weight', torch.tensor(attn_residual_weight))
+
         # Temperature（外部动态更新）
         self.temperature = 1.0
 
@@ -137,7 +160,8 @@ class VisionPrunerHead(nn.Module):
         self,
         vision_hidden: torch.Tensor,
         question_embeddings: torch.Tensor,
-        use_gumbel: bool = True
+        use_gumbel: bool = True,
+        text_to_vision_attn: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """前向传播
 
@@ -145,6 +169,7 @@ class VisionPrunerHead(nn.Module):
             vision_hidden: (batch, n_vision, d_vision) - 当前层的vision token hidden states
             question_embeddings: (batch, n_text, d_text) - question embeddings
             use_gumbel: bool - 是否使用Gumbel-Softmax（训练时True）
+            text_to_vision_attn: (batch, n_vision) - 可选的text→vision attention平均值
 
         返回:
             soft_mask: (batch, n_vision) - 每个token的保留概率，范围[0, 1]
@@ -183,6 +208,13 @@ class VisionPrunerHead(nn.Module):
         mask_hidden = self.mask_act(mask_hidden)
         mask_hidden = self.mask_dropout(mask_hidden)
         keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
+
+        # === Step 5.5: Attention Residual（可选） ===
+        if self.use_attn_residual and text_to_vision_attn is not None:
+            # 确保attention在正确的设备和dtype上
+            text_to_vision_attn = text_to_vision_attn.to(device=keep_logits.device, dtype=keep_logits.dtype)
+            # 残差连接：keep_logits += weight * attention
+            keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
 
         # === Step 6: Gumbel-Softmax（可微分的二分类） ===
         if use_gumbel and self.training:

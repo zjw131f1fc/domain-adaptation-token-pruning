@@ -484,6 +484,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
         attention_mask: torch.Tensor,
         vision_positions: Optional[Tuple[int, int]] = None,
         output_hidden_states: bool = False,
+        output_attentions: bool = False,
         # === 层修改器参数 ===
         layer_modifier: Optional[Callable] = None,
         hook_layer_idx: Optional[int] = None,
@@ -495,6 +496,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             attention_mask: (batch, seq_len)
             vision_positions: (start, end) vision token 在序列中的位置（元信息，可选）
             output_hidden_states: 是否输出所有层的隐层状态
+            output_attentions: 是否输出所有层的attention weights
             layer_modifier: 用户自定义的层修改函数，签名为:
                 def modifier(hidden_states, attention_mask) -> Tuple[Tensor, Tensor]
                     参数:
@@ -508,6 +510,8 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             包含以下键的字典:
             - logits: torch.Tensor, 输出 logits (batch, seq_len, vocab_size)
             - all_hidden_states: tuple[torch.Tensor], 所有层的隐层状态（如果 output_hidden_states=True）
+            - attentions: tuple[torch.Tensor], 所有层的attention weights（如果 output_attentions=True）
+                每个元素形状为 (batch, num_heads, seq_len, seq_len)
 
         示例 - 剪枝场景:
             ```python
@@ -568,6 +572,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                 inputs_embeds=embeddings,
                 attention_mask=attention_mask,
                 output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
                 return_dict=True
             )
 
@@ -581,6 +586,11 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             if output_hidden_states:
                 result['all_hidden_states'] = tuple(
                     h.to(self.output_device) for h in outputs.hidden_states
+                )
+
+            if output_attentions:
+                result['attentions'] = tuple(
+                    attn.to(self.output_device) for attn in outputs.attentions
                 )
 
             return result

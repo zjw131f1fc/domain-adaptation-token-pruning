@@ -39,7 +39,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [0,2,3]  # 更新可用GPU列表
+  available_gpus: [4,5,6]  # 更新可用GPU列表
   gpus_per_subtask: 3  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
@@ -47,7 +47,7 @@ search_settings:
   enable: false
   type: "optuna"
   n_trials: 200  # 减少trial数量（单worker串行执行）
-  study_name: "gan_vtp_hp_layer_wise_search2"
+  study_name: "attn_residual"
   pruner:
     type: "successive_halving"
     min_resource: 2  # 最少跑2个评估点才能被剪枝
@@ -161,6 +161,11 @@ method_settings:
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
   pruner_dropout: 0.1  # Layer Pruner 的 dropout（防过拟合）
+
+  # Attention Residual配置（新功能）
+  use_attn_residual: true  # 是否启用attention residual（残差连接text→vision attention）
+  attn_residual_weight: 0.5  # Residual权重（固定值或初始值）
+  learnable_attn_weight: true  # Residual weight是否可学习（true=可学习参数，false=固定值）
 
   # ==================== 剪枝目标配置 ====================
   use_token_num_target: true  # true=使用绝对token数目标, false=使用稀疏度比例

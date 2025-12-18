@@ -174,12 +174,14 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         pruning_masks = []
 
         # 2.2 注册hooks到Layer 10/20/31
+        use_attn_residual = config["method_settings"].get("use_attn_residual", False)
         handles = register_multi_layer_hooks(
             backbone,
             layer_pruners,
             new_vision_pos,
             question_embeddings,
-            mask_collector=pruning_masks  # 收集每层的soft_mask
+            mask_collector=pruning_masks,  # 收集每层的soft_mask
+            use_attn_residual=use_attn_residual  # 是否启用attention residual
         )
 
         try:

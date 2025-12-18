@@ -159,11 +159,13 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
             # --- Phase 2: Soft Pruning（带layer pruners） ---
             if "soft" in eval_modes and judge_fn:
                 # 注册hooks
+                use_attn_residual = config["method_settings"].get("use_attn_residual", False)
                 handles = register_multi_layer_hooks(
                     backbone,
                     layer_pruners,
                     new_vision_pos,
-                    question_embeddings
+                    question_embeddings,
+                    use_attn_residual=use_attn_residual
                 )
 
                 try:

@@ -290,7 +290,8 @@ def create_layer_pruning_modifier(
     pruner,
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
-    mask_collector: Optional[List] = None
+    mask_collector: Optional[List] = None,
+    use_attn_residual: bool = False
 ) -> Callable:
     """创建层剪枝的modifier函数（用于hook）
 
@@ -299,10 +300,14 @@ def create_layer_pruning_modifier(
         vision_positions: (start, end) - vision tokens在序列中的位置
         question_embeddings: (batch, n_text, d_text) - question embeddings
         mask_collector: 可选的列表，用于收集soft_mask（用于计算sparsity loss）
+        use_attn_residual: 是否启用attention residual
 
     返回:
         modifier函数，签名为 (hidden_states, attention_mask) -> (new_hidden, new_mask)
     """
+
+    # 用于存储attention weights的容器
+    attention_storage = {'attn_weights': None}
 
     def modifier(hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         """Hook函数，在layer执行前调用
@@ -318,27 +323,68 @@ def create_layer_pruning_modifier(
         v_start, v_end = vision_positions
         vision_hidden = hidden_states[:, v_start:v_end+1, :]  # (batch, n_vision, d_model)
 
-        # === Step 2: 调用pruner生成soft_mask ===
-        with torch.enable_grad():  # 确保梯度开启（即使在eval模式）
-            soft_mask = pruner(vision_hidden, question_embeddings)  # (batch, n_vision)
+        # === Step 2: 计算text→vision attention（如果启用） ===
+        text_to_vision_attn = None
+        if use_attn_residual:
+            if attention_storage['attn_weights'] is not None:
+                attn_weights = attention_storage['attn_weights']  # (batch, num_heads, seq_len, seq_len)
 
-        # === Step 3: 收集mask（用于sparsity loss计算） ===
+                print(f"[DEBUG] Attention captured! Shape: {attn_weights.shape}")
+
+                # 提取text positions (排除vision部分)
+                seq_len = hidden_states.shape[1]
+                # text indices: [0, v_start) + (v_end, seq_len)
+                text_indices = list(range(0, v_start)) + list(range(v_end+1, seq_len))
+                vision_indices = list(range(v_start, v_end+1))
+
+                if len(text_indices) > 0:
+                    # 提取text→vision的attention: attn[text, vision]
+                    # attn_weights[batch, heads, from, to]
+                    # 我们需要: text_tokens → vision_tokens
+                    text_to_vision = attn_weights[:, :, text_indices, :][:, :, :, vision_indices]
+                    # (batch, num_heads, n_text, n_vision)
+
+                    # 平均: 跨heads和text tokens维度
+                    text_to_vision_attn = text_to_vision.mean(dim=(1, 2))  # (batch, n_vision)
+
+                    print(f"[DEBUG] text_to_vision_attn computed: shape={text_to_vision_attn.shape}, "
+                          f"range=[{text_to_vision_attn.min().item():.6f}, {text_to_vision_attn.max().item():.6f}], "
+                          f"mean={text_to_vision_attn.mean().item():.6f}")
+                else:
+                    print(f"[DEBUG] No text tokens found (all tokens are vision)")
+
+                # 清空storage，避免影响下一层
+                attention_storage['attn_weights'] = None
+            else:
+                print(f"[DEBUG] Attention NOT captured! storage['attn_weights'] is None")
+
+        # === Step 3: 调用pruner生成soft_mask（传入attention） ===
+        with torch.enable_grad():  # 确保梯度开启（即使在eval模式）
+            soft_mask = pruner(vision_hidden, question_embeddings, text_to_vision_attn=text_to_vision_attn)  # (batch, n_vision)
+
+        # === Step 4: 收集mask（用于sparsity loss计算） ===
         if mask_collector is not None:
             mask_collector.append(soft_mask)
 
-        # === Step 4: 应用mask（逐元素乘法） ===
+        # === Step 5: 应用mask（逐元素乘法） ===
         # 等价于同时缩放Q, K, V，影响attention scores
         # 确保soft_mask与vision_hidden的dtype一致
         soft_mask = soft_mask.to(vision_hidden.dtype)
         scaled_vision = vision_hidden * soft_mask.unsqueeze(-1)  # (batch, n_vision, d_model)
 
-        # === Step 5: 替换到完整hidden_states中 ===
+        # === Step 6: 替换到完整hidden_states中 ===
         new_hidden = hidden_states.clone()
         new_hidden[:, v_start:v_end+1, :] = scaled_vision
 
         return new_hidden, attention_mask
 
-    return modifier
+    # 如果启用attention residual，返回modifier和attention_storage
+    # 否则只返回modifier
+    if use_attn_residual:
+        # 返回modifier和storage的引用，以便外部可以填充attention weights
+        return modifier, attention_storage
+    else:
+        return modifier, None
 
 
 def register_multi_layer_hooks(
@@ -346,9 +392,10 @@ def register_multi_layer_hooks(
     layer_pruners,
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
-    mask_collector: Optional[List] = None
+    mask_collector: Optional[List] = None,
+    use_attn_residual: bool = False
 ) -> List[Any]:
-    """在多个LLM层注册剪枝hooks
+    """在多个LLM层注册剪枝hooks（旧版本，建议使用 register_multi_layer_hooks_v2）
 
     参数:
         backbone: LLaVA backbone实例
@@ -356,10 +403,18 @@ def register_multi_layer_hooks(
         vision_positions: (start, end) - vision tokens位置
         question_embeddings: (batch, n_text, d_text) - question embeddings
         mask_collector: 可选的列表，用于收集soft_mask（用于计算sparsity loss）
+        use_attn_residual: 是否启用attention residual（此版本不支持，将被忽略）
 
     返回:
         handles: hook handle列表（用于后续清理）
     """
+    # 如果启用attention residual，使用新版本
+    if use_attn_residual:
+        return register_multi_layer_hooks_v2(
+            backbone, layer_pruners, vision_positions, question_embeddings,
+            mask_collector, use_attn_residual
+        )
+
     handles = []
 
     for layer_idx in layer_pruners.get_all_layers():
@@ -367,15 +422,15 @@ def register_multi_layer_hooks(
         pruner = layer_pruners.get_pruner(layer_idx)
 
         # 2. 创建modifier函数
-        modifier = create_layer_pruning_modifier(pruner, vision_positions, question_embeddings, mask_collector)
+        modifier, _ = create_layer_pruning_modifier(
+            pruner, vision_positions, question_embeddings, mask_collector, use_attn_residual=False
+        )
 
-        # 3. 注册hook到LLaMA的对应层
-        # LLaVA结构: backbone.model.model.language_model.layers[idx]
+        # 3. 获取target layer
         target_layer = backbone.model.model.language_model.layers[layer_idx]
 
-        # 注册forward pre-hook
+        # 4. 在整个Layer上注册pre-hook来应用pruning
         def hook_fn(module, args, mod=modifier):
-            # args: (hidden_states, attention_mask, *rest)
             hidden_states = args[0]
             attention_mask = args[1] if len(args) > 1 else None
             new_hidden, new_mask = mod(hidden_states, attention_mask)
@@ -388,6 +443,151 @@ def register_multi_layer_hooks(
 
         handle = target_layer.register_forward_pre_hook(hook_fn)
         handles.append(handle)
+
+    return handles
+
+
+def register_multi_layer_hooks_v2(
+    backbone,
+    layer_pruners,
+    vision_positions: Tuple[int, int],
+    question_embeddings: torch.Tensor,
+    mask_collector: Optional[List] = None,
+    use_attn_residual: bool = False
+) -> List[Any]:
+    """在多个LLM层注册剪枝hooks（V2版本 - 更稳健）
+
+    新方案：使用 Pre-hook + Post-hook 组合
+    - Pre-hook: 保存Layer输入的hidden_states
+    - Post-hook: 在Layer执行完后，手动计算attention，调用pruner，应用mask
+
+    这样可以确保：
+    1. attention在Layer真正执行后计算（基于layernorm后的输入）
+    2. mask应用在Layer输出上（已经完成了attention计算）
+    3. 时序清晰，不会出现attention未计算就读取的问题
+
+    参数:
+        backbone: LLaVA backbone实例
+        layer_pruners: LayerSpecificPruner实例
+        vision_positions: (start, end) - vision tokens位置
+        question_embeddings: (batch, n_text, d_text) - question embeddings
+        mask_collector: 可选的列表，用于收集soft_mask（用于计算sparsity loss）
+        use_attn_residual: 是否启用attention residual
+
+    返回:
+        handles: hook handle列表（用于后续清理）
+    """
+    handles = []
+    v_start, v_end = vision_positions
+
+    for layer_idx in layer_pruners.get_all_layers():
+        # 1. 获取该层的pruner和target layer
+        pruner = layer_pruners.get_pruner(layer_idx)
+        target_layer = backbone.model.model.language_model.layers[layer_idx]
+        self_attn = target_layer.self_attn
+
+        # 2. 创建该层的context（存储输入hidden_states）
+        layer_context = {'input_hidden_states': None}
+
+        # 3. Pre-hook: 保存输入
+        def create_pre_hook(ctx):
+            def pre_hook(module, args, kwargs):
+                if len(args) > 0:
+                    hidden_states = args[0]
+                else:
+                    hidden_states = kwargs.get('hidden_states')
+                ctx['input_hidden_states'] = hidden_states
+                return args, kwargs
+            return pre_hook
+
+        # 4. Post-hook: 计算attention + 剪枝 + 应用mask
+        def create_post_hook(ctx, pruner_ref, layer_ref, attn_ref, layer_idx_ref, collector_ref, use_attn_ref):
+            def post_hook(module, args, kwargs, output):
+                hidden_states_out = output  # Layer输出
+                hidden_states_in = ctx['input_hidden_states']  # Layer输入
+
+                # 提取vision hidden states
+                vision_hidden = hidden_states_out[:, v_start:v_end+1, :]
+
+                text_to_vision_attn = None
+                if use_attn_ref:
+                    # 手动计算attention weights
+                    # 使用Layer输入（经过input_layernorm后的）
+                    with torch.no_grad():
+                        normed_input = layer_ref.input_layernorm(hidden_states_in)
+
+                        batch, seq_len, d_model = normed_input.shape
+                        num_heads = attn_ref.config.num_attention_heads
+                        head_dim = attn_ref.head_dim
+
+                        # 计算Q, K
+                        Q = attn_ref.q_proj(normed_input)
+                        K = attn_ref.k_proj(normed_input)
+
+                        # Reshape to (batch, num_heads, seq_len, head_dim)
+                        Q = Q.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+                        K = K.view(batch, seq_len, num_heads, head_dim).transpose(1, 2)
+
+                        # 计算attention scores
+                        scaling = 1.0 / (head_dim ** 0.5)
+                        attn_weights = torch.matmul(Q, K.transpose(-2, -1)) * scaling
+                        attn_weights = torch.softmax(attn_weights, dim=-1)
+                        # (batch, num_heads, seq_len, seq_len)
+
+                        # 提取question→vision的attention
+                        # question位置: [v_end+1, seq_len)，但我们用传入的question_embeddings来确定范围
+                        # 这里简化：使用vision之后的所有token作为question
+                        q_start = v_end + 1
+                        q_end = seq_len  # 包括answer部分
+
+                        if q_start < seq_len:
+                            question_indices = list(range(q_start, q_end))
+                            vision_indices = list(range(v_start, v_end + 1))
+
+                            # attn_weights[batch, heads, from, to]
+                            # 提取 question → vision
+                            q_to_v = attn_weights[:, :, question_indices, :][:, :, :, vision_indices]
+                            # (batch, num_heads, n_question, n_vision)
+
+                            # 平均跨heads和question tokens
+                            text_to_vision_attn = q_to_v.mean(dim=(1, 2))  # (batch, n_vision)
+
+                # 调用pruner生成soft_mask
+                with torch.enable_grad():
+                    soft_mask = pruner_ref(
+                        vision_hidden,
+                        question_embeddings,
+                        text_to_vision_attn=text_to_vision_attn
+                    )  # (batch, n_vision)
+
+                # 收集mask
+                if collector_ref is not None:
+                    collector_ref.append(soft_mask)
+
+                # 应用mask到vision部分
+                soft_mask = soft_mask.to(hidden_states_out.dtype)
+                new_hidden = hidden_states_out.clone()
+                new_hidden[:, v_start:v_end+1, :] = vision_hidden * soft_mask.unsqueeze(-1)
+
+                return new_hidden
+
+            return post_hook
+
+        # 5. 注册hooks
+        pre_handle = target_layer.register_forward_pre_hook(
+            create_pre_hook(layer_context),
+            with_kwargs=True
+        )
+        post_handle = target_layer.register_forward_hook(
+            create_post_hook(
+                layer_context, pruner, target_layer, self_attn,
+                layer_idx, mask_collector, use_attn_residual
+            ),
+            with_kwargs=True
+        )
+
+        handles.append(pre_handle)
+        handles.append(post_handle)
 
     return handles
 
