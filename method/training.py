@@ -338,8 +338,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             layer_pruners_losses["binarization_loss"] = layer_pruners_losses["binarization_loss"] + binarization_loss
 
             # 统计信息：记录每层的保留率
+            pruning_layers = layer_pruners.get_all_layers()
             for idx, mask in enumerate(pruning_masks):
-                stats[f"layer_{idx}_kept_ratio"] += mask.mean().item()
+                layer_num = pruning_layers[idx]
+                stats[f"L{layer_num}_kept"] += mask.mean().item()
             stats["final_kept_ratio"] += final_kept_ratio.item()
             stats["final_token_count"] += final_mask.sum().item()
             stats["target_kept_ratio"] += target_kept_ratio
@@ -364,6 +366,15 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             reduction='mean'
         )
 
+        # 计算判别器胜率（正确分类的比例）
+        # real_pred 应该接近1，fake_pred_for_disc 应该接近0
+        real_correct = (real_pred > 0.5).float().mean()
+        fake_correct = (fake_pred_for_disc < 0.5).float().mean()
+        disc_accuracy = (real_correct + fake_correct) / 2.0
+        stats["disc_accuracy"] = stats.get("disc_accuracy", 0.0) + disc_accuracy.item()
+        stats["disc_real_acc"] = stats.get("disc_real_acc", 0.0) + real_correct.item()
+        stats["disc_fake_acc"] = stats.get("disc_fake_acc", 0.0) + fake_correct.item()
+
         # 清理
         del embeddings_merged, result_fake, result_real
         del fake_hidden_list, real_hidden_list, fake_hidden_detached
@@ -382,12 +393,51 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         for k in stats:
             stats[k] = stats[k] / valid_samples
 
-        # Apply weights (非 inplace 操作)
-        adv_weight = config['method_settings'].get('adv_loss_weight')
-        task_weight = config['method_settings'].get('task_loss_weight')
+        # === Dynamic Loss Weight Scheduling (余弦调度) ===
+        # 训练初期: task_weight高，adv_weight低（优先学习保留信息）
+        # 训练后期: task_weight降低，adv_weight升高（强化对抗训练）
+
+        # 1. 计算训练进度
+        progress = current_step / total_steps  # 0.0 → 1.0
+
+        # 2. 读取配置
+        task_weight_start = config['method_settings'].get('task_loss_weight_start', None)
+        task_weight_end = config['method_settings'].get('task_loss_weight')
+        adv_weight_start = config['method_settings'].get('adv_loss_weight_start', None)
+        adv_weight_end = config['method_settings'].get('adv_loss_weight')
+        warmup_ratio = config['method_settings'].get('loss_weight_warmup_ratio', 0.0)
+
+        # 3. 余弦调度计算
+        if warmup_ratio > 0 and progress < warmup_ratio:
+            # Warmup阶段：平滑过渡
+            warmup_progress = progress / warmup_ratio  # 0.0 → 1.0
+            # 余弦插值: cos从1→0，映射为0→1的平滑曲线
+            cosine_factor = (1 - torch.cos(torch.tensor(warmup_progress * 3.14159))) / 2
+
+            # Task weight: start → end (递减)
+            if task_weight_start is not None:
+                task_weight = task_weight_start + (task_weight_end - task_weight_start) * cosine_factor
+            else:
+                task_weight = task_weight_end  # 未配置start，直接使用end
+
+            # Adv weight: start → end (递增)
+            if adv_weight_start is not None:
+                adv_weight = adv_weight_start + (adv_weight_end - adv_weight_start) * cosine_factor
+            else:
+                adv_weight = adv_weight_end
+        else:
+            # Warmup后：使用目标权重
+            task_weight = task_weight_end
+            adv_weight = adv_weight_end
+
+        # 4. 其他权重（不需要调度）
         sparsity_weight = config['method_settings'].get('sparsity_weight')
         token_count_weight = config['method_settings'].get('token_count_loss_weight')
         binarization_weight = config['method_settings'].get('binarization_loss_weight', 0.0)
+
+        # 5. 记录当前权重（用于日志）
+        stats["current_task_weight"] = float(task_weight)
+        stats["current_adv_weight"] = float(adv_weight)
 
         # Token Merger权重（只有在启用时才应用）
         if enable_token_merger:
@@ -419,5 +469,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     return {
         "discriminator": dict(disc_losses),      # 第1个：独立计算图，先backward先释放
         "token_merger": dict(token_merger_losses),  # 第2个：共享计算图
-        "layer_pruners": dict(layer_pruners_losses) # 第3个：共享计算图，最后释放
+        "layer_pruners": dict(layer_pruners_losses), # 第3个：共享计算图，最后释放
+        "metrics": stats  # 训练指标：保留率、判别器胜率等
     }

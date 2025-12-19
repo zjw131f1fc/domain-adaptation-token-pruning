@@ -398,55 +398,74 @@ class BasicPytorchTrainer:
                     for group_name, spec in self.param_groups.items():
                         torch.nn.utils.clip_grad_norm_(spec.params, self.grad_clip_max_norm)
 
-                # === 打印梯度统计（在 clip 之后，step 之前）===
+                # === 收集要打印的所有信息（梯度 + Loss + Metrics） ===
                 if self.print_loss_every_batches and batch_count % self.print_loss_every_batches == 0:
+                    # 1. 收集梯度信息
                     grad_stats = []
                     for group_name, spec in self.param_groups.items():
                         grad_norms = [p.grad.norm().item() for p in spec.params if p.grad is not None]
                         if grad_norms:
                             total_norm = (sum(g**2 for g in grad_norms))**0.5
-                            max_norm = max(grad_norms)
-                            mean_norm = sum(grad_norms) / len(grad_norms)
-                            grad_stats.append(f"{group_name}[total={total_norm:.4f}, max={max_norm:.4f}, mean={mean_norm:.6f}]")
-                    if grad_stats and self.logger:
-                        self.logger.info(f"[Gradients] {' | '.join(grad_stats)}")
+                            grad_stats.append(f"grad_{group_name}={total_norm:.4f}")
+
+                    # 2. 收集Loss信息
+                    loss_parts = []
+                    metrics_info = outputs.get("metrics", {})  # 提取 metrics
+
+                    for group_name in self.optimizers.keys():
+                        group_out = outputs[group_name]
+                        if isinstance(group_out, dict):
+                            loss_strs = [f"{k}={float(v.detach() if isinstance(v, torch.Tensor) else v):.4f}"
+                                       for k, v in group_out.items()]
+                            loss_parts.append(f"{group_name}[{', '.join(loss_strs)}]")
+                        else:
+                            loss_val = group_out.detach() if isinstance(group_out, torch.Tensor) else group_out
+                            loss_parts.append(f"{group_name}={float(loss_val):.4f}")
+
+                    # 3. 添加关键 metrics（保留率和判别器胜率）
+                    metric_strs = []
+
+                    # 每层的保留率 (L5_kept, L15_kept, L25_kept)
+                    layer_metrics = {k: v for k, v in metrics_info.items() if k.startswith('L') and k.endswith('_kept')}
+                    for layer_key in sorted(layer_metrics.keys(), key=lambda x: int(x[1:-5])):  # 按层号排序
+                        metric_strs.append(f"{layer_key}={layer_metrics[layer_key]:.3f}")
+
+                    # 最终保留率
+                    if "final_kept_ratio" in metrics_info:
+                        metric_strs.append(f"final={metrics_info['final_kept_ratio']:.3f}")
+
+                    # 判别器胜率
+                    if "disc_real_acc" in metrics_info and "disc_fake_acc" in metrics_info:
+                        metric_strs.append(f"disc_R={metrics_info['disc_real_acc']:.3f}")
+                        metric_strs.append(f"disc_F={metrics_info['disc_fake_acc']:.3f}")
+
+                    # 4. 组装完整消息
+                    all_parts = grad_stats + loss_parts + metric_strs
+
+                    # 5. 计算ETA
+                    remaining_batches = total_planned_batches - batch_count
+                    if len(batch_times) > 0 and remaining_batches > 0:
+                        avg_batch_time = sum(batch_times) / len(batch_times)
+                        eta_seconds = avg_batch_time * remaining_batches
+                        eta_str = self._format_time(eta_seconds)
+                        all_parts.append(f"ETA: {eta_str}")
+
+                    # 6. 统一打印
+                    if self.logger:
+                        self.logger.info(f"[Batch {batch_count}/{total_planned_batches}] " + " | ".join(all_parts))
 
                 # 最后统一执行优化步骤
                 for opt in self.optimizers.values():
                     opt.step()
 
                 batch_count += 1
-                
+
                 # 记录本batch耗时
                 batch_time = time.time() - batch_start_time
                 batch_times.append(batch_time)
                 # 保留最近50个batch的时间用于平滑预估
                 if len(batch_times) > 50:
                     batch_times.pop(0)
-
-                # 每隔 N 个 batch 打印该 batch 的结果（不做平均）
-                if self.print_loss_every_batches and batch_count % self.print_loss_every_batches == 0 and self.logger:
-                    # 打印每个组的 loss
-                    msg_parts = []
-                    for group_name in self.optimizers.keys():
-                        group_out = outputs[group_name]
-                        if isinstance(group_out, dict):
-                            # 打印所有命名的loss
-                            loss_strs = [f"{k}={float(v.detach() if isinstance(v, torch.Tensor) else v):.4f}" for k, v in group_out.items()]
-                            msg_parts.append(f"{group_name}[{', '.join(loss_strs)}]")
-                        else:
-                            loss_val = group_out.detach() if isinstance(group_out, torch.Tensor) else group_out
-                            msg_parts.append(f"{group_name}={float(loss_val):.4f}")
-                    
-                    # 计算预期剩余时间
-                    remaining_batches = total_planned_batches - batch_count
-                    if len(batch_times) > 0 and remaining_batches > 0:
-                        avg_batch_time = sum(batch_times) / len(batch_times)
-                        eta_seconds = avg_batch_time * remaining_batches
-                        eta_str = self._format_time(eta_seconds)
-                        msg_parts.append(f"ETA: {eta_str}")
-                    
-                    self.logger.info(f"[Batch {batch_count}/{total_planned_batches}] " + " | ".join(msg_parts))
 
                 # 每隔 N 个 batch 评估一次（评估整个测试集）
                 if self.eval_every_batches and self.eval_fn and batch_count % self.eval_every_batches == 0:
