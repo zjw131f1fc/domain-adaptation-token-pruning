@@ -139,10 +139,10 @@ class VisionPrunerHead(nn.Module):
         self.mask_dropout = nn.Dropout(0.1)
         self.mask_fc2 = nn.Linear(d_internal // 2, 1)
 
-        # 关键：初始化最后一层bias为正值，让初始输出倾向于"保留"
-        # sigmoid(2.0) ≈ 0.88，即默认保留 88% 的 tokens
-        nn.init.zeros_(self.mask_fc2.weight)
-        nn.init.constant_(self.mask_fc2.bias, 2.0)
+        # 使用标准初始化，不引入偏置
+        # 让模型从中性状态开始学习（sigmoid(0) = 0.5）
+        nn.init.xavier_uniform_(self.mask_fc2.weight)
+        nn.init.zeros_(self.mask_fc2.bias)
 
         # === 7. Attention Residual配置（可选） ===
         if self.use_attn_residual:

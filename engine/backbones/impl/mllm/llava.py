@@ -371,26 +371,45 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             # 1) 获取文本 token 的嵌入
             text_token_embeds = self.model.get_input_embeddings()(input_ids)  # (1, T_text, D)
 
-            # 2) 获取raw vision features (CLIP输出，未投影，1024维)
-            # 直接调用vision_tower，不经过projector
-            if hasattr(self.model, 'vision_tower'):
-                vision_tower = self.model.vision_tower
-                if hasattr(vision_tower, 'forward'):
-                    # 调用vision_tower获取原始1024维features
-                    raw_vision_features = vision_tower(pixel_values).last_hidden_state  # (1, 576, 1024) for CLIP ViT-L/14
-                else:
-                    # Fallback: 使用get_image_features (已投影)
-                    raw_vision_features = None
-            else:
-                raw_vision_features = None
+            # 2) 只调用一次 vision_tower，同时获取 raw 和 projected features
+            # 避免两次调用导致的数值不一致
+            raw_vision_features = None
+            image_token_embeds = None
 
-            # 3) 通过 model.get_image_features 获取图像特征（已经过 vision tower + projector）
-            # 返回的是 list，每个元素对应一张图像，shape 为 (num_patches, hidden_dim)
-            image_features_list = self.model.get_image_features(pixel_values=pixel_values)
-            # 拼接成 tensor: (batch, num_patches, hidden_dim)
-            # 对于单张图片：(1, num_patches, hidden_dim)
-            image_token_embeds = torch.cat(image_features_list, dim=0).unsqueeze(0)
-            image_token_embeds = image_token_embeds.to(text_token_embeds.dtype)
+            if hasattr(self.model, 'vision_tower') and hasattr(self.model, 'multi_modal_projector'):
+                vision_tower = self.model.vision_tower
+                projector = self.model.multi_modal_projector
+
+                # 调用 vision_tower 获取原始 features（只调用一次！）
+                vision_outputs = vision_tower(pixel_values, output_hidden_states=True)
+
+                # 获取指定层的 hidden states（默认使用 vision_feature_layer）
+                vision_feature_layer = self.model.config.vision_feature_layer
+                if isinstance(vision_feature_layer, int):
+                    selected_features = vision_outputs.hidden_states[vision_feature_layer]
+                else:
+                    # 多层拼接的情况
+                    selected_features = torch.cat(
+                        [vision_outputs.hidden_states[idx] for idx in vision_feature_layer],
+                        dim=-1
+                    )
+
+                # 根据 vision_feature_select_strategy 决定是否去掉 CLS
+                vision_feature_select_strategy = self.model.config.vision_feature_select_strategy
+                if vision_feature_select_strategy == "default":
+                    selected_features = selected_features[:, 1:]  # 去掉 CLS token
+
+                # raw_vision_features: 未投影的 CLIP 输出 (1, 576, 1024)
+                raw_vision_features = selected_features
+
+                # 通过 projector 投影到 LLM hidden dim (1, 576, 4096)
+                image_token_embeds = projector(selected_features)
+                image_token_embeds = image_token_embeds.to(text_token_embeds.dtype)
+            else:
+                # Fallback: 使用 get_image_features（会额外调用一次 vision_tower）
+                image_features_list = self.model.get_image_features(pixel_values=pixel_values)
+                image_token_embeds = torch.cat(image_features_list, dim=0).unsqueeze(0)
+                image_token_embeds = image_token_embeds.to(text_token_embeds.dtype)
             
             # 4) 找到图像占位 token 的位置
             # LLaVA processor 会将 <image> 扩展为多个 image_token_id（通常是 576 个）

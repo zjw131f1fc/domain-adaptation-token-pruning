@@ -20,16 +20,16 @@ trainer_settings:  # 训练框架设置
     optimizers:
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: "1e-04"  # 默认值，会被Optuna覆盖
+        lr: "3.2e-03"  # 最优值
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
         lr: "1e-04"  # 默认1e-3，比layer_pruners高10倍
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: "1e-04"  # 默认1e-4
+        lr: "1.7e-03"  # 最优值
     print_loss_every_batches: 20  # 减少日志打印
     eval_every_batches: 30  # 每25个batch评估一次
-    eval_max_samples: 100  # 每次评估50个样本
+    eval_max_samples: 20  # 每次评估50个样本
     save_every_batches: 0  # Optuna搜索时禁用保存（加速）
     save_every_epochs: 0  # Optuna搜索时禁用保存
     optuna_eval_interval_batches: 40  # Optuna评估间隔：每25个batch报告一次
@@ -39,7 +39,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1  # 单任务：每个trial需要3个GPU，5张卡只够开1个
-  available_gpus: [4,5,6]  # 更新可用GPU列表
+  available_gpus: [1,5,6]  # 更新可用GPU列表
   gpus_per_subtask: 3  # 每个trial使用3个GPU
   poll_interval: 5.0  # 轮询间隔，减少CPU占用
 
@@ -104,6 +104,13 @@ search_settings:
       high: 100.0   # 7.02 * 100
       log: true
 
+    # binarization_loss_weight: 鼓励soft_mask接近0或1
+    method_settings.binarization_loss_weight:
+      type: "float"
+      low: 0.001
+      high: 100.0
+      log: true
+
     # Discriminator配置（线性搜索，±0.1范围）
     # disc_reinit_prob (最优: 0.084)
     method_settings.disc_reinit_prob:
@@ -127,6 +134,28 @@ search_settings:
     # learnable_attn_weight: attention weight是否可学习
     method_settings.learnable_attn_weight:
       type: "bool"
+
+    # ==================== Gumbel Softmax 相关参数 ====================
+    # temperature: 初始temperature（控制soft/hard程度，典型值0.5-2.0）
+    method_settings.temperature:
+      type: "float"
+      low: 0.5
+      high: 2.0
+      log: false
+
+    # temperature_min: 最小temperature（annealing终点，典型值0.05-0.5）
+    method_settings.temperature_min:
+      type: "float"
+      low: 0.05
+      high: 0.5
+      log: false
+
+    # temperature_anneal_rate: Anneal比例（前X%步数进行annealing，0.3-0.8）
+    method_settings.temperature_anneal_rate:
+      type: "float"
+      low: 0.1
+      high: 0.8
+      log: false
 
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
@@ -172,7 +201,7 @@ method_settings:
   pruner_dropout: 0.1  # Layer Pruner 的 dropout（防过拟合）
 
   # Attention Residual配置（新功能）
-  use_attn_residual: true  # 是否启用attention residual（残差连接text→vision attention）
+  use_attn_residual: false  # 是否启用attention residual（残差连接text→vision attention）
   attn_residual_weight: 0.5  # Residual权重（固定值或初始值）
   learnable_attn_weight: true  # Residual weight是否可学习（true=可学习参数，false=固定值）
 
@@ -183,13 +212,14 @@ method_settings:
 
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
-  sparsity_weight: 0 # 1 # 10 # 1e-4  # Sparsity约束loss权重（强惩罚）
-  token_count_loss_weight: 0 # 1 # 10.0 # 1e-3  # Token总数loss权重（弱惩罚，鼓励减少token）
+  sparsity_weight: 37.67  # Sparsity约束loss权重（强惩罚）
+  token_count_loss_weight: 0.16  # Token总数loss权重（弱惩罚，鼓励减少token）
+  binarization_loss_weight: 0.41  # Binarization loss权重，鼓励soft_mask接近0或1
 
   # ==================== Temperature Annealing（新增） ====================
-  temperature: 1.0  # 初始temperature
-  temperature_min: 0.1  # 最小temperature
-  temperature_anneal_rate: 0.5  # Anneal比例（前50%步数进行annealing）
+  temperature: 0.99  # 初始temperature
+  temperature_min: 0.25  # 最小temperature
+  temperature_anneal_rate: 0.52  # Anneal比例（前50%步数进行annealing）
 
   # ==================== Hard Pruning配置（评估时使用） ====================
   hard_pruning_threshold: 0.5  # Hard剪枝阈值（soft_mask > threshold则保留）
@@ -197,14 +227,14 @@ method_settings:
   # Discriminator配置
   disc_num_layers: 3  # 使用的LLM隐层数量
   disc_d_d: 512  # 隐层维度
-  disc_dropout: 0.2  # Dropout比率
+  disc_dropout: 0.09  # Dropout比率
   disc_target_layers: [-1, -3, -5]  # 目标LLM层索引
-  disc_reinit_prob: 0.2  # 每个batch重初始化Discriminator的概率
+  disc_reinit_prob: 0.05  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
   # 损失权重
-  adv_loss_weight: 0 # 1 # 1.0  # 对抗损失权重
-  task_loss_weight: 1 # 100.0 # 25.0  # 任务损失权重
+  adv_loss_weight: 172.3  # 对抗损失权重
+  task_loss_weight: 10.65  # 任务损失权重
 
 evaluation_settings:  # 评估配置
-  eval_mode: ["origin", "merge_only", "soft", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝
+  eval_mode: ["origin", "soft", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝

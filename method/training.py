@@ -322,6 +322,21 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             token_count_loss = final_mask.sum().to(device) / n_vision
             layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] + token_count_loss
 
+            # === Bimodal Loss: 鼓励 soft_mask 接近 0 或 1，但不能全是同一个值 ===
+            # 两部分组成:
+            # 1. binarization: mask * (1 - mask) 在 0.5 时最大，鼓励输出接近 0 或 1
+            # 2. variance: 鼓励 token 之间有差异，避免全部输出相同值（全剪或全留）
+            binarization_loss = torch.tensor(0.0, device=device)
+            for mask in pruning_masks:
+                # 鼓励接近 0 或 1
+                binary_term = (mask * (1 - mask)).mean()
+                # 鼓励 token 之间有差异（variance 越大越好，所以取负）
+                variance_term = mask.var()
+                # 组合：最小化 binary_term，最大化 variance（所以减去）
+                binarization_loss = binarization_loss + (binary_term - 0.5 * variance_term).to(device)
+            binarization_loss = binarization_loss / len(pruning_masks)
+            layer_pruners_losses["binarization_loss"] = layer_pruners_losses["binarization_loss"] + binarization_loss
+
             # 统计信息：记录每层的保留率
             for idx, mask in enumerate(pruning_masks):
                 stats[f"layer_{idx}_kept_ratio"] += mask.mean().item()
@@ -372,6 +387,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         task_weight = config['method_settings'].get('task_loss_weight')
         sparsity_weight = config['method_settings'].get('sparsity_weight')
         token_count_weight = config['method_settings'].get('token_count_loss_weight')
+        binarization_weight = config['method_settings'].get('binarization_loss_weight', 0.0)
 
         # Token Merger权重（只有在启用时才应用）
         if enable_token_merger:
@@ -385,6 +401,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] * sparsity_weight
         if "token_count_loss" in layer_pruners_losses:
             layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] * token_count_weight
+        if "binarization_loss" in layer_pruners_losses:
+            layer_pruners_losses["binarization_loss"] = layer_pruners_losses["binarization_loss"] * binarization_weight
 
     # 确保tensor在正确设备上
     # 使用layer_pruners而不是token_merger来获取设备（因为token_merger可能为None）
