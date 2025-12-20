@@ -57,8 +57,10 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
         "avg_merged_tokens": 0.0,
         "avg_original_tokens": 0.0,
         # Hard pruning 统计
-        "hard_final_tokens": 0.0,
-        "hard_keep_ratio_total": 0.0
+        "hard_final_tokens": 0.0,          # 最终剩余的token数
+        "hard_avg_tokens": 0.0,            # 所有LLM层的平均token数（新增）
+        "hard_keep_ratio_total": 0.0,      # 最终保留率
+        "hard_avg_keep_ratio": 0.0         # 平均保留率（新增）
     }
 
     valid_samples = 0
@@ -204,11 +206,39 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                     judge_result = judge_fn(pred_hard, ref_answer, sample)
                     results["accuracy_hard"] += judge_result["accuracy"]
 
-                    # 收集hard pruning统计信息
+                    # 收集hard pruning统计信息 - 计算所有LLM层的平均token数
+                    pruning_stats = hard_context.get_stats()
+
+                    # 获取LLM总层数（从backbone配置中获取）
+                    total_llm_layers = backbone.model.model.language_model.config.num_hidden_layers
+
+                    # 构建每一层的token数
+                    # 初始：前面的层使用merge后的token数
+                    # 每次剪枝后：后续层使用剪枝后的token数
+                    tokens_per_layer = []
+                    current_tokens = num_merged_tokens  # 初始token数（merge后的）
+
+                    for layer_idx in range(total_llm_layers):
+                        tokens_per_layer.append(current_tokens)
+
+                        # 检查这一层之后是否有剪枝
+                        for stat in pruning_stats:
+                            if stat['layer_idx'] == layer_idx:
+                                current_tokens = stat['kept_count']
+                                break
+
+                    # 计算平均token数（所有层的平均）
+                    avg_tokens_across_layers = sum(tokens_per_layer) / len(tokens_per_layer) if len(tokens_per_layer) > 0 else 0.0
+
+                    # 统计最终token数（用于参考）
                     final_v_start, final_v_end = hard_context.get_positions()
                     final_tokens = final_v_end - final_v_start + 1 if final_v_end >= final_v_start else 0
-                    results["hard_final_tokens"] += float(final_tokens)
+
+                    # 更新结果
+                    results["hard_final_tokens"] += float(final_tokens)  # 最终token数
+                    results["hard_avg_tokens"] += avg_tokens_across_layers  # 所有层的平均token数
                     results["hard_keep_ratio_total"] += float(final_tokens) / float(num_merged_tokens) if num_merged_tokens > 0 else 0.0
+                    results["hard_avg_keep_ratio"] += avg_tokens_across_layers / float(num_merged_tokens) if num_merged_tokens > 0 else 0.0
 
                 finally:
                     # 恢复原始forward方法
@@ -235,7 +265,9 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
         if "hard" in eval_modes:
             results["accuracy_hard"] /= valid_samples
             results["hard_final_tokens"] /= valid_samples
+            results["hard_avg_tokens"] /= valid_samples  # 归一化平均token数
             results["hard_keep_ratio_total"] /= valid_samples
+            results["hard_avg_keep_ratio"] /= valid_samples  # 归一化平均保留率
         results["keep_ratio_merge"] /= valid_samples
         results["avg_original_tokens"] /= valid_samples
         results["avg_merged_tokens"] /= valid_samples
@@ -245,11 +277,11 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
         acc_drop = results["accuracy_baseline"] - results["accuracy_hard"]
         # 当禁用token merger时，keep_ratio_merge = 1.0（无merge）
         # 当启用时，keep_ratio_merge < 1.0（有merge）
-        # hard_keep_ratio_total 是最终的总体保留率（merge + layer pruning）
+        # hard_avg_keep_ratio 是所有LLM层的平均保留率（更准确地反映计算成本）
 
         # 修改score计算：
         # 1. 更突出"不掉点"（对acc_drop进行惩罚性加权）
-        # 2. hard_keep_ratio必须在[0.10, 0.60]区间，区间内越小越好
+        # 2. hard_avg_keep_ratio必须在[0.10, 0.60]区间，区间内越小越好
 
         # === 准确率惩罚 ===
         # 当 acc_drop > 0 时（性能下降），使用指数惩罚
@@ -261,8 +293,8 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
             # 性能提升（极少见），给予奖励
             acc_penalty = acc_drop
 
-        # === Keep Ratio约束 ===
-        keep_ratio = results["hard_keep_ratio_total"]
+        # === Keep Ratio约束（使用平均保留率） ===
+        keep_ratio = results["hard_avg_keep_ratio"]  # 修改：使用所有层的平均保留率
         # 要求keep_ratio在[0.10, 0.60]区间
         if keep_ratio < 0.10:
             # 小于10%：严重惩罚（可能信息丢失过多）

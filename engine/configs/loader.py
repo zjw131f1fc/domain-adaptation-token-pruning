@@ -183,8 +183,6 @@ DEFAULT_CONFIG = {
         "disc_target_layers": [-1, -3, -5],
         "disc_reinit_prob": 0.02,
         "disc_use_spectral_norm": True,
-        "eval_apply_bias_soft": True,
-        "eval_apply_bias_hard": True,
     },
     "evaluation_settings": {
         "eval_mode": ["origin", "full"],

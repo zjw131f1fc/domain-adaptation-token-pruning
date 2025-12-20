@@ -73,6 +73,18 @@ class VQAV2Preparer(BasePreparer):
         samples: List[Dict[str, Any]] = []
         # 计算 fast load 限额
         limit = None
+        
+        
+        # 注意：
+        '''
+        ann_map[458752001]，我随便取了一个样本发现，ann_map[458752001]是一个key，里面可能用到的除了answers还有这些项：
+        multiple_choice_answer: 应该指多选答案。评估时还是按官方标准来，训练时可能可以直接用这个？
+        question_type：问题的类型
+        answer_type：答案的类型
+        组合question_type和answer_type，应该能得到一个类别名称，如 what-other
+        '''
+        
+        
         if self.fast_load_no_random and 'train' in self.split_cfg:
             raw_v = self.split_cfg['train']
             if isinstance(raw_v, int):

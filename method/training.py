@@ -301,25 +301,27 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
                 # 基于稀疏度比例
                 target_kept_ratio = 1.0 - target_sparsity
 
-            # === Sparsity Loss: 只在最后一层约束 ===
-            # 最后一层的mask反映了累积剪枝后的效果
-            # 梯度会通过hidden states传播到前面的层
-            final_mask = pruning_masks[-1]  # 最后一层的soft_mask
-            final_kept_ratio = final_mask.mean()  # 最后一层的保留比例
+            # === Sparsity Loss: 基于所有层的平均保留率 ===
+            # 计算每层的保留率，然后取平均
+            # 这样训练目标与评估指标（hard_avg_keep_ratio）一致
+            kept_ratios = [mask.mean().to(device) for mask in pruning_masks]  # 每层的保留率，确保在同一设备
+            avg_kept_ratio = torch.stack(kept_ratios).mean()  # 所有层的平均保留率
+            final_mask = pruning_masks[-1]  # 保留最后一层用于统计
+            final_kept_ratio = final_mask.mean()
 
             if sparsity_loss_only_on_excess:
                 # 只在保留率超过目标时惩罚
-                excess = torch.relu(final_kept_ratio - target_kept_ratio)
+                excess = torch.relu(avg_kept_ratio - target_kept_ratio)
                 sparsity_constraint_loss = excess.to(device).pow(2)
             else:
                 # 双向惩罚（过多或过少都惩罚）
-                sparsity_constraint_loss = (final_kept_ratio - target_kept_ratio).to(device).pow(2)
+                sparsity_constraint_loss = (avg_kept_ratio - target_kept_ratio).to(device).pow(2)
 
             layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] + sparsity_constraint_loss
 
-            # === Token Count Loss: 只在最后一层计算 ===
-            # 最后一层保留的token总数
-            token_count_loss = final_mask.sum().to(device) / n_vision
+            # === Token Count Loss: 基于所有层的平均保留率 ===
+            # avg_kept_ratio 已经是归一化的比例（0-1范围）
+            token_count_loss = avg_kept_ratio.to(device)
             layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] + token_count_loss
 
             # === Bimodal Loss: 鼓励 soft_mask 接近 0 或 1，但不能全是同一个值 ===
@@ -342,7 +344,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             for idx, mask in enumerate(pruning_masks):
                 layer_num = pruning_layers[idx]
                 stats[f"L{layer_num}_kept"] += mask.mean().item()
-            stats["final_kept_ratio"] += final_kept_ratio.item()
+            stats["avg_kept_ratio"] += avg_kept_ratio.item()  # 新增：所有层平均保留率
+            stats["final_kept_ratio"] += final_kept_ratio.item()  # 保留：最后一层保留率
             stats["final_token_count"] += final_mask.sum().item()
             stats["target_kept_ratio"] += target_kept_ratio
 

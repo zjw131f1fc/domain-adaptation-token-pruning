@@ -30,8 +30,8 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: 1.7e-05
-    print_loss_every_batches: 100
-    eval_every_batches: 500
+    print_loss_every_batches: 20
+    eval_every_batches: 100
     eval_max_samples: 50
     save_every_batches: 500
     save_every_epochs: 0
@@ -42,7 +42,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [3,5,7]
+  available_gpus: [1, 3, 5]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -164,8 +164,8 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 40000
-    test: 1000
+    train: 20000
+    test: 200
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
     values:
@@ -186,6 +186,8 @@ backbone_settings:  # 多模态大模型骨架配置
     device_map: "balanced"  # 显存分配策略（balanced/auto）
     max_text_tokens: 128  # 最大文本token数
     max_vision_tokens: 1600  # 最大视觉token数（减少降低显存占用）
+    hidden_dim: 4096
+    vision_dim: 1024
     image_max_size: 1100  # 图像最大尺寸（减少降低vision token数）
 
 
@@ -216,7 +218,7 @@ method_settings:
 
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
-  sparsity_weight: 8  # Sparsity约束loss权重（强惩罚）
+  sparsity_weight: 5  # Sparsity约束loss权重（强惩罚）
   sparsity_weight_max: 0.0006
   sparsity_warmup_ratio: 0.7
   token_count_loss_weight: 0.08  # Token总数loss权重（弱惩罚，鼓励减少token）
@@ -250,12 +252,16 @@ method_settings:
   disc_reinit_prob: 0.2  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
+  # ==================== 评估配置 ====================
+  eval_apply_bias_soft: true
+  eval_apply_bias_hard: true
+
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 100.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 40  # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 80.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 20  # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 1.0  # 初始权重（低对抗，避免过早压制pruner）
