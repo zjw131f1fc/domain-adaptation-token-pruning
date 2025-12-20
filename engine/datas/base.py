@@ -111,6 +111,14 @@ class BasePreparer:
     def split_from_presplits(self, presplits: Dict[str, List[Dict[str, Any]]]) -> Tuple[Dict[str, BsesDataset], List[str]]:
         placeholder_splits: List[str] = []
         result: Dict[str, BsesDataset] = {}
+
+        # 检查是否需要类别平衡截取
+        use_category_balance = (
+            self.has_category and
+            "category_priority" in self.config.dataset_settings and
+            self.config.dataset_settings["category_priority"].get("enable", False)
+        )
+
         for name, samples in presplits.items():
             # 若 split_cfg 中未声明, 直接全量
             if name not in self.split_cfg:
@@ -130,12 +138,29 @@ class BasePreparer:
                 placeholder_splits.append(name)
                 result[name] = BsesDataset(samples[:])
                 continue
-            # 按目标大小截取 (不打乱, 保留原顺序)
+            # 按目标大小截取
             target_sizes = self.compute_split_target_sizes(len(samples))
             need = target_sizes[name] if name in target_sizes else len(samples)
             if need > len(samples):
                 need = len(samples)
-            result[name] = BsesDataset(samples[:need])
+
+            # 如果启用类别平衡，使用类别平衡采样
+            if use_category_balance and need < len(samples):
+                cat_priority = self.config.dataset_settings["category_priority"]
+                priority_defs = cat_priority["values"]
+                # 查找当前 split 的采样模式
+                mode = 'origin'  # 默认模式
+                for item in priority_defs:
+                    if name in item:
+                        mode = item[name]
+                        break
+                # 使用类别平衡采样
+                subset = self._category_balanced_sample(samples, need, mode)
+                result[name] = BsesDataset(subset)
+            else:
+                # 按顺序截取（不打乱，保留原顺序）
+                result[name] = BsesDataset(samples[:need])
+
         # 对于 split_cfg 中声明但未在 presplits 出现的占位/全量, 创建空集合或占位
         for name, v in self.split_cfg.items():
             if name in result:
@@ -153,6 +178,89 @@ class BasePreparer:
         return result, placeholder_splits
 
     # ---- 类别优先拆分 ----
+    def _category_balanced_sample(self, samples: List[Dict[str, Any]], need: int, mode: str) -> List[Dict[str, Any]]:
+        """从样本列表中按类别平衡采样指定数量的样本
+
+        Args:
+            samples: 样本列表
+            need: 需要采样的数量
+            mode: 采样模式，'mean' 表示均衡各类别，'origin' 表示按原始比例
+
+        Returns:
+            采样后的样本列表
+        """
+        if need >= len(samples):
+            return samples[:]
+
+        # 按类别分组
+        cat_pool: Dict[Any, List[Dict[str, Any]]] = {}
+        for s in samples:
+            c = s["category"]
+            if c not in cat_pool:
+                cat_pool[c] = []
+            cat_pool[c].append(s)
+
+        # 打乱每个类别的样本
+        random.seed(self.seed)
+        for lst in cat_pool.values():
+            random.shuffle(lst)
+
+        # 根据模式进行采样
+        if mode == 'mean':
+            return self._alloc_mean_from_pool(cat_pool, need)
+        else:  # 'origin'
+            return self._alloc_origin_from_pool(cat_pool, need)
+
+    def _alloc_mean_from_pool(self, cat_pool: Dict[Any, List[Dict[str, Any]]], k: int) -> List[Dict[str, Any]]:
+        """从类别池中均衡采样（轮流从各类别取样）"""
+        picked: List[Dict[str, Any]] = []
+        active = [c for c, lst in cat_pool.items() if lst]
+        idx = 0
+        while k > 0 and active:
+            c = active[idx]
+            lst = cat_pool[c]
+            if lst:
+                picked.append(lst.pop())
+                k -= 1
+                if not lst:
+                    active = [x for x in active if x != c]
+                    if active:
+                        idx %= len(active)
+            idx = (idx + 1) % len(active) if active else 0
+        return picked
+
+    def _alloc_origin_from_pool(self, cat_pool: Dict[Any, List[Dict[str, Any]]], k: int) -> List[Dict[str, Any]]:
+        """从类别池中按原始比例采样"""
+        picked: List[Dict[str, Any]] = []
+        while k > 0 and any(len(v) > 0 for v in cat_pool.values()):
+            remaining = sum(len(v) for v in cat_pool.values())
+            if remaining == 0:
+                break
+            alloc: Dict[Any, int] = {}
+            fractional: List[Tuple[float, Any]] = []
+            for c, lst in cat_pool.items():
+                if not lst:
+                    continue
+                share = (len(lst) / remaining) * k
+                base = int(share)
+                alloc[c] = base
+                fractional.append((share - base, c))
+            allocated = sum(alloc.values())
+            leftover = k - allocated
+            fractional.sort(key=lambda x: (-x[0], -len(cat_pool[x[1]])))
+            for _, c in fractional:
+                if leftover <= 0:
+                    break
+                alloc[c] += 1
+                leftover -= 1
+            for c, n in alloc.items():
+                for _ in range(n):
+                    if not cat_pool[c]:
+                        break
+                    picked.append(cat_pool[c].pop())
+            k = 0
+        return picked
+
     def _split_category_priority(self, samples: List[Dict[str, Any]]) -> Tuple[Dict[str, BsesDataset], List[str]]:
         total = len(samples)
         targets = self.compute_split_target_sizes(total)
