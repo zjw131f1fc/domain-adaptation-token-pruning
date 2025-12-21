@@ -26,7 +26,7 @@ from tqdm import tqdm
 # ==================== 配置区域 ====================
 
 # 要评估的checkpoint路径
-CHECKPOINT_PATH = "outputs/checkpoints/epoch1_batch2000.pt"
+CHECKPOINT_PATH = "/data/users/zjw/projects/domain-adaptation-token-pruning/outputs/tasks/gan_vtp_20251221-0122_vqa-vqav2_llava157b_8768/checkpoints/gan_vtp_20251221-0122_vqa-vqav2_llava157b_8768/epoch1_batch4000.pt"
 
 # 配置文件路径（默认使用vision_token_pruning.yaml）
 CONFIG_FILE = "configs/vision_token_pruning.yaml"
@@ -43,7 +43,7 @@ CONFIG_OVERRIDES = {
     "dataset_settings": {
         "split": {
             "train": 1,  # train样本数（评估时不需要train，设为最小值）
-            "test": 10000  # 测试集大小
+            "test": 5000  # 测试集大小
         }
     },
     "trainer_settings": {

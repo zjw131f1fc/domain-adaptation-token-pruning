@@ -14,7 +14,8 @@ from .utils import (
     register_multi_layer_hooks,
     remove_hooks,
     replace_vision_tokens_in_embeddings,
-    update_temperature_for_all
+    update_temperature_for_all,
+    get_current_sparsity_weight
 )
 
 
@@ -378,10 +379,15 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         stats["disc_real_acc"] = stats.get("disc_real_acc", 0.0) + real_correct.item()
         stats["disc_fake_acc"] = stats.get("disc_fake_acc", 0.0) + fake_correct.item()
 
-        # 清理
+        # 清理张量和图像对象
         del embeddings_merged, result_fake, result_real
         del fake_hidden_list, real_hidden_list, fake_hidden_detached
         del fake_pred_for_gen, real_pred, fake_pred_for_disc, pruning_masks
+
+        # 显式释放图像对象（PIL Image），避免内存泄露
+        if 'image' in sample and hasattr(sample['image'], 'close'):
+            sample['image'].close()
+        del sample
 
     # ========== Phase 5: 归一化Loss并应用权重 ==========
 
@@ -433,14 +439,15 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             task_weight = task_weight_end
             adv_weight = adv_weight_end
 
-        # 4. 其他权重（不需要调度）
-        sparsity_weight = config['method_settings'].get('sparsity_weight')
+        # 4. Sparsity weight (使用warmup机制，前期弱约束→后期强约束，防止token数反弹)
+        sparsity_weight = get_current_sparsity_weight(config, current_step, total_steps)
         token_count_weight = config['method_settings'].get('token_count_loss_weight')
         binarization_weight = config['method_settings'].get('binarization_loss_weight', 0.0)
 
         # 5. 记录当前权重（用于日志）
         stats["current_task_weight"] = float(task_weight)
         stats["current_adv_weight"] = float(adv_weight)
+        stats["current_sparsity_weight"] = float(sparsity_weight)
 
         # Token Merger权重（只有在启用时才应用）
         if enable_token_merger:

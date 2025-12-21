@@ -217,23 +217,23 @@ class VisionPrunerHead(nn.Module):
             keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
 
         # === Step 6: Gumbel-Softmax（可微分的二分类） ===
-        if use_gumbel and self.training:
-            # 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
-            stacked_logits = torch.stack([
-                torch.zeros_like(keep_logits),  # drop的logit固定为0
-                keep_logits                      # keep的logit为预测值
-            ], dim=-1)  # (batch, n_vision, 2)
+        # 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
+        stacked_logits = torch.stack([
+            torch.zeros_like(keep_logits),  # drop的logit固定为0
+            keep_logits                      # keep的logit为预测值
+        ], dim=-1)  # (batch, n_vision, 2)
 
-            # 为每个类别独立生成Gumbel噪声（标准Gumbel-Softmax实现）
+        if use_gumbel and self.training:
+            # 训练模式：添加Gumbel噪声实现可微分采样
             gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
             gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-
-            # Softmax + 提取keep概率
             probs = F.softmax(gumbel_logits, dim=-1)  # (batch, n_vision, 2)
-            soft_mask = probs[..., 1]  # (batch, n_vision) - 提取P(keep)
         else:
-            # 推理模式：使用sigmoid（确定性）
-            soft_mask = torch.sigmoid(keep_logits / self.temperature)
+            # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
+            probs = F.softmax(stacked_logits / self.temperature, dim=-1)  # (batch, n_vision, 2)
+
+        # 提取P(keep)
+        soft_mask = probs[..., 1]  # (batch, n_vision)
 
         return soft_mask
 
@@ -290,21 +290,23 @@ class VisionPrunerHeadSimple(nn.Module):
         # 直接从vision hidden预测keep logits
         keep_logits = self.mask_predictor(vision_hidden).squeeze(-1)
 
-        # Gumbel-Softmax或Sigmoid
-        if use_gumbel and self.training:
-            stacked_logits = torch.stack([
-                torch.zeros_like(keep_logits),
-                keep_logits
-            ], dim=-1)
+        # Gumbel-Softmax: 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
+        stacked_logits = torch.stack([
+            torch.zeros_like(keep_logits),  # drop的logit固定为0
+            keep_logits                      # keep的logit为预测值
+        ], dim=-1)
 
-            # 为每个类别独立生成Gumbel噪声（标准Gumbel-Softmax实现）
+        if use_gumbel and self.training:
+            # 训练模式：添加Gumbel噪声实现可微分采样
             gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
             gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-
             probs = F.softmax(gumbel_logits, dim=-1)
-            soft_mask = probs[..., 1]
         else:
-            soft_mask = torch.sigmoid(keep_logits / self.temperature)
+            # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
+            probs = F.softmax(stacked_logits / self.temperature, dim=-1)
+
+        # 提取P(keep)
+        soft_mask = probs[..., 1]
 
         return soft_mask
 

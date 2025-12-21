@@ -250,24 +250,27 @@ class Generator(nn.Module):
         # Generate mask
         V_normalized = self.output_norm(V_out)  # (batch, N, d_internal)
         logits = self.output_proj(V_normalized).squeeze(-1)  # (batch, N)
-        
+
         if self.use_gumbel:
             # Gumbel-Softmax: 对每个token的keep/drop进行采样
             stacked_logits = torch.stack([torch.zeros_like(logits), logits], dim=-1)  # (batch, N, 2)
             if self.training:
+                # 训练模式：添加Gumbel噪声实现可微分采样
                 gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
                 gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
                 m_soft = F.softmax(gumbel_logits, dim=-1)
-                m = m_soft[..., 1]  # 取keep的概率
             else:
-                m = torch.sigmoid(logits / self.temperature)
+                # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
+                m_soft = F.softmax(stacked_logits / self.temperature, dim=-1)
+            m = m_soft[..., 1]  # 取P(keep)
         else:
+            # 不使用Gumbel时，直接用sigmoid
             m = torch.sigmoid(logits / self.temperature)
-        
+
         # Apply padding mask
         if padding_mask is not None:
             m = m * padding_mask.float()
-        
+
         return m, V_out
 
 
