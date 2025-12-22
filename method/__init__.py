@@ -8,6 +8,7 @@ from .models.discriminator import Discriminator
 from .models.token_merger import LearnableTokenMerger, LearnableTokenMergerV2, LearnableTokenMergerV3
 from .models.layer_pruner import LayerSpecificPruner, VisionPrunerHead, VisionPrunerHeadSimple
 from .training import train_step
+from .training_batch import train_step_batch
 from .evaluation import eval_step
 from .utils import (
     get_vision_features_and_question_embedding,
@@ -38,6 +39,7 @@ __all__ = [
     'VisionPrunerHeadSimple',
     # Training & Evaluation
     'train_step',
+    'train_step_batch',
     'eval_step',
     # Utils
     'get_vision_features_and_question_embedding',

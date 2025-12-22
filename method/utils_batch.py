@@ -134,42 +134,23 @@ def register_multi_layer_hooks_batch(
                 vision_hidden = hidden_states[:, v_start:v_end+1, :]  # (batch_size, n_vision, d)
 
                 # Pruner forward（batch处理）
-                pruner_result = pruner_obj(
+                # 注意：pruner直接返回soft_mask tensor，不是字典
+                soft_mask = pruner_obj(
                     vision_hidden,
                     question_embeddings,
                     use_gumbel=True
-                )
-
-                soft_mask = pruner_result['soft_mask']  # (batch_size, n_vision)
-                importance_scores = pruner_result.get('importance_scores', None)
+                )  # (batch_size, n_vision)
 
                 # 收集mask用于sparsity loss
                 if mask_collector is not None:
                     mask_collector.append(soft_mask.detach())
 
                 # 应用soft_mask到vision tokens
+                soft_mask = soft_mask.to(vision_hidden.dtype)
                 masked_vision = vision_hidden * soft_mask.unsqueeze(-1)  # (batch_size, n_vision, d)
 
-                # Attention residual（如果启用）
-                if use_attn_residual and importance_scores is not None:
-                    # 提取text hidden states
-                    text_before = hidden_states[:, :v_start, :]
-                    text_after = hidden_states[:, v_end+1:, :]
-                    text_hidden = torch.cat([text_before, text_after], dim=1)  # (batch_size, text_len, d)
-
-                    # Cross-attention: text → vision
-                    # 简化版：使用importance scores作为权重
-                    attn_weights = torch.softmax(importance_scores, dim=-1)  # (batch_size, n_vision)
-                    text_context = torch.mean(text_hidden, dim=1, keepdim=True)  # (batch_size, 1, d)
-                    text_context = text_context.expand(-1, n_vision, -1)  # (batch_size, n_vision, d)
-
-                    # 加权融合
-                    if hasattr(pruner_obj, 'attn_residual_weight'):
-                        alpha = torch.sigmoid(pruner_obj.attn_residual_weight)
-                    else:
-                        alpha = 0.5
-
-                    masked_vision = alpha * masked_vision + (1 - alpha) * text_context * soft_mask.unsqueeze(-1)
+                # 注意：当前pruner不支持attention residual（需要修改pruner返回格式）
+                # 暂时禁用这部分功能
 
                 # 替换vision部分
                 new_hidden_states = hidden_states.clone()
@@ -183,7 +164,7 @@ def register_multi_layer_hooks_batch(
             return hook_fn
 
         # 注册hook
-        layer_module = backbone.model.language_model.model.layers[layer_idx]
+        layer_module = backbone.model.model.language_model.layers[layer_idx]
         handle = layer_module.register_forward_hook(make_hook(pruner, layer_idx))
         handles.append(handle)
 

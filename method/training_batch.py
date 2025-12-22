@@ -13,11 +13,13 @@ from .utils import (
     weighted_pool_text_hidden_states,
     add_position_aware_noise_to_pooled,
     compute_task_loss,
-    register_multi_layer_hooks_batch,
     remove_hooks,
-    replace_vision_tokens_in_embeddings_batch,
     update_temperature_for_all,
     get_current_sparsity_weight
+)
+from .utils_batch import (
+    replace_vision_tokens_in_embeddings_batch,
+    register_multi_layer_hooks_batch
 )
 
 

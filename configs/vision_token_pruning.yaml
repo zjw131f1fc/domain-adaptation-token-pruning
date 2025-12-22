@@ -16,7 +16,7 @@ trainer_settings:  # 训练框架设置
   name: "basic-pytorch"
   dl_settings:
     epochs: 1
-    batch_size: 10
+    batch_size: 6
     optimizers: # lr增大了10倍，不稳定的话需要改回去
       generator:
         type: "adam"
@@ -42,7 +42,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [4,5,6]
+  available_gpus: [4,5]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -190,6 +190,7 @@ backbone_settings:  # 多模态大模型骨架配置
 
     # ==================== Batch化相关配置 ====================
     enable_true_batch: true  # 是否启用真正的batch化处理（需要统一图片尺寸）
+                             # 使用左padding确保vision token位置对齐
     unified_image_size: 336  # 统一的图片尺寸（正方形，如336x336）
 
 

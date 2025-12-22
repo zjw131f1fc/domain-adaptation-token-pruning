@@ -558,13 +558,56 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
         else:
             prompts = [self._build_prompt(q) for q in questions]
 
-        # 3. Batch处理所有输入
-        inputs = self.processor(
-            text=prompts,
-            images=[img.convert("RGB") for img in resized_images],
-            return_tensors="pt",
-            padding=True  # 自动padding到相同长度
-        )
+        # 3. 先逐样本处理（获取每个样本的token ids）
+        # 然后手动进行左padding，确保vision token位置对齐
+        individual_inputs = []
+        for prompt, img in zip(prompts, resized_images):
+            single_input = self.processor(
+                text=prompt,
+                images=img.convert("RGB"),
+                return_tensors="pt"
+            )
+            individual_inputs.append(single_input)
+
+        # 4. 手动左padding：找到最大长度，然后在左侧补齐
+        max_length = max(inp['input_ids'].shape[1] for inp in individual_inputs)
+        pad_token_id = self.processor.tokenizer.pad_token_id
+        if pad_token_id is None:
+            # 如果没有pad_token，使用eos_token
+            pad_token_id = self.processor.tokenizer.eos_token_id
+
+        padded_input_ids = []
+        padded_attention_masks = []
+        pixel_values_list = []
+
+        for inp in individual_inputs:
+            input_ids = inp['input_ids'][0]  # (seq_len,)
+            seq_len = input_ids.shape[0]
+            num_pads = max_length - seq_len
+
+            # 右padding（在末尾添加padding）
+            if num_pads > 0:
+                pad_ids = torch.full((num_pads,), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
+                padded_ids = torch.cat([input_ids, pad_ids], dim=0)
+                # Attention mask: 实际内容为1，padding位置为0
+                attention_mask = torch.cat([
+                    torch.ones(seq_len, dtype=torch.long, device=input_ids.device),
+                    torch.zeros(num_pads, dtype=torch.long, device=input_ids.device)
+                ], dim=0)
+            else:
+                padded_ids = input_ids
+                attention_mask = torch.ones(seq_len, dtype=torch.long, device=input_ids.device)
+
+            padded_input_ids.append(padded_ids)
+            padded_attention_masks.append(attention_mask)
+            pixel_values_list.append(inp['pixel_values'][0])
+
+        # 堆叠成batch
+        inputs = {
+            'input_ids': torch.stack(padded_input_ids, dim=0),  # (batch_size, max_length)
+            'attention_mask': torch.stack(padded_attention_masks, dim=0),  # (batch_size, max_length)
+            'pixel_values': torch.stack(pixel_values_list, dim=0)  # (batch_size, 3, H, W)
+        }
 
         # 移动到模型设备
         target_device = next(self.model.parameters()).device
