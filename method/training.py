@@ -295,9 +295,11 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             target_kept_ratio = 1.0 - target_sparsity
 
         kept_ratios = [mask.mean().to(device) for mask in pruning_masks]
-        avg_kept_ratio = torch.stack(kept_ratios).mean()
-        final_mask = pruning_masks[-1]
-        final_kept_ratio = final_mask.mean()
+        avg_kept_ratio = torch.stack(kept_ratios).mean()  # 仅用于 sparsity loss 计算
+
+        # 计算累积保留率（考虑mask的连续作用）
+        # 累积效果 = 所有mask的连乘
+        cumulative_kept_ratio = torch.stack(kept_ratios).prod()
 
         if sparsity_loss_only_on_excess:
             excess = torch.relu(avg_kept_ratio - target_kept_ratio)
@@ -322,8 +324,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         for idx, mask in enumerate(pruning_masks):
             layer_num = pruning_layers[idx]
             stats[f"L{layer_num}_kept"] = mask.mean().item()
-        stats["avg_kept_ratio"] = avg_kept_ratio.item()
-        stats["final_kept_ratio"] = final_kept_ratio.item()
+        stats["cumulative_kept_ratio"] = cumulative_kept_ratio.item()  # 累积保留率
 
         if use_attn_residual and config["method_settings"].get("learnable_attn_weight", False):
             for idx in pruning_layers:

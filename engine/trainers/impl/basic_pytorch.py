@@ -446,8 +446,22 @@ class BasicPytorchTrainer:
                     # 打印所有metrics（排除特定的内部指标）
                     exclude_keys = {'current_task_weight', 'current_adv_weight', 'current_sparsity_weight'}
 
-                    # 按键名排序以保持一致的显示顺序
-                    for k in sorted(metrics_info.keys()):
+                    # 自定义排序：将L开头的layer指标按数字排序，其他按字母排序
+                    def metric_sort_key(k):
+                        if k.startswith('L') and '_' in k:
+                            # 提取层号，例如 "L6_kept" -> 6
+                            try:
+                                layer_num = int(k[1:k.index('_')])
+                                # 返回(0, layer_num, metric_name) 确保layer指标在前且按数字排序
+                                metric_name = k[k.index('_')+1:]
+                                return (0, layer_num, metric_name)
+                            except (ValueError, IndexError):
+                                return (1, k)  # 解析失败，按字母排序
+                        else:
+                            return (1, k)  # 非layer指标，按字母排序
+
+                    # 按自定义规则排序
+                    for k in sorted(metrics_info.keys(), key=metric_sort_key):
                         if k not in exclude_keys:
                             v = metrics_info[k]
                             metric_strs.append(f"{k}={v:.3f}")
