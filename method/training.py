@@ -226,16 +226,19 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # 3.1 对text hidden states进行加权融合
         # 越靠前的token权重越小（信息不完整），越靠后权重越大（信息完整）
+        start_weight = config["method_settings"].get("disc_pool_start_weight", 0.4)
+        end_weight = config["method_settings"].get("disc_pool_end_weight", 1.0)
+
         fake_hidden_pooled = weighted_pool_text_hidden_states(
             fake_hidden_list,
-            start_weight=0.5,  # 前面token权重0.5
-            end_weight=1.0     # 后面token权重1.0
+            start_weight=start_weight,
+            end_weight=end_weight
         )  # List[(batch, hidden_dim)]
 
         real_hidden_pooled = weighted_pool_text_hidden_states(
             real_hidden_list,
-            start_weight=0.5,
-            end_weight=1.0
+            start_weight=start_weight,
+            end_weight=end_weight
         )  # List[(batch, hidden_dim)]
 
         # 3.2 添加位置感知噪声（替代dropout）

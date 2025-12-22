@@ -17,22 +17,22 @@ trainer_settings:  # 训练框架设置
   dl_settings:
     epochs: 1
     batch_size: 10
-    optimizers:
+    optimizers: # lr增大了10倍，不稳定的话需要改回去
       generator:
         type: "adam"
         lr: 2.0e-05
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: 3.2e-04
+        lr: 3.2e-03
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
-        lr: 1.0e-05
+        lr: 1.0e-04
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: 1.7e-05
+        lr: 1.7e-04
     print_loss_every_batches: 100
     eval_every_batches: 500
-    eval_max_samples: 2000
+    eval_max_samples: 500
     save_every_batches: 500
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
@@ -42,7 +42,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [5,6,7]
+  available_gpus: [0,5,6]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -201,10 +201,10 @@ method_settings:
   pruner_d_internal: 512  # Pruner内部维度
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
-  pruner_dropout: 0.1  # Layer Pruner 的 dropout（防过拟合）
+  pruner_dropout: 0  # Layer Pruner 的 dropout（防过拟合）
 
   # Attention Residual配置（新功能）
-  use_attn_residual: false  # 是否启用attention residual（残差连接text→vision attention）
+  use_attn_residual: true  # 是否启用attention residual（残差连接text→vision attention）
   attn_residual_weight: 0.5  # Residual权重（固定值或初始值）
   learnable_attn_weight: true  # Residual weight是否可学习（true=可学习参数，false=固定值）
 
@@ -243,8 +243,10 @@ method_settings:
   # ==================== Discriminator配置 ====================
   disc_num_layers: 3  # 使用的LLM隐层数量
   disc_d_d: 512  # 隐层维度
-  disc_dropout: 0.15  # Dropout比率（已被噪声替代，但保留兼容性）
-  disc_noise_scale: 0.01  # 添加到hidden states的高斯噪声标准差（替代dropout）
+  # disc_dropout: 0.15  # [已废弃] Dropout比率（已被噪声替代）
+  disc_noise_scale: 0.03  # 添加到hidden states的高斯噪声标准差（替代dropout，推荐值：2% of pooled std）
+  disc_pool_start_weight: 0.3  # 加权融合时前面token的权重（信息不完整）
+  disc_pool_end_weight: 1.0    # 加权融合时后面token的权重（信息完整）
   disc_target_layers: [-1, -3, -5]  # 目标LLM层索引
   disc_reinit_prob: 0.15  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
@@ -258,7 +260,7 @@ method_settings:
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 1.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 50  # 目标权重（warmup后强化对抗）
+  adv_loss_weight: 60  # 目标权重（warmup后强化对抗）
 
   # Entropy Loss权重
   entropy_weight: 12.0
