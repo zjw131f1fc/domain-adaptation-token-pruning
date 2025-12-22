@@ -172,10 +172,28 @@ class BasicPytorchTrainer:
             self.logger.info("注册评估回调完成")
 
     # ---------------------- 内部 DataLoader ----------------------
+    @staticmethod
+    def _collate_fn(batch):
+        """Collate函数：保持list格式不变，支持多进程pickle"""
+        return batch
+
     def _make_loader(self, dataset, shuffle: bool = True) -> DataLoader:
-        def _collate_fn(batch):
-            return batch  # 保持 list，不强制张量化
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, collate_fn=_collate_fn, num_workers=0, pin_memory=False)
+        # 启用多进程数据加载以加速预处理
+        # num_workers=4: 使用4个子进程预加载数据
+        # pin_memory=True: 使用页锁定内存加速CPU到GPU传输
+        # prefetch_factor=2: 每个worker预取2个batch
+        # persistent_workers=True: 保持worker进程存活，避免重复创建开销
+        num_workers = 4 if self.device.type == 'cuda' else 0  # CPU模式下不使用多进程
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            collate_fn=self._collate_fn,  # 使用静态方法，可以被pickle
+            num_workers=num_workers,
+            pin_memory=(self.device.type == 'cuda'),
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=(num_workers > 0)
+        )
 
     # ---------------------- 兼容路由层 ----------------------
     def run(self):

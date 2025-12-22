@@ -36,7 +36,7 @@ trainer_settings:  # 训练框架设置
     save_every_batches: 500
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
-    grad_clip_max_norm: 10.0
+    grad_clip_max_norm: null
 
 manager_settings:
   name: "basic"

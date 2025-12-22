@@ -12,14 +12,15 @@ from .utils import (
     extract_text_hidden_states,
     weighted_pool_text_hidden_states,
     add_position_aware_noise_to_pooled,
-    compute_task_loss,
     remove_hooks,
     update_temperature_for_all,
     get_current_sparsity_weight
 )
 from .utils_batch import (
     replace_vision_tokens_in_embeddings_batch,
-    register_multi_layer_hooks_batch
+    register_multi_layer_hooks_batch,
+    extract_text_hidden_batch,
+    compute_task_loss_batch
 )
 
 
@@ -188,20 +189,12 @@ def train_step_batch(batch: List[Any], device: torch.device, info: Dict[str, Any
             output_hidden_states=True
         )
 
-        # 提取text hidden states（batch维度）
+        # 向量化提取text hidden states（使用新的批量函数）
         fake_hidden_list = []
         for layer_idx in disc_target_layers:
             hidden = result_fake['all_hidden_states'][layer_idx]  # (batch_size, seq_len, dim)
-            # 对每个样本提取text部分
-            batch_text_hiddens = []
-            for b in range(batch_size):
-                v_start_b = new_vision_pos[b, 0].item()
-                v_end_b = new_vision_pos[b, 1].item()
-                text_before = hidden[b:b+1, :v_start_b, :]
-                text_after = hidden[b:b+1, v_end_b+1:, :]
-                text_hidden_b = torch.cat([text_before, text_after], dim=1)
-                batch_text_hiddens.append(text_hidden_b)
-            fake_hidden_list.append(torch.cat(batch_text_hiddens, dim=0))  # (batch_size, text_len, dim)
+            text_hidden = extract_text_hidden_batch(hidden, new_vision_pos)  # 向量化操作
+            fake_hidden_list.append(text_hidden)
 
     finally:
         remove_hooks(handles)
@@ -214,18 +207,12 @@ def train_step_batch(batch: List[Any], device: torch.device, info: Dict[str, Any
             output_hidden_states=True
         )
 
+        # 向量化提取text hidden states（使用新的批量函数）
         real_hidden_list = []
         for layer_idx in disc_target_layers:
-            hidden = result_real['all_hidden_states'][layer_idx]
-            batch_text_hiddens = []
-            for b in range(batch_size):
-                v_start_b = original_vision_pos[b, 0].item()
-                v_end_b = original_vision_pos[b, 1].item()
-                text_before = hidden[b:b+1, :v_start_b, :]
-                text_after = hidden[b:b+1, v_end_b+1:, :]
-                text_hidden_b = torch.cat([text_before, text_after], dim=1)
-                batch_text_hiddens.append(text_hidden_b)
-            real_hidden_list.append(torch.cat(batch_text_hiddens, dim=0))
+            hidden = result_real['all_hidden_states'][layer_idx]  # (batch_size, seq_len, dim)
+            text_hidden = extract_text_hidden_batch(hidden, original_vision_pos)  # 向量化操作
+            real_hidden_list.append(text_hidden)
 
     # ========== Phase 4: Discriminator Judgment ==========
     start_weight = config["method_settings"].get("disc_pool_start_weight", 0.4)
@@ -275,31 +262,24 @@ def train_step_batch(batch: List[Any], device: torch.device, info: Dict[str, Any
         adv_loss = F.binary_cross_entropy(fake_pred_for_gen, torch.ones_like(fake_pred_for_gen), reduction='mean')
         token_merger_losses["adv_loss"] = adv_loss
 
-        # Task loss（batch化版本）
-        task_loss_sum = torch.tensor(0.0, device=device)
-        for b in range(batch_size):
-            task_loss_b = compute_task_loss(
-                result_fake['logits'][b:b+1],
-                (answer_pos[b, 0].item(), answer_pos[b, 1].item()),
-                batch[b]["answer"],
-                backbone.processor
-            )
-            task_loss_sum = task_loss_sum + task_loss_b
-        task_loss = task_loss_sum / batch_size
+        # Task loss（批量计算）
+        task_loss = compute_task_loss_batch(
+            result_fake['logits'],
+            answer_pos,
+            answers,
+            backbone.processor
+        )
         token_merger_losses["task_loss"] = task_loss
 
     # Layer Pruners Loss
     if not enable_token_merger:
-        task_loss_sum = torch.tensor(0.0, device=device)
-        for b in range(batch_size):
-            task_loss_b = compute_task_loss(
-                result_fake['logits'][b:b+1],
-                (answer_pos[b, 0].item(), answer_pos[b, 1].item()),
-                batch[b]["answer"],
-                backbone.processor
-            )
-            task_loss_sum = task_loss_sum + task_loss_b
-        task_loss = task_loss_sum / batch_size
+        # Task loss（批量计算）
+        task_loss = compute_task_loss_batch(
+            result_fake['logits'],
+            answer_pos,
+            answers,
+            backbone.processor
+        )
 
     adv_loss = F.binary_cross_entropy(fake_pred_for_gen, torch.ones_like(fake_pred_for_gen), reduction='mean')
     layer_pruners_losses["adv_loss"] = adv_loss

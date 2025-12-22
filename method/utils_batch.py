@@ -4,7 +4,135 @@
 """
 
 import torch
+import torch.nn.functional as F
 from typing import Tuple, List, Optional
+
+
+def compute_task_loss_batch(
+    logits: torch.Tensor,
+    answer_positions: torch.Tensor,
+    answers: List[str],
+    processor
+) -> torch.Tensor:
+    """批量计算任务损失（预测answer的交叉熵损失）
+
+    参数:
+        logits: (batch_size, seq_len, vocab_size) - 模型输出的logits
+        answer_positions: (batch_size, 2) - answer在序列中的位置（支持负索引）
+        answers: List[str] - 答案文本列表
+        processor: tokenizer所在的processor
+
+    返回:
+        task_loss: torch.Tensor - 批量平均后的交叉熵损失
+
+    注意：当前实现要求batch内所有answer位置相同（通过padding保证）
+    """
+    batch_size, seq_len, vocab_size = logits.shape
+    device = logits.device
+
+    # 检查是否所有answer位置相同
+    # 如果位置相同，可以进行高效的批量计算
+    positions_unique = torch.unique(answer_positions, dim=0)
+    if positions_unique.shape[0] == 1:
+        # 所有样本的answer位置相同，可以批量处理
+        answer_start, answer_end = answer_positions[0].tolist()
+
+        # 转换负索引
+        if answer_start < 0:
+            answer_start = seq_len + answer_start
+        if answer_end < 0:
+            answer_end = seq_len + answer_end
+
+        # 批量tokenize所有answers
+        answer_token_ids_list = []
+        for answer in answers:
+            token_ids = processor.tokenizer.encode(answer, add_special_tokens=False)
+            if len(token_ids) == 0:
+                raise ValueError(f"answer '{answer}' 被分词后长度为0")
+            answer_token_ids_list.append(token_ids)
+
+        # 检查所有answer长度是否相同（通常由于padding会相同）
+        answer_lengths = [len(ids) for ids in answer_token_ids_list]
+        if len(set(answer_lengths)) == 1:
+            # 长度相同，可以批量处理
+            answer_token_ids = torch.tensor(
+                answer_token_ids_list,
+                device=device,
+                dtype=torch.long
+            )  # (batch_size, answer_len)
+
+            # 提取用于预测的logits
+            logits_for_answer = logits[:, answer_start-1:answer_end, :]  # (batch_size, answer_len, vocab_size)
+
+            # 批量计算交叉熵
+            loss = F.cross_entropy(
+                logits_for_answer.reshape(-1, vocab_size),  # (batch_size * answer_len, vocab_size)
+                answer_token_ids.reshape(-1),  # (batch_size * answer_len,)
+                reduction='mean'
+            )
+            return loss
+        else:
+            # 长度不同，退回到逐样本计算
+            pass
+
+    # Fallback：逐样本计算（当位置或长度不一致时）
+    total_loss = torch.tensor(0.0, device=device)
+    for b in range(batch_size):
+        answer_start, answer_end = answer_positions[b].tolist()
+
+        # 转换负索引
+        if answer_start < 0:
+            answer_start = seq_len + answer_start
+        if answer_end < 0:
+            answer_end = seq_len + answer_end
+
+        answer_token_ids_list = processor.tokenizer.encode(answers[b], add_special_tokens=False)
+        if len(answer_token_ids_list) == 0:
+            raise ValueError(f"answer '{answers[b]}' 被分词后长度为0")
+
+        answer_token_ids = torch.tensor(answer_token_ids_list, device=device, dtype=torch.long)
+
+        logits_for_answer = logits[b:b+1, answer_start-1:answer_end, :]
+
+        loss_b = F.cross_entropy(
+            logits_for_answer.reshape(-1, vocab_size),
+            answer_token_ids,
+            reduction='mean'
+        )
+        total_loss = total_loss + loss_b
+
+    return total_loss / batch_size
+
+
+def extract_text_hidden_batch(
+    hidden_states: torch.Tensor,
+    vision_positions: torch.Tensor
+) -> torch.Tensor:
+    """向量化提取text hidden states（去除vision tokens）
+
+    参数:
+        hidden_states: (batch_size, seq_len, hidden_dim)
+        vision_positions: (batch_size, 2) - 每行为 (v_start, v_end)
+
+    返回:
+        text_hidden: (batch_size, text_len, hidden_dim) - 拼接后的text部分
+
+    注意：要求batch内所有样本的vision位置相同
+    """
+    batch_size, seq_len, hidden_dim = hidden_states.shape
+
+    # 验证所有样本的vision位置相同
+    v_start = vision_positions[0, 0].item()
+    v_end = vision_positions[0, 1].item()
+
+    # 向量化提取：text_before + text_after
+    text_before = hidden_states[:, :v_start, :]  # (batch_size, v_start, dim)
+    text_after = hidden_states[:, v_end+1:, :]   # (batch_size, seq_len-v_end-1, dim)
+
+    # 拼接
+    text_hidden = torch.cat([text_before, text_after], dim=1)  # (batch_size, text_len, dim)
+
+    return text_hidden
 
 
 def replace_vision_tokens_in_embeddings_batch(
