@@ -11,6 +11,7 @@ from collections import defaultdict
 from .utils import (
     extract_target_hidden_states,
     extract_text_hidden_states,
+    weighted_pool_text_hidden_states,
     compute_task_loss,
     register_multi_layer_hooks,
     remove_hooks,
@@ -222,19 +223,38 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # ========== Phase 3: Discriminator Judgment ==========
 
+        # 3.1 对text hidden states进行加权融合
+        # 越靠前的token权重越小（信息不完整），越靠后权重越大（信息完整）
+        fake_hidden_pooled = weighted_pool_text_hidden_states(
+            fake_hidden_list,
+            start_weight=0.5,  # 前面token权重0.5
+            end_weight=1.0     # 后面token权重1.0
+        )  # List[(batch, hidden_dim)]
+
+        real_hidden_pooled = weighted_pool_text_hidden_states(
+            real_hidden_list,
+            start_weight=0.5,
+            end_weight=1.0
+        )  # List[(batch, hidden_dim)]
+
+        # 3.2 将每层的pooled表示拼接成(batch, 1, hidden_dim)用于判别器
+        # 判别器需要(batch, seq_len, hidden_dim)格式，这里seq_len=1表示整个样本只判别一次
+        fake_hidden_for_disc = [h.unsqueeze(1) for h in fake_hidden_pooled]  # List[(batch, 1, hidden_dim)]
+        real_hidden_for_disc = [h.unsqueeze(1) for h in real_hidden_pooled]  # List[(batch, 1, hidden_dim)]
+
         discriminator.eval()
 
-        # 3.1 判别fake（用于generator loss）
+        # 3.3 判别fake（用于generator loss）
         for p in discriminator.parameters():
             p.requires_grad = False
 
-        fake_pred_for_gen = discriminator(fake_hidden_list)  # (batch, seq_len)
+        fake_pred_for_gen = discriminator(fake_hidden_for_disc)  # (batch, 1)
 
         for p in discriminator.parameters():
             p.requires_grad = True
 
-        # 3.2 判别real
-        real_pred = discriminator(real_hidden_list)
+        # 3.4 判别real
+        real_pred = discriminator(real_hidden_for_disc)  # (batch, 1)
 
         # ========== Phase 4: Loss Computation ==========
 

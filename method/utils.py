@@ -185,6 +185,40 @@ def extract_text_hidden_states(
     return selected_hidden_states
 
 
+def weighted_pool_text_hidden_states(
+    text_hidden_list: List[torch.Tensor],
+    start_weight: float = 0.5,
+    end_weight: float = 1.0
+) -> List[torch.Tensor]:
+    """对text hidden states进行逐token加权融合，越靠后权重越大
+
+    参数:
+        text_hidden_list: List[(batch, text_len, hidden_dim)] - 每层的text hidden states
+        start_weight: float - 第一个token的权重（默认0.5）
+        end_weight: float - 最后一个token的权重（默认1.0）
+
+    返回:
+        pooled_list: List[(batch, hidden_dim)] - 每层融合后的表示
+    """
+    pooled_list = []
+
+    for text_hidden in text_hidden_list:
+        batch_size, text_len, hidden_dim = text_hidden.shape
+
+        # 创建线性递增的权重：从start_weight到end_weight
+        # Shape: (text_len,)
+        weights = torch.linspace(start_weight, end_weight, text_len, device=text_hidden.device)
+        weights = weights.view(1, -1, 1)  # (1, text_len, 1) for broadcasting
+
+        # 加权平均：每个token乘以其权重，然后求和并归一化
+        weighted_hidden = text_hidden * weights  # (batch, text_len, hidden_dim)
+        pooled = weighted_hidden.sum(dim=1) / weights.sum()  # (batch, hidden_dim)
+
+        pooled_list.append(pooled)
+
+    return pooled_list
+
+
 def compute_task_loss(
     logits: torch.Tensor,
     answer_positions: Tuple[int, int],
