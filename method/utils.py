@@ -142,13 +142,46 @@ def extract_target_hidden_states(
     """提取指定层和位置的hidden states"""
     start, end = target_positions
     selected_hidden_states = []
-    
+
     for layer_idx in target_layer_indices:
         hidden = all_hidden_states[layer_idx]
         # 不再强制移动设备，保持在原始设备上
         hidden_slice = hidden[:, start:None if end+1==0 else end+1, :]
         selected_hidden_states.append(hidden_slice)
-    
+
+    return selected_hidden_states
+
+
+def extract_text_hidden_states(
+    all_hidden_states: tuple,
+    vision_positions: Tuple[int, int],
+    target_layer_indices: List[int]
+) -> List[torch.Tensor]:
+    """提取所有text token的hidden states（排除vision tokens）
+
+    参数:
+        all_hidden_states: tuple of (batch, seq_len, hidden_dim) - 所有层的hidden states
+        vision_positions: (start, end) - vision tokens的位置
+        target_layer_indices: List[int] - 要提取的层索引（如[-1, -3, -5]）
+
+    返回:
+        selected_hidden_states: List[(batch, text_seq_len, hidden_dim)] - 每层的text hidden states
+    """
+    v_start, v_end = vision_positions
+    selected_hidden_states = []
+
+    for layer_idx in target_layer_indices:
+        hidden = all_hidden_states[layer_idx]  # (batch, seq_len, hidden_dim)
+        seq_len = hidden.shape[1]
+
+        # 提取所有text tokens: [0:v_start] + [v_end+1:seq_len]
+        text_before = hidden[:, :v_start, :]  # vision前的text
+        text_after = hidden[:, v_end+1:, :]   # vision后的text (question + answer)
+
+        # 拼接所有text tokens
+        text_hidden = torch.cat([text_before, text_after], dim=1)  # (batch, text_len, hidden_dim)
+        selected_hidden_states.append(text_hidden)
+
     return selected_hidden_states
 
 

@@ -30,9 +30,9 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: 1.7e-05
-    print_loss_every_batches: 100
-    eval_every_batches: 500
-    eval_max_samples: 2000
+    print_loss_every_batches: 20
+    eval_every_batches: 100
+    eval_max_samples: 50
     save_every_batches: 500
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
@@ -42,7 +42,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [5,6,7]
+  available_gpus: [1, 3, 5]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -164,13 +164,14 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 80000
-    test: 2000
+    train: 20000
+    test: 200
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
     values:
-      - train: "origin"
-  fast_load_no_random: false  # 快速加载模式（Optuna搜索时加速）
+      - train: "mean"
+      - test: "mean"
+  fast_load_no_random: true  # 快速加载模式（Optuna搜索时加速）
 
 config_settings:
   enable_dict_overrides: true
@@ -185,6 +186,8 @@ backbone_settings:  # 多模态大模型骨架配置
     device_map: "balanced"  # 显存分配策略（balanced/auto）
     max_text_tokens: 128  # 最大文本token数
     max_vision_tokens: 1600  # 最大视觉token数（减少降低显存占用）
+    hidden_dim: 4096
+    vision_dim: 1024
     image_max_size: 1100  # 图像最大尺寸（减少降低vision token数）
 
 
@@ -215,14 +218,15 @@ method_settings:
 
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
-  sparsity_weight: 9  # Sparsity约束loss权重（恒定值）
-  sparsity_warmup_enable: false
+  sparsity_weight: 5  # Sparsity约束loss权重（强惩罚）
+  sparsity_weight_max: 0.0006
+  sparsity_warmup_ratio: 0.7
   token_count_loss_weight: 0.08  # Token总数loss权重（弱惩罚，鼓励减少token）
   binarization_loss_weight: 0.81  # Binarization loss权重，鼓励soft_mask接近0或1
 
   # ==================== Temperature Annealing（新增） ====================
   temperature: 0.99  # 初始temperature
-  temperature_min: 0.4  # 最小temperature
+  temperature_min: 0.5  # 最小temperature
   temperature_anneal_rate: 0.4  # Anneal比例（前50%步数进行annealing）
 
   # ==================== Hard Pruning配置（评估时使用） ====================
@@ -243,21 +247,25 @@ method_settings:
   # ==================== Discriminator配置 ====================
   disc_num_layers: 3  # 使用的LLM隐层数量
   disc_d_d: 512  # 隐层维度
-  disc_dropout: 0.15  # Dropout比率
+  disc_dropout: 0.2  # Dropout比率
   disc_target_layers: [-1, -3, -5]  # 目标LLM层索引
-  disc_reinit_prob: 0.15  # 每个batch重初始化Discriminator的概率
+  disc_reinit_prob: 0.2  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
+
+  # ==================== 评估配置 ====================
+  eval_apply_bias_soft: true
+  eval_apply_bias_hard: true
 
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
   task_loss_weight_start: 80.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 50.0  # 目标权重（warmup后的稳定值）
+  task_loss_weight: 20  # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 1.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 50  # 目标权重（warmup后强化对抗）
+  adv_loss_weight: 40  # 目标权重（warmup后强化对抗）
 
   # Entropy Loss权重
   entropy_weight: 12.0
@@ -267,4 +275,3 @@ method_settings:
 
 evaluation_settings:  # 评估配置
   eval_mode: ["origin", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝
-  eval_use_gumbel: false  # 评估时是否使用Gumbel Softmax (false=确定性推理，推荐)

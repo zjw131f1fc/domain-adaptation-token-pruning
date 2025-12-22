@@ -10,6 +10,7 @@ from typing import Dict, Any, List
 from collections import defaultdict
 from .utils import (
     extract_target_hidden_states,
+    extract_text_hidden_states,
     compute_task_loss,
     register_multi_layer_hooks,
     remove_hooks,
@@ -194,12 +195,11 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
                 output_hidden_states=True
             )
 
-            # 2.3 提取hidden states from target layers
-            fake_hidden_list = extract_target_hidden_states(
+            # 2.3 提取text hidden states from target layers (排除vision tokens)
+            fake_hidden_list = extract_text_hidden_states(
                 result_fake['all_hidden_states'],
-                answer_pos,
-                disc_target_layers,
-                batch_size=1
+                new_vision_pos,  # 使用merged后的vision位置
+                disc_target_layers
             )
 
         finally:
@@ -214,11 +214,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
                 output_hidden_states=True
             )
 
-            real_hidden_list = extract_target_hidden_states(
+            real_hidden_list = extract_text_hidden_states(
                 result_real['all_hidden_states'],
-                answer_pos,
-                disc_target_layers,
-                batch_size=1
+                original_vision_pos,  # 使用原始vision位置
+                disc_target_layers
             )
 
         # ========== Phase 3: Discriminator Judgment ==========
