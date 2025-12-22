@@ -16,20 +16,20 @@ trainer_settings:  # 训练框架设置
   name: "basic-pytorch"
   dl_settings:
     epochs: 1
-    batch_size: 6
+    batch_size: 7
     optimizers: # lr增大了10倍，不稳定的话需要改回去
       generator:
         type: "adam"
         lr: 2.0e-05
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: 3.2e-03
+        lr: 3.2e-02
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
         lr: 1.0e-04
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: 1.7e-04
+        lr: 1.7e-03
     print_loss_every_batches: 20
     eval_every_batches: 200
     eval_max_samples: 300
@@ -37,6 +37,15 @@ trainer_settings:  # 训练框架设置
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
     grad_clip_max_norm: null
+    # 学习率退火配置
+    lr_scheduler:
+      type: "cosine"  # 调度器类型: "cosine" (余弦退火), "linear" (线性衰减), "none" (不使用)
+      warmup_ratio: 0.1  # warmup比例 (前10%步数进行warmup)
+      min_lr_ratio: 0.01  # 最小学习率比例 (最终lr = 初始lr * min_lr_ratio)
+    # 混合精度训练配置
+    amp:
+      enabled: true  # 是否启用混合精度训练
+      dtype: "bfloat16"  # 混合精度类型: "float16" (FP16) 或 "bfloat16" (BF16, 需要Ampere及以上GPU)
 
 manager_settings:
   name: "basic"
@@ -164,7 +173,7 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 80000
+    train: 40000
     test: 2000
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载

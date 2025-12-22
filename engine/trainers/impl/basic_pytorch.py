@@ -12,8 +12,11 @@
 from typing import Any, Dict, List, Callable, Optional
 from dataclasses import dataclass
 import time
+import math
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 
@@ -53,6 +56,17 @@ class BasicPytorchTrainer:
         self.optim_cfg = ts["optimizers"]
         self.param_groups: Dict[str, _ParamGroupSpec] = {}
         self.optimizers: Dict[str, torch.optim.Optimizer] = {}
+        self.schedulers: Dict[str, LambdaLR] = {}  # 学习率调度器
+
+        # 学习率调度器配置
+        self.lr_scheduler_cfg = ts.get("lr_scheduler", {"type": "none"})
+
+        # 混合精度训练配置
+        self.amp_cfg = ts.get("amp", {"enabled": False})
+        self.amp_enabled = self.amp_cfg.get("enabled", False)
+        amp_dtype_str = self.amp_cfg.get("dtype", "float16").lower()
+        self.amp_dtype = torch.float16 if amp_dtype_str == "float16" else torch.bfloat16
+        self.grad_scaler: Optional[GradScaler] = None  # 在 setup_optimizers 后初始化
 
         # 数据集
         self.dataset_bundle = dataset_bundle
@@ -132,6 +146,66 @@ class BasicPytorchTrainer:
             self.optimizers[name] = opt
             if self.logger:
                 self.logger.info(f"优化器就绪: {name} -> {spec.opt_type}")
+
+        # 初始化 GradScaler（混合精度训练）
+        if self.amp_enabled:
+            # bfloat16 不需要 GradScaler，只有 float16 需要
+            if self.amp_dtype == torch.float16:
+                self.grad_scaler = GradScaler()
+                if self.logger:
+                    self.logger.info("混合精度训练已启用 (FP16 + GradScaler)")
+            else:
+                if self.logger:
+                    self.logger.info("混合精度训练已启用 (BF16, 无需GradScaler)")
+
+    def setup_schedulers(self, total_steps: int):
+        """根据配置创建学习率调度器。
+
+        参数:
+            total_steps: 总训练步数
+        """
+        scheduler_type = self.lr_scheduler_cfg.get("type", "none").lower()
+        if scheduler_type == "none":
+            if self.logger:
+                self.logger.info("学习率调度器: 未启用")
+            return
+
+        warmup_ratio = self.lr_scheduler_cfg.get("warmup_ratio", 0.1)
+        min_lr_ratio = self.lr_scheduler_cfg.get("min_lr_ratio", 0.01)
+        warmup_steps = int(total_steps * warmup_ratio)
+
+        if self.logger:
+            self.logger.info(f"学习率调度器配置: type={scheduler_type}, warmup_steps={warmup_steps}, min_lr_ratio={min_lr_ratio}")
+
+        for name, opt in self.optimizers.items():
+            if scheduler_type == "cosine":
+                # 带warmup的余弦退火
+                def lr_lambda(current_step, warmup_steps=warmup_steps, total_steps=total_steps, min_lr_ratio=min_lr_ratio):
+                    if current_step < warmup_steps:
+                        # warmup阶段: 线性增长
+                        return float(current_step) / float(max(1, warmup_steps))
+                    else:
+                        # 余弦退火阶段
+                        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+                scheduler = LambdaLR(opt, lr_lambda)
+            elif scheduler_type == "linear":
+                # 带warmup的线性衰减
+                def lr_lambda(current_step, warmup_steps=warmup_steps, total_steps=total_steps, min_lr_ratio=min_lr_ratio):
+                    if current_step < warmup_steps:
+                        return float(current_step) / float(max(1, warmup_steps))
+                    else:
+                        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                        return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
+
+                scheduler = LambdaLR(opt, lr_lambda)
+            else:
+                raise ValueError(f"不支持的调度器类型: {scheduler_type}")
+
+            self.schedulers[name] = scheduler
+            if self.logger:
+                self.logger.info(f"学习率调度器就绪: {name} -> {scheduler_type}")
 
     # ---------------------- 模型注册 ----------------------
     def register_model(self, name: str, model):
@@ -360,7 +434,10 @@ class BasicPytorchTrainer:
         loader = self._make_loader(train_ds, shuffle=True)
         batch_count = 0
         total_planned_batches = self.epochs * len(loader)
-        
+
+        # 初始化学习率调度器
+        self.setup_schedulers(total_planned_batches)
+
         # 时间跟踪：用于预估剩余时间
         start_time = time.time()
         batch_times = []  # 记录最近若干batch的耗时
@@ -387,6 +464,8 @@ class BasicPytorchTrainer:
                     "total_planned_batches": total_planned_batches,
                     "models": self.models,
                     "persistent_state": self.persistent_state,
+                    "amp_enabled": self.amp_enabled,
+                    "amp_dtype": self.amp_dtype,
                 }
                 outputs = self.train_fn(batch, self.device, info)
 
@@ -394,7 +473,7 @@ class BasicPytorchTrainer:
                 # 先清空所有优化器的梯度
                 for opt in self.optimizers.values():
                     opt.zero_grad(set_to_none=True)
-                
+
                 # 然后分别 backward 各组的损失
                 group_names = list(self.optimizers.keys())
                 for idx, group_name in enumerate(group_names):
@@ -404,20 +483,35 @@ class BasicPytorchTrainer:
                         loss = sum(group_out.values())
                     else:
                         loss = group_out
-                    
+
                     if not torch.is_tensor(loss):
                         loss = torch.tensor(float(loss), dtype=torch.float32, device=self.device)
                     # 如果不是最后一个组，保留计算图
                     retain_graph = (idx < len(group_names) - 1)
-                    loss.backward(retain_graph=retain_graph)
-                
+
+                    # 使用 GradScaler 进行反向传播（FP16混合精度）
+                    if self.grad_scaler is not None:
+                        self.grad_scaler.scale(loss).backward(retain_graph=retain_graph)
+                    else:
+                        loss.backward(retain_graph=retain_graph)
+
                 # 梯度裁剪（在 backward 之后，optimizer.step 之前）
                 if self.grad_clip_max_norm is not None:
+                    if self.grad_scaler is not None:
+                        # 使用 GradScaler 时需要先 unscale 梯度再裁剪
+                        for opt in self.optimizers.values():
+                            self.grad_scaler.unscale_(opt)
                     for group_name, spec in self.param_groups.items():
                         torch.nn.utils.clip_grad_norm_(spec.params, self.grad_clip_max_norm)
 
                 # === 收集要打印的所有信息（梯度 + Loss + Metrics） ===
                 if self.print_loss_every_batches and batch_count % self.print_loss_every_batches == 0:
+                    # 0. 收集学习率信息
+                    lr_stats = []
+                    for name, opt in self.optimizers.items():
+                        current_lr = opt.param_groups[0]['lr']
+                        lr_stats.append(f"lr_{name}={current_lr:.2e}")
+
                     # 1. 收集梯度信息
                     grad_stats = []
                     for group_name, spec in self.param_groups.items():
@@ -483,6 +577,10 @@ class BasicPytorchTrainer:
                         self.logger.info(f"\n{'='*80}")
                         self.logger.info(f"[Batch {batch_count}/{total_planned_batches}]")
 
+                        # 打印学习率信息
+                        if lr_stats:
+                            self.logger.info("  Learning rates: " + " | ".join(lr_stats))
+
                         # 打印梯度信息
                         if grad_stats:
                             self.logger.info("  Gradients: " + " | ".join(grad_stats))
@@ -511,8 +609,18 @@ class BasicPytorchTrainer:
                         self.logger.info(f"{'='*80}")
 
                 # 最后统一执行优化步骤
-                for opt in self.optimizers.values():
-                    opt.step()
+                if self.grad_scaler is not None:
+                    # FP16混合精度：使用 GradScaler
+                    for opt in self.optimizers.values():
+                        self.grad_scaler.step(opt)
+                    self.grad_scaler.update()
+                else:
+                    for opt in self.optimizers.values():
+                        opt.step()
+
+                # 更新学习率调度器
+                for scheduler in self.schedulers.values():
+                    scheduler.step()
 
                 batch_count += 1
 
@@ -648,6 +756,9 @@ class BasicPytorchTrainer:
             self.setup_optimizers()
             self._current_loader = self._make_loader(train_ds, shuffle=True)
             self._dataloader_iterator = iter(self._current_loader)
+            # 估算总步数用于学习率调度（epochs * steps_per_epoch）
+            total_steps = self.epochs * len(self._current_loader)
+            self.setup_schedulers(total_steps)
             if self.logger:
                 self.logger.info(f"初始化训练: batch_size={self.batch_size}, steps/epoch={len(self._current_loader)}")
         
@@ -724,7 +835,11 @@ class BasicPytorchTrainer:
             # 优化步骤
             for opt in self.optimizers.values():
                 opt.step()
-            
+
+            # 更新学习率调度器
+            for scheduler in self.schedulers.values():
+                scheduler.step()
+
             # 更新计数器
             self._current_epoch_batch_idx += 1
             self._global_batch_count += 1

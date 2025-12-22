@@ -261,26 +261,17 @@ def register_multi_layer_hooks_batch(
                 # 提取vision tokens（batch维度）
                 vision_hidden = hidden_states[:, v_start:v_end+1, :]  # (batch_size, n_vision, d)
 
-                # 提取text→vision attention（如果启用）
-                text_to_vision_attn = None
+                # Pruner forward（batch处理）
+                # 当use_attn_residual=False时，跳过text_to_vision_attn计算以节约时间
                 if use_attn_residual:
-                    # 从self-attention输出中提取attention weights
-                    # 注意：这需要访问layer的attention输出
-                    # 如果模型返回了attention weights，可以从output中获取
-                    # 否则需要单独计算或从module中获取
-                    # 这里使用一个简化的实现：基于question embeddings计算attention
-
-                    # 提取question部分的hidden states
-                    # question在vision之后，假设从v_end+1开始
-                    # 但在batch模式下，需要知道question的长度
+                    # 提取text→vision attention
+                    text_to_vision_attn = None
                     q_len = question_embeddings.shape[1]
                     if v_end + 1 + q_len <= hidden_states.shape[1]:
                         text_hidden = hidden_states[:, v_end+1:v_end+1+q_len, :]  # (batch, q_len, d)
 
                         # 计算text→vision的attention分数
-                        # 使用点积attention: softmax(Q @ V^T / sqrt(d))
                         d_model = text_hidden.shape[-1]
-                        # Q = text, K = vision
                         attn_scores = torch.matmul(text_hidden, vision_hidden.transpose(1, 2))  # (batch, q_len, n_vision)
                         attn_scores = attn_scores / (d_model ** 0.5)
                         attn_weights = torch.softmax(attn_scores, dim=-1)  # (batch, q_len, n_vision)
@@ -288,13 +279,20 @@ def register_multi_layer_hooks_batch(
                         # 平均所有text token对vision的attention
                         text_to_vision_attn = attn_weights.mean(dim=1)  # (batch, n_vision)
 
-                # Pruner forward（batch处理）
-                soft_mask = pruner_obj(
-                    vision_hidden,
-                    question_embeddings,
-                    use_gumbel=True,
-                    text_to_vision_attn=text_to_vision_attn
-                )  # (batch_size, n_vision)
+                    soft_mask = pruner_obj(
+                        vision_hidden,
+                        question_embeddings,
+                        use_gumbel=True,
+                        text_to_vision_attn=text_to_vision_attn
+                    )  # (batch_size, n_vision)
+                else:
+                    # 不启用attn_residual时，直接调用pruner，无需计算attention
+                    soft_mask = pruner_obj(
+                        vision_hidden,
+                        question_embeddings,
+                        use_gumbel=True,
+                        text_to_vision_attn=None
+                    )  # (batch_size, n_vision)
 
                 # 收集mask用于sparsity loss
                 if mask_collector is not None:
