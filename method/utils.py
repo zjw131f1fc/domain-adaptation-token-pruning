@@ -791,7 +791,8 @@ def create_layer_hard_pruning_modifier(
     layer_idx: int,
     threshold: float = 0.5,
     is_first_layer: bool = False,
-    min_seq_len_for_pruning: int = 50
+    min_seq_len_for_pruning: int = 50,
+    use_gumbel: bool = False
 ) -> Callable:
     """创建层hard剪枝的modifier函数（用于hook）
 
@@ -808,6 +809,7 @@ def create_layer_hard_pruning_modifier(
         threshold: hard mask阈值，默认0.5
         is_first_layer: 是否是第一个剪枝层（用于检测prefill/decode）
         min_seq_len_for_pruning: 最小序列长度阈值，低于此值不执行剪枝（避免decode阶段触发）
+        use_gumbel: 是否使用Gumbel Softmax（评估时通常为False）
 
     返回:
         modifier函数，签名为 (hidden_states, attention_mask) -> (new_hidden, new_mask)
@@ -874,7 +876,7 @@ def create_layer_hard_pruning_modifier(
 
         # === Step 2: 调用pruner生成soft_mask ===
         with torch.no_grad():  # 评估时不需要梯度
-            soft_mask = pruner(vision_hidden, question_embeddings, use_gumbel=False)  # (batch, n_vision)
+            soft_mask = pruner(vision_hidden, question_embeddings, use_gumbel=use_gumbel)  # (batch, n_vision)
 
         # === Step 3: 转换为hard mask ===
         hard_mask = (soft_mask > threshold).float()  # (batch, n_vision)
@@ -968,7 +970,7 @@ def register_multi_layer_hard_hooks(
         is_first = (idx == 0)
         modifier = create_layer_hard_pruning_modifier(
             pruner, context, question_embeddings, layer_idx, threshold,
-            is_first_layer=is_first
+            is_first_layer=is_first, use_gumbel=use_gumbel
         )
 
         # 3. 注册hook到LLaMA的对应层
@@ -1000,7 +1002,8 @@ def register_hard_pruning_at_model_level(
     layer_pruners,
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    use_gumbel: bool = False
 ) -> Tuple[Callable, HardPruningContext]:
     """在LlamaModel层面注册hard pruning，正确处理position_ids等参数
 
@@ -1013,6 +1016,7 @@ def register_hard_pruning_at_model_level(
         vision_positions: (start, end) - 初始vision tokens位置
         question_embeddings: (batch, n_text, d_text) - question embeddings
         threshold: hard mask阈值，默认0.5
+        use_gumbel: 是否使用Gumbel Softmax（评估时通常为False）
 
     返回:
         restore_fn: 恢复原始forward的函数
@@ -1022,6 +1026,7 @@ def register_hard_pruning_at_model_level(
     context.layer_pruners = layer_pruners
     context.question_embeddings = question_embeddings
     context.threshold = threshold
+    context.use_gumbel = use_gumbel  # 将use_gumbel存储到context中
 
     # 获取LlamaModel
     llama_model = backbone.model.model.language_model
@@ -1205,7 +1210,7 @@ def apply_hard_pruning_to_hidden_states(
 
     # 生成soft_mask
     with torch.no_grad():
-        soft_mask = pruner(vision_hidden, context.question_embeddings, use_gumbel=False)
+        soft_mask = pruner(vision_hidden, context.question_embeddings, use_gumbel=context.use_gumbel)
 
     # 转换为hard mask
     hard_mask = (soft_mask > context.threshold).float()

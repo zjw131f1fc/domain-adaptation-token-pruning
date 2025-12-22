@@ -186,6 +186,7 @@ DEFAULT_CONFIG = {
     },
     "evaluation_settings": {
         "eval_mode": ["origin", "full"],
+        "eval_use_gumbel": False,  # 评估时是否使用Gumbel Softmax (False=确定性推理)
     }
 }
 

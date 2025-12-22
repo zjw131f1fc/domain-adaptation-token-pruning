@@ -32,7 +32,7 @@ trainer_settings:  # 训练框架设置
         lr: 1.7e-05
     print_loss_every_batches: 100
     eval_every_batches: 1000
-    eval_max_samples: 2000
+    eval_max_samples: 1000
     save_every_batches: 1000
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
@@ -169,7 +169,7 @@ dataset_settings:  # 数据集配置
   category_priority:
     enable: true  # 禁用类别均衡，加快数据加载
     values:
-      - train: "mean"
+      - train: "origin"
   fast_load_no_random: false  # 快速加载模式（Optuna搜索时加速）
 
 config_settings:
@@ -269,3 +269,4 @@ method_settings:
 
 evaluation_settings:  # 评估配置
   eval_mode: ["origin", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝
+  eval_use_gumbel: false  # 评估时是否使用Gumbel Softmax (false=确定性推理，推荐)

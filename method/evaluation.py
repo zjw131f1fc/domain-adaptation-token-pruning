@@ -40,6 +40,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
     # 获取配置
     enable_token_merger = config["method_settings"].get("enable_token_merger", True)
+    eval_use_gumbel = config["evaluation_settings"].get("eval_use_gumbel", False)
 
     # 设置为eval模式
     if token_merger is not None:
@@ -110,9 +111,9 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
                     # Token Merge (在1024维空间操作)
                     if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
-                        merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=False)
+                        merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=eval_use_gumbel)
                     else:
-                        merge_result = token_merger(vision_features_raw, use_gumbel=False)
+                        merge_result = token_merger(vision_features_raw, use_gumbel=eval_use_gumbel)
                     merged_vision = merge_result['merged_features']  # (1, M, 1024)
 
                     # 投影到LLM维度 (1024 → 4096)
@@ -193,7 +194,8 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                     layer_pruners,
                     new_vision_pos,
                     question_embeddings,
-                    threshold=hard_threshold
+                    threshold=hard_threshold,
+                    use_gumbel=eval_use_gumbel
                 )
 
                 try:
