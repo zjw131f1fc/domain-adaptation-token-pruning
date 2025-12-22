@@ -189,8 +189,7 @@ backbone_settings:  # 多模态大模型骨架配置
     image_max_size: 1100  # 图像最大尺寸（减少降低vision token数）
 
     # ==================== Batch化相关配置 ====================
-    enable_true_batch: true  # 是否启用真正的batch化处理（需要统一图片尺寸）
-                             # 使用左padding确保vision token位置对齐
+    enable_true_batch: true  # batch化处理（需要统一图片尺寸）
     unified_image_size: 336  # 统一的图片尺寸（正方形，如336x336）
 
 

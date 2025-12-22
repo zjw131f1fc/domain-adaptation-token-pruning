@@ -512,11 +512,10 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
         questions: List[str],
         answers: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """批量预处理输入（真正的batch化）。
+        """批量预处理输入。
 
         注意：
         - 要求所有图片已统一尺寸（通过 _resize_image 实现）
-        - 要求启用 enable_true_batch 配置
         - 所有样本的 vision token 数量必须相同
 
         参数:
@@ -533,16 +532,8 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             - raw_vision_features: torch.Tensor, shape (batch_size, n_vision_tokens, 1024)
 
         抛出:
-            ValueError: 当未启用 enable_true_batch 或序列长度不一致时
+            ValueError: 当序列长度不一致时
         """
-        # 检查配置
-        enable_true_batch = self.mllm_cfg.get("enable_true_batch", False)
-        if not enable_true_batch:
-            raise ValueError(
-                "preprocess_batch requires enable_true_batch=True in config. "
-                "Please set backbone_settings.mllm_settings.enable_true_batch=true"
-            )
-
         batch_size = len(images)
         if len(questions) != batch_size:
             raise ValueError(f"images and questions length mismatch: {batch_size} vs {len(questions)}")

@@ -44,7 +44,6 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
         LayerSpecificPruner,
         Discriminator,
         train_step,
-        train_step_batch,
         eval_step
     )
 
@@ -52,15 +51,6 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
     backbone = cache["backbone"]
     dataset_bundle = cache["dataset_bundle"]
     device = config.get("global_settings", {}).get("device")
-
-    # 根据配置选择训练函数
-    enable_true_batch = config["backbone_settings"]["mllm_settings"].get("enable_true_batch", False)
-    if enable_true_batch:
-        logger.info("⚡ Batch化模式已启用 - 使用 train_step_batch")
-        train_step_fn = train_step_batch
-    else:
-        logger.info("📝 标准模式 - 使用 train_step")
-        train_step_fn = train_step
 
     # 将dataset_bundle放入config供eval_step使用
     config["_dataset_bundle"] = dataset_bundle
@@ -152,13 +142,12 @@ def run_fn(config: Dict, cache: Dict[str, Any]) -> Dict[str, Any]:
 
     # ==================== 注册训练和评估函数 ====================
 
-    trainer.register_train_step(train_step_fn)  # 使用动态选择的训练函数
+    trainer.register_train_step(train_step)
     trainer.register_eval_step(eval_step)
 
     # ==================== 执行训练 ====================
 
     logger.info("开始训练...")
-    logger.info(f"训练函数: {train_step_fn.__name__}")  # 显示使用的训练函数
     logger.info(f"Token Merger类型: {merger_type}")
     logger.info(f"Merge Ratio: {config['method_settings']['merge_ratio']}")
     logger.info(f"Pruning Layers: {config['method_settings']['pruning_layers']}")
