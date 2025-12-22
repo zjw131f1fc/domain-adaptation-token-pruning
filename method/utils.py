@@ -219,6 +219,37 @@ def weighted_pool_text_hidden_states(
     return pooled_list
 
 
+def add_position_aware_noise_to_pooled(
+    pooled_hidden_list: List[torch.Tensor],
+    noise_scale: float = 0.01,
+    training: bool = True
+) -> List[torch.Tensor]:
+    """给pooled hidden states添加高斯噪声（替代dropout）
+
+    注意：由于输入是已经加权融合后的表示，噪声的强度已经通过加权融合时的权重调节了
+    （前面token权重小→贡献小→间接实现了"前面信息不可靠"的效果）
+
+    参数:
+        pooled_hidden_list: List[(batch, hidden_dim)] - 融合后的hidden states
+        noise_scale: float - 噪声标准差（默认0.01）
+        training: bool - 是否在训练模式（仅训练时加噪声）
+
+    返回:
+        noisy_hidden_list: List[(batch, hidden_dim)] - 加噪声后的hidden states
+    """
+    if not training or noise_scale <= 0:
+        return pooled_hidden_list
+
+    noisy_list = []
+    for pooled_hidden in pooled_hidden_list:
+        # 添加高斯噪声
+        noise = torch.randn_like(pooled_hidden) * noise_scale
+        noisy_hidden = pooled_hidden + noise
+        noisy_list.append(noisy_hidden)
+
+    return noisy_list
+
+
 def compute_task_loss(
     logits: torch.Tensor,
     answer_positions: Tuple[int, int],

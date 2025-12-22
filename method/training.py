@@ -12,6 +12,7 @@ from .utils import (
     extract_target_hidden_states,
     extract_text_hidden_states,
     weighted_pool_text_hidden_states,
+    add_position_aware_noise_to_pooled,
     compute_task_loss,
     register_multi_layer_hooks,
     remove_hooks,
@@ -237,14 +238,29 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             end_weight=1.0
         )  # List[(batch, hidden_dim)]
 
-        # 3.2 将每层的pooled表示拼接成(batch, 1, hidden_dim)用于判别器
+        # 3.2 添加位置感知噪声（替代dropout）
+        # Real和Fake都加噪声，提高判别器鲁棒性
+        # 噪声效果已通过加权融合间接实现（前面token权重小=贡献小=不确定性高）
+        disc_noise_scale = config["method_settings"].get("disc_noise_scale", 0.01)
+        fake_hidden_pooled = add_position_aware_noise_to_pooled(
+            fake_hidden_pooled,
+            noise_scale=disc_noise_scale,
+            training=True
+        )
+        real_hidden_pooled = add_position_aware_noise_to_pooled(
+            real_hidden_pooled,
+            noise_scale=disc_noise_scale,
+            training=True
+        )
+
+        # 3.3 将每层的pooled表示拼接成(batch, 1, hidden_dim)用于判别器
         # 判别器需要(batch, seq_len, hidden_dim)格式，这里seq_len=1表示整个样本只判别一次
         fake_hidden_for_disc = [h.unsqueeze(1) for h in fake_hidden_pooled]  # List[(batch, 1, hidden_dim)]
         real_hidden_for_disc = [h.unsqueeze(1) for h in real_hidden_pooled]  # List[(batch, 1, hidden_dim)]
 
         discriminator.eval()
 
-        # 3.3 判别fake（用于generator loss）
+        # 3.4 判别fake（用于generator loss）
         for p in discriminator.parameters():
             p.requires_grad = False
 
@@ -253,7 +269,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         for p in discriminator.parameters():
             p.requires_grad = True
 
-        # 3.4 判别real
+        # 3.5 判别real
         real_pred = discriminator(real_hidden_for_disc)  # (batch, 1)
 
         # ========== Phase 4: Loss Computation ==========
