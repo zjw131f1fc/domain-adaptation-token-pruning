@@ -463,9 +463,38 @@ class BasicPytorchTrainer:
                         eta_str = self._format_time(eta_seconds)
                         all_parts.append(f"ETA: {eta_str}")
 
-                    # 6. 统一打印
+                    # 6. 统一打印（多行格式，清晰易读）
                     if self.logger:
-                        self.logger.info(f"[Batch {batch_count}/{total_planned_batches}] " + " | ".join(all_parts))
+                        # 打印批次信息
+                        self.logger.info(f"\n{'='*80}")
+                        self.logger.info(f"[Batch {batch_count}/{total_planned_batches}]")
+
+                        # 打印梯度信息
+                        if grad_stats:
+                            self.logger.info("  Gradients: " + " | ".join(grad_stats))
+
+                        # 打印损失信息
+                        if loss_parts:
+                            self.logger.info("  Losses:")
+                            for loss_str in loss_parts:
+                                self.logger.info(f"    - {loss_str}")
+
+                        # 打印metrics信息
+                        if metric_strs:
+                            self.logger.info("  Metrics:")
+                            # 每行打印3个metric
+                            for i in range(0, len(metric_strs), 3):
+                                batch_metrics = metric_strs[i:i+3]
+                                self.logger.info(f"    {' | '.join(batch_metrics)}")
+
+                        # 打印ETA
+                        if len(batch_times) > 0 and remaining_batches > 0:
+                            avg_batch_time = sum(batch_times) / len(batch_times)
+                            eta_seconds = avg_batch_time * remaining_batches
+                            eta_str = self._format_time(eta_seconds)
+                            self.logger.info(f"  ETA: {eta_str}")
+
+                        self.logger.info(f"{'='*80}")
 
                 # 最后统一执行优化步骤
                 for opt in self.optimizers.values():

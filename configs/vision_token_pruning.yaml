@@ -31,8 +31,8 @@ trainer_settings:  # 训练框架设置
         type: "adam"
         lr: 1.7e-04
     print_loss_every_batches: 20
-    eval_every_batches: 500
-    eval_max_samples: 500
+    eval_every_batches: 200
+    eval_max_samples: 300
     save_every_batches: 500
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
@@ -43,7 +43,7 @@ manager_settings:
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
   available_gpus: [4,5]
-  gpus_per_subtask: 3
+  gpus_per_subtask: 2
   poll_interval: 5.0
   batch_configs_dir: null
 
