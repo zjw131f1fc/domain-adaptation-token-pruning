@@ -94,27 +94,36 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
 
     def _resize_image(self, image: Image.Image) -> Image.Image:
         """根据配置调整图像大小。
-        
+
         参数:
             image: 原始图像
-            
+
         返回:
             调整后的图像
         """
+        # 检查是否启用统一尺寸
+        enable_true_batch = self.mllm_cfg.get("enable_true_batch", False)
+
+        if enable_true_batch:
+            # 启用batch化：强制调整为统一的正方形尺寸
+            unified_size = self.mllm_cfg.get("unified_image_size", 336)
+            return image.resize((unified_size, unified_size), Image.Resampling.LANCZOS)
+
+        # 原有逻辑：等比例缩放到不超过 image_max_size
         if self.image_max_size is None:
             return image
-        
+
         width, height = image.size
         max_dim = max(width, height)
-        
+
         if max_dim <= self.image_max_size:
             return image
-        
+
         # 等比例缩放
         scale = self.image_max_size / max_dim
         new_width = int(width * scale)
         new_height = int(height * scale)
-        
+
         return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
     def _build_prompt(self, question: str, answer: Optional[str] = None) -> str:
@@ -494,6 +503,230 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                 answer_end = answer_start + answer_len - 1
 
                 result["answer_token_positions"] = (answer_start, answer_end)
+
+        return result
+
+    def preprocess_batch(
+        self,
+        images: List[Image.Image],
+        questions: List[str],
+        answers: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """批量预处理输入（真正的batch化）。
+
+        注意：
+        - 要求所有图片已统一尺寸（通过 _resize_image 实现）
+        - 要求启用 enable_true_batch 配置
+        - 所有样本的 vision token 数量必须相同
+
+        参数:
+            images: PIL Image 对象列表，batch_size 个
+            questions: 问题文本列表，batch_size 个
+            answers: 答案文本列表，batch_size 个（可选）
+
+        返回:
+            包含以下键的字典:
+            - embeddings: torch.Tensor, shape (batch_size, seq_len, hidden_dim)
+            - attention_mask: torch.Tensor, shape (batch_size, seq_len)
+            - vision_token_positions: torch.Tensor, shape (batch_size, 2)，每行为 (start, end)
+            - answer_token_positions: torch.Tensor, shape (batch_size, 2)（如果提供 answer）
+            - raw_vision_features: torch.Tensor, shape (batch_size, n_vision_tokens, 1024)
+
+        抛出:
+            ValueError: 当未启用 enable_true_batch 或序列长度不一致时
+        """
+        # 检查配置
+        enable_true_batch = self.mllm_cfg.get("enable_true_batch", False)
+        if not enable_true_batch:
+            raise ValueError(
+                "preprocess_batch requires enable_true_batch=True in config. "
+                "Please set backbone_settings.mllm_settings.enable_true_batch=true"
+            )
+
+        batch_size = len(images)
+        if len(questions) != batch_size:
+            raise ValueError(f"images and questions length mismatch: {batch_size} vs {len(questions)}")
+        if answers is not None and len(answers) != batch_size:
+            raise ValueError(f"images and answers length mismatch: {batch_size} vs {len(answers)}")
+
+        # 1. 调整所有图片到统一尺寸
+        resized_images = [self._resize_image(img) for img in images]
+
+        # 2. 构建所有prompts
+        if answers is not None:
+            prompts = [self._build_prompt(q, a) for q, a in zip(questions, answers)]
+        else:
+            prompts = [self._build_prompt(q) for q in questions]
+
+        # 3. Batch处理所有输入
+        inputs = self.processor(
+            text=prompts,
+            images=[img.convert("RGB") for img in resized_images],
+            return_tensors="pt",
+            padding=True  # 自动padding到相同长度
+        )
+
+        # 移动到模型设备
+        target_device = next(self.model.parameters()).device
+        inputs = {k: v.to(target_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            input_ids = inputs['input_ids']  # (batch_size, seq_len)
+            pixel_values = inputs['pixel_values']  # (batch_size, 3, H, W)
+
+            # 4. 获取文本 token 的嵌入
+            text_token_embeds = self.model.get_input_embeddings()(input_ids)  # (batch_size, seq_len, hidden_dim)
+
+            # 5. 批量调用 vision_tower
+            raw_vision_features = None
+            image_token_embeds = None
+
+            if hasattr(self.model, 'vision_tower') and hasattr(self.model, 'multi_modal_projector'):
+                vision_tower = self.model.vision_tower
+                projector = self.model.multi_modal_projector
+
+                # Batch调用 vision_tower
+                vision_outputs = vision_tower(pixel_values, output_hidden_states=True)
+
+                # 获取指定层的 hidden states
+                vision_feature_layer = self.model.config.vision_feature_layer
+                if isinstance(vision_feature_layer, int):
+                    selected_features = vision_outputs.hidden_states[vision_feature_layer]
+                else:
+                    selected_features = torch.cat(
+                        [vision_outputs.hidden_states[idx] for idx in vision_feature_layer],
+                        dim=-1
+                    )
+
+                # 根据策略决定是否去掉 CLS
+                vision_feature_select_strategy = self.model.config.vision_feature_select_strategy
+                if vision_feature_select_strategy == "default":
+                    selected_features = selected_features[:, 1:]  # 去掉 CLS token
+
+                # raw_vision_features: (batch_size, n_vision_tokens, 1024)
+                raw_vision_features = selected_features
+
+                # 通过 projector 投影
+                image_token_embeds = projector(selected_features)  # (batch_size, n_vision_tokens, hidden_dim)
+                image_token_embeds = image_token_embeds.to(text_token_embeds.dtype)
+            else:
+                raise ValueError("Batch mode requires direct access to vision_tower and multi_modal_projector")
+
+            # 6. 找到每个样本的图像占位 token 位置
+            image_token_id = self.model.config.image_token_index
+            vision_positions_list = []
+
+            for i in range(batch_size):
+                image_token_indices = torch.where(input_ids[i] == image_token_id)[0]
+                if len(image_token_indices) == 0:
+                    raise ValueError(f"Sample {i}: 未找到图像占位 token (<image>)")
+
+                img_token_start_idx = int(image_token_indices[0])
+                img_token_end_idx = int(image_token_indices[-1])
+                vision_positions_list.append((img_token_start_idx, img_token_end_idx))
+
+            # 检查所有样本的vision token位置是否一致（batch化要求）
+            first_start, first_end = vision_positions_list[0]
+            for i, (start, end) in enumerate(vision_positions_list[1:], 1):
+                if start != first_start or end != first_end:
+                    raise ValueError(
+                        f"Vision token positions not aligned across batch: "
+                        f"sample 0 has ({first_start}, {first_end}), sample {i} has ({start}, {end}). "
+                        f"This usually means text sequences have different lengths. "
+                        f"Please ensure enable_true_batch mode uses unified image sizes."
+                    )
+
+            # 7. 批量构建完整序列
+            img_token_start_idx, img_token_end_idx = first_start, first_end
+            num_vision_tokens = image_token_embeds.shape[1]
+
+            text_embeds_part1 = text_token_embeds[:, :img_token_start_idx, :]
+            text_embeds_part2 = text_token_embeds[:, img_token_end_idx + 1:, :]
+
+            full_embeddings = torch.cat([
+                text_embeds_part1,
+                image_token_embeds,
+                text_embeds_part2
+            ], dim=1)  # (batch_size, seq_len, hidden_dim)
+
+            # 8. 构建对应的 attention mask
+            vision_attention = torch.ones(
+                (batch_size, num_vision_tokens),
+                dtype=torch.long,
+                device=target_device
+            )
+
+            if 'attention_mask' in inputs:
+                attention_part1 = inputs['attention_mask'][:, :img_token_start_idx]
+                attention_part2 = inputs['attention_mask'][:, img_token_end_idx + 1:]
+                full_attention_mask = torch.cat([
+                    attention_part1,
+                    vision_attention,
+                    attention_part2
+                ], dim=1)
+            else:
+                full_attention_mask = torch.ones(
+                    (batch_size, full_embeddings.shape[1]),
+                    dtype=torch.long,
+                    device=target_device
+                )
+
+            # 9. vision token 在完整序列中的位置（所有样本相同）
+            vision_start = text_embeds_part1.shape[1]
+            vision_end = vision_start + num_vision_tokens - 1
+
+            # 转为 (batch_size, 2) 的tensor
+            vision_positions_tensor = torch.tensor(
+                [[vision_start, vision_end]] * batch_size,
+                dtype=torch.long,
+                device=self.output_device
+            )
+
+            result = {
+                "embeddings": full_embeddings.to(self.output_device),
+                "attention_mask": full_attention_mask.to(self.output_device),
+                "vision_token_positions": vision_positions_tensor,  # (batch_size, 2)
+                "raw_vision_features": raw_vision_features.to(self.output_device) if raw_vision_features is not None else None,
+            }
+
+            # 10. 如果提供了 answers，批量计算 answer token 位置
+            if answers:
+                answer_positions_list = []
+
+                for i, (question, answer) in enumerate(zip(questions, answers)):
+                    # 构建不带 answer 的 prompt
+                    prompt_no_answer = self._build_prompt(question)
+
+                    inputs_no_answer = self.processor(
+                        text=prompt_no_answer,
+                        images=resized_images[i].convert("RGB"),
+                        return_tensors="pt"
+                    )
+
+                    # 计算 answer token 的长度差异
+                    total_added_len = input_ids[i].shape[0] - inputs_no_answer['input_ids'].shape[1]
+
+                    # 单独 tokenize answer
+                    answer_tokens = self.processor.tokenizer(
+                        answer,
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    )['input_ids']
+                    answer_len = answer_tokens.shape[1]
+
+                    # 使用负索引定位 answer 位置
+                    answer_start = -total_added_len
+                    answer_end = answer_start + answer_len - 1
+
+                    answer_positions_list.append((answer_start, answer_end))
+
+                # 转为 (batch_size, 2) 的tensor
+                answer_positions_tensor = torch.tensor(
+                    answer_positions_list,
+                    dtype=torch.long,
+                    device=self.output_device
+                )
+                result["answer_token_positions"] = answer_positions_tensor
 
         return result
 
