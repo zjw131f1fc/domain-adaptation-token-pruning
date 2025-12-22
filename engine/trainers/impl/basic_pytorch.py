@@ -422,22 +422,17 @@ class BasicPytorchTrainer:
                             loss_val = group_out.detach() if isinstance(group_out, torch.Tensor) else group_out
                             loss_parts.append(f"{group_name}={float(loss_val):.4f}")
 
-                    # 3. 添加关键 metrics（保留率和判别器胜率）
+                    # 3. 添加关键 metrics（保留率、权重、判别器胜率等）
                     metric_strs = []
 
-                    # 每层的保留率 (L5_kept, L15_kept, L25_kept)
-                    layer_metrics = {k: v for k, v in metrics_info.items() if k.startswith('L') and k.endswith('_kept')}
-                    for layer_key in sorted(layer_metrics.keys(), key=lambda x: int(x[1:-5])):  # 按层号排序
-                        metric_strs.append(f"{layer_key}={layer_metrics[layer_key]:.3f}")
+                    # 打印所有metrics（排除特定的内部指标）
+                    exclude_keys = {'current_task_weight', 'current_adv_weight', 'current_sparsity_weight'}
 
-                    # 最终保留率
-                    if "final_kept_ratio" in metrics_info:
-                        metric_strs.append(f"final={metrics_info['final_kept_ratio']:.3f}")
-
-                    # 判别器胜率
-                    if "disc_real_acc" in metrics_info and "disc_fake_acc" in metrics_info:
-                        metric_strs.append(f"disc_R={metrics_info['disc_real_acc']:.3f}")
-                        metric_strs.append(f"disc_F={metrics_info['disc_fake_acc']:.3f}")
+                    # 按键名排序以保持一致的显示顺序
+                    for k in sorted(metrics_info.keys()):
+                        if k not in exclude_keys:
+                            v = metrics_info[k]
+                            metric_strs.append(f"{k}={v:.3f}")
 
                     # 4. 组装完整消息
                     all_parts = grad_stats + loss_parts + metric_strs

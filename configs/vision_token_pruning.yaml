@@ -30,19 +30,19 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: 1.7e-04
-    print_loss_every_batches: 100
+    print_loss_every_batches: 20
     eval_every_batches: 500
     eval_max_samples: 500
     save_every_batches: 500
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
-    grad_clip_max_norm: 1.0
+    grad_clip_max_norm: 10.0
 
 manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [0,5,6]
+  available_gpus: [4,5,6]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -171,6 +171,7 @@ dataset_settings:  # 数据集配置
     values:
       - train: "origin"
   fast_load_no_random: false  # 快速加载模式（Optuna搜索时加速）
+  verbose_judge: false  # 是否打印judge详细信息（单条评估时的pred/ref对比）
 
 config_settings:
   enable_dict_overrides: true
@@ -197,8 +198,8 @@ method_settings:
   merger_d_internal: 512  # Merger内部维度
 
   # ==================== Layer-wise Pruner配置（新增） ====================
-  pruning_layers: [5, 15, 25]  # 要剪枝的LLM层索引
-  pruner_d_internal: 512  # Pruner内部维度
+  pruning_layers: [6, 12, 18]  # 要剪枝的LLM层索引
+  pruner_d_internal: 1024  # Pruner内部维度
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
   pruner_dropout: 0  # Layer Pruner 的 dropout（防过拟合）
@@ -244,7 +245,14 @@ method_settings:
   disc_num_layers: 3  # 使用的LLM隐层数量
   disc_d_d: 512  # 隐层维度
   # disc_dropout: 0.15  # [已废弃] Dropout比率（已被噪声替代）
-  disc_noise_scale: 0.03  # 添加到hidden states的高斯噪声标准差（替代dropout，推荐值：2% of pooled std）
+
+  # 位置相关噪声：在pooling前对每个token添加不同强度的噪声
+  disc_noise_scale_start: 0.05  # 前面token的噪声强度（信息不完整，加大噪声）
+  disc_noise_scale_end: 0.01    # 后面token的噪声强度（信息完整，加小噪声）
+
+  # 全局噪声（可选）：pooling后再添加的均匀噪声，通常设为0或很小
+  disc_noise_scale: 0.0  # 全局噪声标准差（已有位置相关噪声，这里可设为0）
+
   disc_pool_start_weight: 0.3  # 加权融合时前面token的权重（信息不完整）
   disc_pool_end_weight: 1.0    # 加权融合时后面token的权重（信息完整）
   disc_target_layers: [-1, -3, -5]  # 目标LLM层索引
@@ -255,12 +263,12 @@ method_settings:
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 80.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 50.0  # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 100.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 70.0  # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 1.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 60  # 目标权重（warmup后强化对抗）
+  adv_loss_weight: 40  # 目标权重（warmup后强化对抗）
 
   # Entropy Loss权重
   entropy_weight: 12.0

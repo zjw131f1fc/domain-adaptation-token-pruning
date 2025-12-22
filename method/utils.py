@@ -188,7 +188,10 @@ def extract_text_hidden_states(
 def weighted_pool_text_hidden_states(
     text_hidden_list: List[torch.Tensor],
     start_weight: float = 0.5,
-    end_weight: float = 1.0
+    end_weight: float = 1.0,
+    noise_scale_start: float = 0.0,
+    noise_scale_end: float = 0.0,
+    training: bool = True
 ) -> List[torch.Tensor]:
     """对text hidden states进行逐token加权融合，越靠后权重越大
 
@@ -196,6 +199,9 @@ def weighted_pool_text_hidden_states(
         text_hidden_list: List[(batch, text_len, hidden_dim)] - 每层的text hidden states
         start_weight: float - 第一个token的权重（默认0.5）
         end_weight: float - 最后一个token的权重（默认1.0）
+        noise_scale_start: float - 前面token的噪声强度（默认0.0，即不加噪声）
+        noise_scale_end: float - 后面token的噪声强度（默认0.0）
+        training: bool - 是否在训练模式（仅训练时加噪声）
 
     返回:
         pooled_list: List[(batch, hidden_dim)] - 每层融合后的表示
@@ -205,12 +211,24 @@ def weighted_pool_text_hidden_states(
     for text_hidden in text_hidden_list:
         batch_size, text_len, hidden_dim = text_hidden.shape
 
-        # 创建线性递增的权重：从start_weight到end_weight
-        # Shape: (text_len,)
+        # === Step 1: 添加位置相关的噪声（越靠前噪声越大） ===
+        if training and (noise_scale_start > 0 or noise_scale_end > 0):
+            # 创建线性递减的噪声强度：从noise_scale_start到noise_scale_end
+            noise_scales = torch.linspace(
+                noise_scale_start, noise_scale_end, text_len,
+                device=text_hidden.device
+            )  # (text_len,)
+            noise_scales = noise_scales.view(1, -1, 1)  # (1, text_len, 1)
+
+            # 生成噪声并应用位置相关的强度
+            noise = torch.randn_like(text_hidden) * noise_scales  # (batch, text_len, hidden_dim)
+            text_hidden = text_hidden + noise
+
+        # === Step 2: 创建加权融合的权重（越靠后权重越大） ===
         weights = torch.linspace(start_weight, end_weight, text_len, device=text_hidden.device)
         weights = weights.view(1, -1, 1)  # (1, text_len, 1) for broadcasting
 
-        # 加权平均：每个token乘以其权重，然后求和并归一化
+        # === Step 3: 加权平均 ===
         weighted_hidden = text_hidden * weights  # (batch, text_len, hidden_dim)
         pooled = weighted_hidden.sum(dim=1) / weights.sum()  # (batch, hidden_dim)
 

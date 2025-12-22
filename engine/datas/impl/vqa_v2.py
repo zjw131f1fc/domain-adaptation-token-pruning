@@ -97,6 +97,8 @@ class VQAV2Preparer(BasePreparer):
         self.fast_load_no_random = ds_cfg.get('fast_load_no_random', False)
         # 是否使用 multiple_choice_answer 作为训练答案（更官方，默认启用）
         self.use_mc_answer = ds_cfg.get('use_mc_answer', True)
+        # 是否打印judge的详细信息（单条评估时的pred/ref对比）
+        self.verbose_judge = ds_cfg.get('verbose_judge', False)
     
     def _get_most_common_answer(self, answers: List[str]) -> str:
         """从答案列表中选择最常见的答案"""
@@ -332,6 +334,7 @@ class VQAV2Preparer(BasePreparer):
             "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"
         }
         punct_table = str.maketrans({c: ' ' for c in "!?,.:;\"'`~()[]{}<>"})
+        verbose = self.verbose_judge  # 捕获实例变量到闭包
 
         def _normalize(s: Any) -> str:
             text = str(s).strip().lower()
@@ -391,19 +394,22 @@ class VQAV2Preparer(BasePreparer):
             # 预处理：空预测直接返回0分
             pred_norm = _normalize(pred)
             if not pred_norm or pred_norm.strip() == "":
-                print(f"[VQAV2 Judge] pred_norm: (empty), ref: {ref}, score: 0.0")
+                if verbose:
+                    print(f"[VQAV2 Judge] pred_norm: (empty), ref: {ref}, score: 0.0")
                 return {'correct': 0.0, 'total': 1, 'accuracy': 0.0}
 
             if isinstance(ref, list):
                 # 多答案情况，使用官方评分
                 score = _official_score(pred_norm, ref)
-                print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref: {ref}, score: {score}")
+                if verbose:
+                    print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref: {ref}, score: {score}")
                 return {'correct': score, 'total': 1, 'accuracy': float(score)}
             else:
                 # 单答案情况，使用模糊匹配
                 ref_norm = _normalize(ref)
                 score = 1.0 if (pred_norm == ref_norm or ref_norm in pred_norm or pred_norm in ref_norm) else 0.0
-                print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref_norm: {ref_norm}, score: {score}")
+                if verbose:
+                    print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref_norm: {ref_norm}, score: {score}")
                 return {'correct': score, 'total': 1, 'accuracy': float(score)}
         return _judge
 

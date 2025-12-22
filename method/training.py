@@ -111,6 +111,24 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             if vision_features_raw is None:
                 raise ValueError("backbone未返回raw_vision_features，请检查backbone实现")
 
+            # 统计原始vision token数量（进入merge前）
+            # vision_features_raw.shape = (1, n_vision_tokens, 1024) - batch_size=1
+            n_vision_tokens = vision_features_raw.shape[1]
+
+            # 累加均值统计
+            stats["vision_tokens_mean"] = stats.get("vision_tokens_mean", 0.0) + n_vision_tokens
+
+            # 最大值和最小值需要特殊处理（不能累加）
+            if "vision_tokens_max" not in stats:
+                stats["vision_tokens_max"] = n_vision_tokens
+            else:
+                stats["vision_tokens_max"] = max(stats["vision_tokens_max"], n_vision_tokens)
+
+            if "vision_tokens_min" not in stats:
+                stats["vision_tokens_min"] = n_vision_tokens
+            else:
+                stats["vision_tokens_min"] = min(stats["vision_tokens_min"], n_vision_tokens)
+
             # 提取question embeddings（用于question-aware merger和pruner）
             # 结构: [0:v_start] = "USER: "
             #       [v_start:v_end+1] = vision tokens
@@ -226,25 +244,33 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # 3.1 对text hidden states进行加权融合
         # 越靠前的token权重越小（信息不完整），越靠后权重越大（信息完整）
+        # 同时添加位置相关的噪声：越靠前噪声越大，越靠后噪声越小
         start_weight = config["method_settings"].get("disc_pool_start_weight", 0.4)
         end_weight = config["method_settings"].get("disc_pool_end_weight", 1.0)
+        noise_scale_start = config["method_settings"].get("disc_noise_scale_start", 0.05)
+        noise_scale_end = config["method_settings"].get("disc_noise_scale_end", 0.01)
 
         fake_hidden_pooled = weighted_pool_text_hidden_states(
             fake_hidden_list,
             start_weight=start_weight,
-            end_weight=end_weight
+            end_weight=end_weight,
+            noise_scale_start=noise_scale_start,
+            noise_scale_end=noise_scale_end,
+            training=True
         )  # List[(batch, hidden_dim)]
 
         real_hidden_pooled = weighted_pool_text_hidden_states(
             real_hidden_list,
             start_weight=start_weight,
-            end_weight=end_weight
+            end_weight=end_weight,
+            noise_scale_start=noise_scale_start,
+            noise_scale_end=noise_scale_end,
+            training=True
         )  # List[(batch, hidden_dim)]
 
-        # 3.2 添加位置感知噪声（替代dropout）
-        # Real和Fake都加噪声，提高判别器鲁棒性
-        # 噪声效果已通过加权融合间接实现（前面token权重小=贡献小=不确定性高）
-        disc_noise_scale = config["method_settings"].get("disc_noise_scale", 0.01)
+        # 3.2 添加全局噪声（可选，作为额外的正则化）
+        # 注意：现在主要噪声已在加权融合前添加，这里的全局噪声可以设为0或很小的值
+        disc_noise_scale = config["method_settings"].get("disc_noise_scale", 0.0)
         fake_hidden_pooled = add_position_aware_noise_to_pooled(
             fake_hidden_pooled,
             noise_scale=disc_noise_scale,
@@ -383,10 +409,16 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             for idx, mask in enumerate(pruning_masks):
                 layer_num = pruning_layers[idx]
                 stats[f"L{layer_num}_kept"] += mask.mean().item()
-            stats["avg_kept_ratio"] += avg_kept_ratio.item()  # 新增：所有层平均保留率
-            stats["final_kept_ratio"] += final_kept_ratio.item()  # 保留：最后一层保留率
-            stats["final_token_count"] += final_mask.sum().item()
-            stats["target_kept_ratio"] += target_kept_ratio
+            stats["avg_kept_ratio"] += avg_kept_ratio.item()  # 所有层平均保留率
+            stats["final_kept_ratio"] += final_kept_ratio.item()  # 最后一层保留率
+
+            # 记录learnable attention residual weight（如果启用）
+            if use_attn_residual and config["method_settings"].get("learnable_attn_weight", False):
+                for idx in pruning_layers:
+                    pruner = layer_pruners.get_pruner(idx)
+                    if hasattr(pruner, 'attn_residual_weight'):
+                        weight_val = pruner.attn_residual_weight.item()
+                        stats[f"L{idx}_attn_weight"] += weight_val
 
         # --- Discriminator Loss ---
 
@@ -412,8 +444,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         # real_pred 应该接近1，fake_pred_for_disc 应该接近0
         real_correct = (real_pred > 0.5).float().mean()
         fake_correct = (fake_pred_for_disc < 0.5).float().mean()
-        disc_accuracy = (real_correct + fake_correct) / 2.0
-        stats["disc_accuracy"] = stats.get("disc_accuracy", 0.0) + disc_accuracy.item()
         stats["disc_real_acc"] = stats.get("disc_real_acc", 0.0) + real_correct.item()
         stats["disc_fake_acc"] = stats.get("disc_fake_acc", 0.0) + fake_correct.item()
 
@@ -437,8 +467,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             layer_pruners_losses[k] = layer_pruners_losses[k] / valid_samples
         for k in disc_losses:
             disc_losses[k] = disc_losses[k] / valid_samples
+
+        # 归一化stats（排除max/min，它们不需要平均）
+        exclude_from_avg = {'vision_tokens_max', 'vision_tokens_min'}
         for k in stats:
-            stats[k] = stats[k] / valid_samples
+            if k not in exclude_from_avg:
+                stats[k] = stats[k] / valid_samples
 
         # === Dynamic Loss Weight Scheduling (余弦调度) ===
         # 训练初期: task_weight高，adv_weight低（优先学习保留信息）
