@@ -5,6 +5,7 @@
 
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 from typing import Dict, Any, List
 
 from collections import defaultdict
@@ -60,6 +61,11 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     disc_target_layers = config["method_settings"]["disc_target_layers"]
     disc_reinit_prob = config["method_settings"]["disc_reinit_prob"]
     total_steps = config["trainer_settings"]["dl_settings"]["epochs"] * info.get("total_planned_batches", 1000)
+
+    # === 混合精度训练配置 ===
+    amp_enabled = config["method_settings"].get("amp_enabled", False)
+    amp_dtype_str = config["method_settings"].get("amp_dtype", "bfloat16").lower()
+    amp_dtype = torch.float16 if amp_dtype_str == "float16" else torch.bfloat16
 
     # === Discriminator随机重初始化 ===
     if torch.rand(1).item() < disc_reinit_prob:
@@ -129,33 +135,34 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         question_embeddings_for_merger = original_embeddings[:, v_end+1:answer_start_abs, :]  # (batch_size, q_len, dim)
 
     # ========== Phase 2: Token Merge（如果启用） ==========
-    if enable_token_merger and token_merger is not None:
-        token_merger.train()
-        if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
-            merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
+    with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+        if enable_token_merger and token_merger is not None:
+            token_merger.train()
+            if config.method_settings.merger_type in ["question_aware", "fixed_pooling"]:
+                merge_result = token_merger(vision_features_raw, question_embeddings_for_merger, use_gumbel=True)
+            else:
+                merge_result = token_merger(vision_features_raw, use_gumbel=True)
+            merged_vision = merge_result['merged_features']  # (batch_size, M, 1024)
+
+            # 投影到LLM维度
+            merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (batch_size, M, 4096)
+
+            # 替换vision部分（batch版本）
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
+                original_embeddings,
+                original_vision_pos,
+                merged_vision,
+                emb_info['attention_mask']
+            )
         else:
-            merge_result = token_merger(vision_features_raw, use_gumbel=True)
-        merged_vision = merge_result['merged_features']  # (batch_size, M, 1024)
-
-        # 投影到LLM维度
-        merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (batch_size, M, 4096)
-
-        # 替换vision部分（batch版本）
-        embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
-            original_embeddings,
-            original_vision_pos,
-            merged_vision,
-            emb_info['attention_mask']
-        )
-    else:
-        # 禁用token merger
-        vision_features_projected = backbone.model.multi_modal_projector(vision_features_raw)
-        embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
-            original_embeddings,
-            original_vision_pos,
-            vision_features_projected,
-            emb_info['attention_mask']
-        )
+            # 禁用token merger
+            vision_features_projected = backbone.model.multi_modal_projector(vision_features_raw)
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
+                original_embeddings,
+                original_vision_pos,
+                vision_features_projected,
+                emb_info['attention_mask']
+            )
 
     # 提取question embeddings（用于layer pruners）
     num_removed_tokens = (original_vision_pos[0, 1] - original_vision_pos[0, 0] + 1) - (new_vision_pos[0, 1] - new_vision_pos[0, 0] + 1)
@@ -178,11 +185,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     try:
         # Forward（fake sample - 带剪枝）
         layer_pruners.train()
-        result_fake = backbone.forward(
-            embeddings=embeddings_merged,
-            attention_mask=new_attention_mask,
-            output_hidden_states=True
-        )
+        with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+            result_fake = backbone.forward(
+                embeddings=embeddings_merged,
+                attention_mask=new_attention_mask,
+                output_hidden_states=True
+            )
 
         # 向量化提取text hidden states（使用新的批量函数）
         fake_hidden_list = []
@@ -196,11 +204,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     # Forward（real sample - 无剪枝）
     with torch.no_grad():
-        result_real = backbone.forward(
-            embeddings=original_embeddings,
-            attention_mask=emb_info['attention_mask'],
-            output_hidden_states=True
-        )
+        with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+            result_real = backbone.forward(
+                embeddings=original_embeddings,
+                attention_mask=emb_info['attention_mask'],
+                output_hidden_states=True
+            )
 
         # 向量化提取text hidden states（使用新的批量函数）
         real_hidden_list = []
@@ -245,12 +254,14 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     # 判别fake（用于generator loss）
     for p in discriminator.parameters():
         p.requires_grad = False
-    fake_pred_for_gen = discriminator(fake_hidden_for_disc)  # (batch_size, 1)
+    with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+        fake_pred_for_gen = discriminator(fake_hidden_for_disc)  # (batch_size, 1)
     for p in discriminator.parameters():
         p.requires_grad = True
 
     # 判别real
-    real_pred = discriminator(real_hidden_for_disc)  # (batch_size, 1)
+    with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+        real_pred = discriminator(real_hidden_for_disc)  # (batch_size, 1)
 
     # ========== Phase 5: Loss Computation ==========
     if enable_token_merger:
@@ -339,7 +350,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     disc_losses["real_loss"] = F.binary_cross_entropy(real_pred, torch.ones_like(real_pred), reduction='mean')
 
     fake_hidden_detached = [h.detach() for h in fake_hidden_list]
-    fake_pred_for_disc = discriminator(fake_hidden_detached)
+    with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
+        fake_pred_for_disc = discriminator(fake_hidden_detached)
     disc_losses["fake_loss"] = F.binary_cross_entropy(fake_pred_for_disc, torch.zeros_like(fake_pred_for_disc), reduction='mean')
 
     # Stats
@@ -360,6 +372,22 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     torch.cuda.empty_cache()
 
     # ========== Phase 6: Apply Loss Weights ==========
+    # 保存未加权的原始 loss 到 stats（用于监控）
+    if enable_token_merger:
+        stats["raw_tm_adv_loss"] = token_merger_losses["adv_loss"].item()
+        stats["raw_tm_task_loss"] = token_merger_losses["task_loss"].item()
+
+    stats["raw_lp_adv_loss"] = layer_pruners_losses["adv_loss"].item()
+    stats["raw_lp_task_loss"] = layer_pruners_losses["task_loss"].item()
+    if "sparsity_loss" in layer_pruners_losses:
+        stats["raw_sparsity_loss"] = layer_pruners_losses["sparsity_loss"].item()
+    if "token_count_loss" in layer_pruners_losses:
+        stats["raw_token_count_loss"] = layer_pruners_losses["token_count_loss"].item()
+    if "binarization_loss" in layer_pruners_losses:
+        stats["raw_binarization_loss"] = layer_pruners_losses["binarization_loss"].item()
+    stats["raw_disc_real_loss"] = disc_losses["real_loss"].item()
+    stats["raw_disc_fake_loss"] = disc_losses["fake_loss"].item()
+
     progress = current_step / total_steps
     task_weight_start = config['method_settings'].get('task_loss_weight_start', None)
     task_weight_end = config['method_settings'].get('task_loss_weight')

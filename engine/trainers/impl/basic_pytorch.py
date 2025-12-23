@@ -16,7 +16,6 @@ import math
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 
@@ -60,13 +59,6 @@ class BasicPytorchTrainer:
 
         # 学习率调度器配置
         self.lr_scheduler_cfg = ts.get("lr_scheduler", {"type": "none"})
-
-        # 混合精度训练配置
-        self.amp_cfg = ts.get("amp", {"enabled": False})
-        self.amp_enabled = self.amp_cfg.get("enabled", False)
-        amp_dtype_str = self.amp_cfg.get("dtype", "float16").lower()
-        self.amp_dtype = torch.float16 if amp_dtype_str == "float16" else torch.bfloat16
-        self.grad_scaler: Optional[GradScaler] = None  # 在 setup_optimizers 后初始化
 
         # 数据集
         self.dataset_bundle = dataset_bundle
@@ -146,17 +138,6 @@ class BasicPytorchTrainer:
             self.optimizers[name] = opt
             if self.logger:
                 self.logger.info(f"优化器就绪: {name} -> {spec.opt_type}")
-
-        # 初始化 GradScaler（混合精度训练）
-        if self.amp_enabled:
-            # bfloat16 不需要 GradScaler，只有 float16 需要
-            if self.amp_dtype == torch.float16:
-                self.grad_scaler = GradScaler()
-                if self.logger:
-                    self.logger.info("混合精度训练已启用 (FP16 + GradScaler)")
-            else:
-                if self.logger:
-                    self.logger.info("混合精度训练已启用 (BF16, 无需GradScaler)")
 
     def setup_schedulers(self, total_steps: int):
         """根据配置创建学习率调度器。
@@ -464,8 +445,6 @@ class BasicPytorchTrainer:
                     "total_planned_batches": total_planned_batches,
                     "models": self.models,
                     "persistent_state": self.persistent_state,
-                    "amp_enabled": self.amp_enabled,
-                    "amp_dtype": self.amp_dtype,
                 }
                 outputs = self.train_fn(batch, self.device, info)
 
@@ -488,19 +467,10 @@ class BasicPytorchTrainer:
                         loss = torch.tensor(float(loss), dtype=torch.float32, device=self.device)
                     # 如果不是最后一个组，保留计算图
                     retain_graph = (idx < len(group_names) - 1)
-
-                    # 使用 GradScaler 进行反向传播（FP16混合精度）
-                    if self.grad_scaler is not None:
-                        self.grad_scaler.scale(loss).backward(retain_graph=retain_graph)
-                    else:
-                        loss.backward(retain_graph=retain_graph)
+                    loss.backward(retain_graph=retain_graph)
 
                 # 梯度裁剪（在 backward 之后，optimizer.step 之前）
                 if self.grad_clip_max_norm is not None:
-                    if self.grad_scaler is not None:
-                        # 使用 GradScaler 时需要先 unscale 梯度再裁剪
-                        for opt in self.optimizers.values():
-                            self.grad_scaler.unscale_(opt)
                     for group_name, spec in self.param_groups.items():
                         torch.nn.utils.clip_grad_norm_(spec.params, self.grad_clip_max_norm)
 
@@ -609,14 +579,8 @@ class BasicPytorchTrainer:
                         self.logger.info(f"{'='*80}")
 
                 # 最后统一执行优化步骤
-                if self.grad_scaler is not None:
-                    # FP16混合精度：使用 GradScaler
-                    for opt in self.optimizers.values():
-                        self.grad_scaler.step(opt)
-                    self.grad_scaler.update()
-                else:
-                    for opt in self.optimizers.values():
-                        opt.step()
+                for opt in self.optimizers.values():
+                    opt.step()
 
                 # 更新学习率调度器
                 for scheduler in self.schedulers.values():
