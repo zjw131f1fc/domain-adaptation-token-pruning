@@ -17,42 +17,38 @@ trainer_settings:  # 训练框架设置
   dl_settings:
     epochs: 1
     batch_size: 7
-    optimizers: # lr增大了10倍，不稳定的话需要改回去
+    optimizers:
       generator:
         type: "adam"
         lr: 2.0e-05
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: 3.2e-02
+        lr: 6e-04  # 改回旧版，原3.2e-03太高
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
-        lr: 1.0e-04
+        lr: 1.0e-05  # 改回旧版
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: 1.7e-03
-    print_loss_every_batches: 20
-    eval_every_batches: 200
-    eval_max_samples: 300
-    save_every_batches: 500
+        lr: 1e-04  # 改回旧版
+    print_loss_every_batches: 100
+    eval_every_batches: 500
+    eval_max_samples: 500
+    save_every_batches: 1000
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
-    grad_clip_max_norm: null
+    grad_clip_max_norm: 1.0  # 恢复梯度裁剪，防止训练不稳定
     # 学习率退火配置
     lr_scheduler:
       type: "cosine"  # 调度器类型: "cosine" (余弦退火), "linear" (线性衰减), "none" (不使用)
       warmup_ratio: 0.1  # warmup比例 (前10%步数进行warmup)
       min_lr_ratio: 0.01  # 最小学习率比例 (最终lr = 初始lr * min_lr_ratio)
-    # 混合精度训练配置
-    amp:
-      enabled: true  # 是否启用混合精度训练
-      dtype: "bfloat16"  # 混合精度类型: "float16" (FP16) 或 "bfloat16" (BF16, 需要Ampere及以上GPU)
 
 manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [4,5]
-  gpus_per_subtask: 2
+  available_gpus: [2,5,7]
+  gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
 
@@ -173,7 +169,7 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 40000
+    train: 50000
     test: 2000
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
@@ -203,6 +199,10 @@ backbone_settings:  # 多模态大模型骨架配置
 
 
 method_settings:
+  # ==================== 混合精度训练配置 ====================
+  amp_enabled: true  # 是否启用混合精度训练
+  amp_dtype: "bfloat16"  # 混合精度类型: "float16" (FP16) 或 "bfloat16" (BF16, 需要Ampere及以上GPU)
+
   # ==================== Token Merger配置（新增） ====================
   enable_token_merger: false  # 是否启用token merger（true=启用, false=禁用）
   merger_type: "fixed_pooling"  # "simple" / "question_aware" / "fixed_pooling" (推荐V3)
@@ -211,16 +211,16 @@ method_settings:
   merger_d_internal: 512  # Merger内部维度
 
   # ==================== Layer-wise Pruner配置（新增） ====================
-  pruning_layers: [6, 12, 18]  # 要剪枝的LLM层索引
+  pruning_layers: [5, 10, 15, 20]  # 要剪枝的LLM层索引
   pruner_d_internal: 512  # Pruner内部维度
   pruner_num_heads: 4  # Cross-attention头数
   pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
-  pruner_dropout: 0  # Layer Pruner 的 dropout（防过拟合）
+  pruner_dropout: 0.1  # 恢复dropout防过拟合（旧版0.1）
 
   # Attention Residual配置（新功能）
-  use_attn_residual: true  # 是否启用attention residual（残差连接text→vision attention）
+  use_attn_residual: false  # 是否启用attention residual（残差连接text→vision attention）
   attn_residual_weight: 0.5  # Residual权重（固定值或初始值）
-  learnable_attn_weight: true  # Residual weight是否可学习（true=可学习参数，false=固定值）
+  learnable_attn_weight: false  # Residual weight是否可学习（true=可学习参数，false=固定值）
 
   # ==================== 剪枝目标配置 ====================
   use_token_num_target: true  # true=使用绝对token数目标, false=使用稀疏度比例
@@ -231,13 +231,13 @@ method_settings:
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
   sparsity_weight: 9  # Sparsity约束loss权重（恒定值）
   sparsity_warmup_enable: false
-  token_count_loss_weight: 0.08  # Token总数loss权重（弱惩罚，鼓励减少token）
-  binarization_loss_weight: 0.81  # Binarization loss权重，鼓励soft_mask接近0或1
+  token_count_loss_weight: 0  # Token总数loss权重（弱惩罚，鼓励减少token）
+  binarization_loss_weight: 1  # Binarization loss权重，鼓励soft_mask接近0或1
 
   # ==================== Temperature Annealing（新增） ====================
-  temperature: 0.99  # 初始temperature
-  temperature_min: 0.4  # 最小temperature
-  temperature_anneal_rate: 0.4  # Anneal比例（前50%步数进行annealing）
+  temperature: 0.4  # 初始temperature
+  temperature_min: 0.15  # 最小temperature
+  temperature_anneal_rate: 0.5  # Anneal比例（前50%步数进行annealing）
 
   # ==================== Hard Pruning配置（评估时使用） ====================
   hard_pruning_threshold: 0.5  # Hard剪枝阈值（soft_mask > threshold则保留）
@@ -255,7 +255,7 @@ method_settings:
   gen_temperature_anneal_rate: 0.543
 
   # ==================== Discriminator配置 ====================
-  disc_num_layers: 2  # 使用的LLM隐层数量
+  disc_num_layers: 3 # 恢复旧版（更深的Discriminator）
   disc_d_d: 512  # 隐层维度
   # disc_dropout: 0.15  # [已废弃] Dropout比率（已被噪声替代）
 
@@ -268,20 +268,20 @@ method_settings:
 
   disc_pool_start_weight: 0.3  # 加权融合时前面token的权重（信息不完整）
   disc_pool_end_weight: 1.0    # 加权融合时后面token的权重（信息完整）
-  disc_target_layers: [-2, -5]  # 目标LLM层索引
-  disc_reinit_prob: 0.1  # 每个batch重初始化Discriminator的概率
+  disc_target_layers: [-2, -5, -8]  # 恢复旧版，取更多层信息
+  disc_reinit_prob: 0.05  # 恢复旧版，更频繁重初始化防止过拟合
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 10.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 10.0  # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 60.0  # 恢复旧版高初始权重，优先学习保留信息
+  task_loss_weight: 40.0  # 恢复旧版稳定值
 
   # Adversarial Loss权重（递增）
-  adv_loss_weight_start: 1.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 10  # 目标权重（warmup后强化对抗）
+  adv_loss_weight_start: 10.0  # 初始权重（低对抗，避免过早压制pruner）
+  adv_loss_weight: 40  # 恢复旧版，强化对抗
 
   # Entropy Loss权重
   entropy_weight: 12.0
