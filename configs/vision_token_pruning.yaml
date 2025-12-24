@@ -23,23 +23,23 @@ trainer_settings:  # 训练框架设置
         lr: 2.0e-05
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: 6e-04  # 改回旧版，原3.2e-03太高
+        lr: 3.2e-04  # 改回旧版，原3.2e-03太高
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
         lr: 1.0e-05  # 改回旧版
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: 1e-04  # 改回旧版
+        lr: 1.7e-05  # 改回旧版
     print_loss_every_batches: 100
     eval_every_batches: 500
-    eval_max_samples: 500
+    eval_max_samples: 1000
     save_every_batches: 1000
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
     grad_clip_max_norm: 1.0  # 恢复梯度裁剪，防止训练不稳定
     # 学习率退火配置
     lr_scheduler:
-      type: "cosine"  # 调度器类型: "cosine" (余弦退火), "linear" (线性衰减), "none" (不使用)
+      type: "none"  # 调度器类型: "cosine" (余弦退火), "linear" (线性衰减), "none" (不使用)
       warmup_ratio: 0.1  # warmup比例 (前10%步数进行warmup)
       min_lr_ratio: 0.01  # 最小学习率比例 (最终lr = 初始lr * min_lr_ratio)
 
@@ -47,7 +47,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [0,5,7]
+  available_gpus: [0,6,7]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -169,8 +169,8 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 50000
-    test: 2000
+    train: 60000
+    test: 1000
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
     values:
@@ -229,14 +229,16 @@ method_settings:
 
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
-  sparsity_weight: 17  # Sparsity约束loss权重（恒定值）
+  sparsity_weight: 5  # Sparsity约束loss权重（恒定值）
+  sparsity_weight_max: 15
+  sparsity_warmup_ratio: 0.7
   sparsity_warmup_enable: false
   token_count_loss_weight: 0  # Token总数loss权重（弱惩罚，鼓励减少token）
-  binarization_loss_weight: 1  # Binarization loss权重，鼓励soft_mask接近0或1
+  binarization_loss_weight: 0.81  # Binarization loss权重，鼓励soft_mask接近0或1
 
   # ==================== Temperature Annealing（新增） ====================
-  temperature: 0.4  # 初始temperature
-  temperature_min: 0.15  # 最小temperature
+  temperature: 0.99  # 初始temperature
+  temperature_min: 0.3  # 最小temperature
   temperature_anneal_rate: 0.5  # Anneal比例（前50%步数进行annealing）
 
   # ==================== Hard Pruning配置（评估时使用） ====================
@@ -269,19 +271,19 @@ method_settings:
   disc_pool_start_weight: 0.3  # 加权融合时前面token的权重（信息不完整）
   disc_pool_end_weight: 1.0    # 加权融合时后面token的权重（信息完整）
   disc_target_layers: [-2, -5, -8]  # 恢复旧版，取更多层信息
-  disc_reinit_prob: 0.05  # 恢复旧版，更频繁重初始化防止过拟合
+  disc_reinit_prob: 0.1  # 恢复旧版，更频繁重初始化防止过拟合
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 30.0  # 恢复旧版高初始权重，优先学习保留信息
-  task_loss_weight: 20.0  # 恢复旧版稳定值
+  task_loss_weight_start: 80.0  # 恢复旧版高初始权重，优先学习保留信息
+  task_loss_weight: 30.0  # 恢复旧版稳定值
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 5.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 20  # 恢复旧版，强化对抗
+  adv_loss_weight: 40  # 恢复旧版，强化对抗
 
   # Entropy Loss权重
   entropy_weight: 12.0

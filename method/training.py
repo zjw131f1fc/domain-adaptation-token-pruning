@@ -349,7 +349,11 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     disc_losses["real_loss"] = F.binary_cross_entropy(real_pred, torch.ones_like(real_pred), reduction='mean')
 
-    fake_hidden_detached = [h.detach() for h in fake_hidden_list]
+    # 重要: 先 detach fake_hidden_for_disc (它保留了引用), 再清理 fake_hidden_list
+    fake_hidden_detached = [h.detach() for h in fake_hidden_for_disc]
+    # 立即清理原始列表释放显存
+    del fake_hidden_for_disc, real_hidden_for_disc
+
     with autocast('cuda', enabled=amp_enabled, dtype=amp_dtype):
         fake_pred_for_disc = discriminator(fake_hidden_detached)
     disc_losses["fake_loss"] = F.binary_cross_entropy(fake_pred_for_disc, torch.zeros_like(fake_pred_for_disc), reduction='mean')
@@ -360,10 +364,21 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     stats["disc_real_acc"] = real_correct.item()
     stats["disc_fake_acc"] = fake_correct.item()
 
-    # Cleanup
+    # Cleanup - 更激进的显存清理
     del embeddings_merged, result_fake, result_real
     del fake_hidden_list, real_hidden_list, fake_hidden_detached
-    del fake_pred_for_gen, real_pred, fake_pred_for_disc, pruning_masks
+    del fake_pred_for_gen, real_pred, fake_pred_for_disc
+    del pruning_masks
+    del original_embeddings, vision_features_raw  # 清理预处理的大tensor
+    del new_attention_mask  # 清理attention mask
+    del fake_hidden_pooled, real_hidden_pooled  # 清理pooled hidden states
+    del question_embeddings  # 清理question embeddings
+    if enable_token_merger:
+        del merged_vision  # 清理merged vision features
+
+    # 清理emb_info字典
+    if 'emb_info' in locals():
+        del emb_info
 
     for sample in batch:
         if 'image' in sample and hasattr(sample['image'], 'close'):
