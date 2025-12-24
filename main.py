@@ -14,20 +14,28 @@ def preload_fn(config: Dict) -> Dict[str, Any]:
     """预加载重量级资源"""
     from engine.datas.loader import load_dataset
     from engine.backbones.loader import load_backbone
+    from utils.gpu_lock import GPULock
 
     logger = config["logger"]
     logger.info("预加载Backbone和Dataset...")
-    
+
     backbone = load_backbone(config)
-    
+
     # 冻结Backbone参数，避免梯度累积和显存浪费
     logger.info("冻结Backbone参数...")
     if hasattr(backbone, "model"):
         for param in backbone.model.parameters():
             param.requires_grad = False
-    
+
+    # 锁定GPU，防止加载dataset期间被其他进程抢占
+    gpu_lock = GPULock()
+    gpu_lock.lock()
+
     dataset_bundle = load_dataset(config)
-    
+
+    # 解锁GPU，供后续训练使用
+    gpu_lock.unlock()
+
     return {
         "backbone": backbone,
         "dataset_bundle": dataset_bundle

@@ -114,8 +114,8 @@ class Discriminator(nn.Module):
         else:
             reshape_needed = False
 
-        # 目标设备：优先使用输入所在设备，否则使用模块设备
-        target_device = hidden_states[0].device if isinstance(hidden_states[0], torch.Tensor) else next(self.parameters()).device
+        # 目标设备：使用模型参数所在设备，确保输入和模型在同一设备
+        target_device = next(self.parameters()).device
 
         # Process each layer with residual connection
         layer_outputs = []

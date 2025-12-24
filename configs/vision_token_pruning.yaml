@@ -16,7 +16,7 @@ trainer_settings:  # 训练框架设置
   name: "basic-pytorch"
   dl_settings:
     epochs: 1
-    batch_size: 7
+    batch_size: 5
     optimizers:
       generator:
         type: "adam"
@@ -47,7 +47,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [2,5,7]
+  available_gpus: [0,5,7]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -229,7 +229,7 @@ method_settings:
 
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
-  sparsity_weight: 9  # Sparsity约束loss权重（恒定值）
+  sparsity_weight: 17  # Sparsity约束loss权重（恒定值）
   sparsity_warmup_enable: false
   token_count_loss_weight: 0  # Token总数loss权重（弱惩罚，鼓励减少token）
   binarization_loss_weight: 1  # Binarization loss权重，鼓励soft_mask接近0或1
@@ -276,12 +276,12 @@ method_settings:
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 60.0  # 恢复旧版高初始权重，优先学习保留信息
-  task_loss_weight: 40.0  # 恢复旧版稳定值
+  task_loss_weight_start: 30.0  # 恢复旧版高初始权重，优先学习保留信息
+  task_loss_weight: 20.0  # 恢复旧版稳定值
 
   # Adversarial Loss权重（递增）
-  adv_loss_weight_start: 10.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 40  # 恢复旧版，强化对抗
+  adv_loss_weight_start: 5.0  # 初始权重（低对抗，避免过早压制pruner）
+  adv_loss_weight: 20  # 恢复旧版，强化对抗
 
   # Entropy Loss权重
   entropy_weight: 12.0
