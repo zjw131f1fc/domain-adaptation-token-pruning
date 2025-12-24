@@ -86,13 +86,13 @@ class Discriminator(nn.Module):
     def forward(self, hidden_states, padding_mask=None):
         """
         Classify token hidden state as real (from unpruned) or fake (from pruned).
-        
+
         Args:
             hidden_states: list of tensors, each (batch, seq_len, d_model) or (batch * seq_len, d_model)
                           Hidden states from multiple LLM layers
                           Length of list should be num_layers
             padding_mask: (batch, seq_len) - True for valid tokens, False for padding (optional)
-        
+
         Returns:
             prob: (batch, seq_len) or (batch * seq_len,)
                   Sigmoid probability in (0, 1)
@@ -101,11 +101,11 @@ class Discriminator(nn.Module):
         # Handle single tensor input (backward compatibility)
         if not isinstance(hidden_states, list):
             hidden_states = [hidden_states]
-        
+
         # Check number of layers
         assert len(hidden_states) == self.num_layers, \
             f"Expected {self.num_layers} hidden states, got {len(hidden_states)}"
-        
+
         # Get shape info from first tensor
         first_shape = hidden_states[0].shape
         if len(first_shape) == 3:
@@ -126,21 +126,24 @@ class Discriminator(nn.Module):
             # 【简化方案】直接用 tanh 压缩到 [-1, 1]，避免 BatchNorm 在小 batch 下不稳定
             # 先除以一个大的常数（如 100）缩小数值范围，再用 tanh
             h = torch.tanh(h / 100.0)  # 将 [-300, 300] 映射到约 [-1, 1]
-            
+
             # First linear layer with GELU
             h = self.first_linears[i](h)       # (N, d_d)
             h = F.gelu(h)                      # (N, d_d)
             h = self.dropout(h)                # (N, d_d)
-            
+
             # Second linear layer with residual connection
             h_res = self.second_linears[i](h)  # (N, d_d)
             h = h + h_res                      # residual connection
-            
+
             layer_outputs.append(h)
-        
+
         # Concatenate all layer outputs
         h_fused = torch.cat(layer_outputs, dim=-1)  # (N, d_d * num_layers)
-        
+
+        # 立即清理不再需要的中间结果
+        del layer_outputs
+
         # Fusion layer
         h_fused = self.fusion_linear1(h_fused)  # (N, d_d)
         h_fused = F.gelu(h_fused)
@@ -148,15 +151,15 @@ class Discriminator(nn.Module):
         h_fused = F.gelu(h_fused)
         logits = self.fusion_linear3(h_fused)  # (N, 1)
         prob = torch.sigmoid(logits.squeeze(-1))  # (N,)
-        
+
         # Reshape back if input was 3D
         if reshape_needed:
             prob = prob.view(batch_size, seq_len)
-        
+
         # Apply padding mask: zero out padding positions
         if padding_mask is not None:
             prob = prob * padding_mask.float()
-        
+
         return prob
     
     def get_logits(self, hidden_states):
