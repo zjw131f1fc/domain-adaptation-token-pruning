@@ -31,8 +31,8 @@ trainer_settings:  # 训练框架设置
         type: "adam"
         lr: 1.7e-05  # 改回旧版
     print_loss_every_batches: 100
-    eval_every_batches: 500
-    eval_max_samples: 1000
+    eval_every_batches: 1000
+    eval_max_samples: 400
     save_every_batches: 1000
     save_every_epochs: 0
     optuna_eval_interval_batches: 40
@@ -47,7 +47,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [0,6,7]
+  available_gpus: [3,4,5,7]
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -170,7 +170,7 @@ dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
     train: 60000
-    test: 1000
+    test: 400
   category_priority:
     enable: false  # 禁用类别均衡，加快数据加载
     values:
@@ -200,7 +200,7 @@ backbone_settings:  # 多模态大模型骨架配置
 
 method_settings:
   # ==================== 混合精度训练配置 ====================
-  amp_enabled: true  # 是否启用混合精度训练
+  amp_enabled: false  # 是否启用混合精度训练
   amp_dtype: "bfloat16"  # 混合精度类型: "float16" (FP16) 或 "bfloat16" (BF16, 需要Ampere及以上GPU)
 
   # ==================== Token Merger配置（新增） ====================
