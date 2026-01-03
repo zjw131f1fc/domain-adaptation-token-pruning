@@ -789,6 +789,7 @@ def update_temperature_for_all(
     """更新Token Merger和所有Layer Pruners的temperature
 
     Temperature annealing: 训练初期软（高temp），后期硬（低temp）
+    使用指数衰减：temp = max_temp * (min_temp / max_temp) ** progress
 
     参数:
         token_merger: LearnableTokenMerger实例（可选，可为None）
@@ -798,21 +799,18 @@ def update_temperature_for_all(
         total_steps: 总步数
     """
     # 读取配置
-    initial_temp = config['method_settings'].get('temperature', 1.0)
-    final_temp = config['method_settings'].get('temperature_min', 0.1)
-    anneal_rate = config['method_settings'].get('temperature_anneal_rate', 0.5)
+    max_temp = config['method_settings'].get('temperature', 5.0)  # 默认5.0
+    min_temp = config['method_settings'].get('temperature_min', 0.1)  # 默认0.1
 
     if total_steps == 0:
-        current_temp = initial_temp
+        current_temp = max_temp
     else:
+        # 指数衰减：temp = max_temp * (min_temp / max_temp) ** progress
         progress = current_step / total_steps
+        current_temp = max_temp * (min_temp / max_temp) ** progress
 
-        if progress < anneal_rate:
-            # 线性annealing
-            current_temp = initial_temp - (progress / anneal_rate) * (initial_temp - final_temp)
-        else:
-            # Annealing完成
-            current_temp = final_temp
+        # 限制温度范围，避免数值不稳定
+        current_temp = max(min_temp, min(max_temp, current_temp))
 
     # 更新token_merger
     if token_merger is not None:

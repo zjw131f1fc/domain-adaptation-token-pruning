@@ -288,37 +288,48 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     layer_pruners_losses["adv_loss"] = adv_loss
     layer_pruners_losses["task_loss"] = task_loss
 
-    # Sparsity Loss
+    # Sparsity Loss - 全局平均token数约束
     if len(pruning_masks) > 0:
-        target_sparsity = config['method_settings'].get('target_sparsity')
-        use_token_num_target = config['method_settings'].get('use_token_num_target')
-        sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
+        use_token_num_target = config['method_settings'].get('use_token_num_target', True)
+        sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess', False)
 
-        n_vision = pruning_masks[0].shape[1]
+        n_vision = pruning_masks[0].shape[1]  # 初始vision token数
 
         if use_token_num_target:
-            target_token_num = config['method_settings'].get('target_token_num', 128)
-            target_kept_ratio = target_token_num / n_vision
+            # 目标：平均每层的token数
+            target_avg_token_num = config['method_settings'].get('target_token_num', 128)
         else:
-            target_kept_ratio = 1.0 - target_sparsity
+            # 兼容旧配置：通过稀疏度计算目标token数
+            target_sparsity = config['method_settings'].get('target_sparsity', 0.5)
+            target_avg_token_num = n_vision * (1.0 - target_sparsity)
 
+        # 计算每层的实际token数
+        # kept_ratios[i] = 该层保留的token比例
         kept_ratios = [mask.mean().to(device) for mask in pruning_masks]
-        avg_kept_ratio = torch.stack(kept_ratios).mean()  # 仅用于 sparsity loss 计算
 
-        # 计算累积保留率（考虑mask的连续作用）
+        # 每层的token数 = 初始token数 * 保留率
+        tokens_per_layer = [n_vision * ratio for ratio in kept_ratios]
+
+        # 所有层的平均token数（这是我们要约束的目标）
+        avg_tokens_across_layers = torch.stack(tokens_per_layer).mean()
+
+        # Sparsity Loss: 约束平均token数
+        if sparsity_loss_only_on_excess:
+            # 只惩罚超出目标的部分
+            excess = torch.relu(avg_tokens_across_layers - target_avg_token_num)
+            sparsity_constraint_loss = excess.to(device).pow(2)
+        else:
+            # MSE loss: (实际平均token数 - 目标平均token数)^2
+            sparsity_constraint_loss = (avg_tokens_across_layers - target_avg_token_num).to(device).pow(2)
+
+        layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
+        layer_pruners_losses["avg_token_count"] = avg_tokens_across_layers.to(device)
+
+        # 计算累积保留率（用于统计）
         # 累积效果 = 所有mask的连乘
         cumulative_kept_ratio = torch.stack(kept_ratios).prod()
 
-        if sparsity_loss_only_on_excess:
-            excess = torch.relu(avg_kept_ratio - target_kept_ratio)
-            sparsity_constraint_loss = excess.to(device).pow(2)
-        else:
-            sparsity_constraint_loss = (avg_kept_ratio - target_kept_ratio).to(device).pow(2)
-
-        layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
-        layer_pruners_losses["token_count_loss"] = avg_kept_ratio.to(device)
-
-        # Bimodal loss
+        # Bimodal loss（如果使用Gumbel-Softmax + temperature annealing，通常不需要）
         binarization_loss = torch.tensor(0.0, device=device)
         for mask in pruning_masks:
             binary_term = (mask * (1 - mask)).mean()
@@ -329,9 +340,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # Stats
         pruning_layers = layer_pruners.get_all_layers()
-        for idx, mask in enumerate(pruning_masks):
+        for idx, (mask, tokens) in enumerate(zip(pruning_masks, tokens_per_layer)):
             layer_num = pruning_layers[idx]
-            stats[f"L{layer_num}_kept"] = mask.mean().item()
+            stats[f"L{layer_num}_kept_ratio"] = mask.mean().item()
+            stats[f"L{layer_num}_tokens"] = tokens.item()
+        stats["avg_tokens"] = avg_tokens_across_layers.item()  # 平均token数
+        stats["target_avg_tokens"] = target_avg_token_num
         stats["cumulative_kept_ratio"] = cumulative_kept_ratio.item()  # 累积保留率
 
         if use_attn_residual and config["method_settings"].get("learnable_attn_weight", False):
@@ -378,8 +392,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     stats["raw_lp_task_loss"] = layer_pruners_losses["task_loss"].item()
     if "sparsity_loss" in layer_pruners_losses:
         stats["raw_sparsity_loss"] = layer_pruners_losses["sparsity_loss"].item()
-    if "token_count_loss" in layer_pruners_losses:
-        stats["raw_token_count_loss"] = layer_pruners_losses["token_count_loss"].item()
+    if "avg_token_count" in layer_pruners_losses:
+        stats["raw_avg_token_count"] = layer_pruners_losses["avg_token_count"].item()
     if "binarization_loss" in layer_pruners_losses:
         stats["raw_binarization_loss"] = layer_pruners_losses["binarization_loss"].item()
     stats["raw_disc_real_loss"] = disc_losses["real_loss"].item()
@@ -402,7 +416,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         adv_weight = adv_weight_end
 
     sparsity_weight = get_current_sparsity_weight(config, current_step, total_steps)
-    token_count_weight = config['method_settings'].get('token_count_loss_weight')
+    avg_token_count_weight = config['method_settings'].get('token_count_loss_weight')
     binarization_weight = config['method_settings'].get('binarization_loss_weight', 0.0)
 
     stats["current_task_weight"] = float(task_weight)
@@ -417,8 +431,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] * task_weight
     if "sparsity_loss" in layer_pruners_losses:
         layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] * sparsity_weight
-    if "token_count_loss" in layer_pruners_losses:
-        layer_pruners_losses["token_count_loss"] = layer_pruners_losses["token_count_loss"] * token_count_weight
+    if "avg_token_count" in layer_pruners_losses:
+        layer_pruners_losses["avg_token_count"] = layer_pruners_losses["avg_token_count"] * avg_token_count_weight
     if "binarization_loss" in layer_pruners_losses:
         layer_pruners_losses["binarization_loss"] = layer_pruners_losses["binarization_loss"] * binarization_weight
 

@@ -133,14 +133,13 @@ class VisionPrunerHead(nn.Module):
 
         # === 6. Mask预测头 ===
         # 输入: cross-attention后的vision features
-        # 输出: 每个token的keep/drop logit
+        # 输出: 每个token的[drop_logit, keep_logit]（2维）
         self.mask_fc1 = nn.Linear(d_internal, d_internal // 2)
         self.mask_act = nn.GELU()
         self.mask_dropout = nn.Dropout(0.1)
-        self.mask_fc2 = nn.Linear(d_internal // 2, 1)
+        self.mask_fc2 = nn.Linear(d_internal // 2, 2)  # 输出2个logits: [Drop, Keep]
 
-        # 使用标准初始化，不引入偏置
-        # 让模型从中性状态开始学习（sigmoid(0) = 0.5）
+        # 使用标准初始化
         nn.init.xavier_uniform_(self.mask_fc2.weight)
         nn.init.zeros_(self.mask_fc2.bias)
 
@@ -203,37 +202,30 @@ class VisionPrunerHead(nn.Module):
         # === Step 4: Post-Attention归一化 + 残差连接 ===
         attended_V = self.post_attn_norm(V + attended_V)  # 残差 + 归一化
 
-        # === Step 5: 预测keep/drop logits ===
+        # === Step 5: 预测keep/drop logits（2维）===
         mask_hidden = self.mask_fc1(attended_V)
         mask_hidden = self.mask_act(mask_hidden)
         mask_hidden = self.mask_dropout(mask_hidden)
-        keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
+        logits = self.mask_fc2(mask_hidden)  # (batch, n_vision, 2): [drop_logit, keep_logit]
 
         # === Step 5.5: Attention Residual（可选） ===
+        # 注意：只增强keep_logit（索引1）
         if self.use_attn_residual and text_to_vision_attn is not None:
-            # 确保attention在正确的设备和dtype上
-            text_to_vision_attn = text_to_vision_attn.to(device=keep_logits.device, dtype=keep_logits.dtype)
-            # 残差连接：keep_logits += weight * attention
-            keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
+            text_to_vision_attn = text_to_vision_attn.to(device=logits.device, dtype=logits.dtype)
+            # 残差连接到keep_logit
+            logits[:, :, 1] = logits[:, :, 1] + self.attn_residual_weight * text_to_vision_attn
 
-        # === Step 6: Gumbel-Softmax（可微分的二分类） ===
-        # 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
-        stacked_logits = torch.stack([
-            torch.zeros_like(keep_logits),  # drop的logit固定为0
-            keep_logits                      # keep的logit为预测值
-        ], dim=-1)  # (batch, n_vision, 2)
-
+        # === Step 6: PyTorch原生Gumbel-Softmax ===
         if use_gumbel and self.training:
-            # 训练模式：添加Gumbel噪声实现可微分采样
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
-            gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-            probs = F.softmax(gumbel_logits, dim=-1)  # (batch, n_vision, 2)
+            # 训练模式：使用Gumbel-Softmax with hard=True
+            # hard=True: 前向输出one-hot，反向传播使用softmax梯度
+            y_soft = F.gumbel_softmax(logits, tau=self.temperature, hard=True, dim=-1)
+            # 提取keep的mask（索引1）
+            soft_mask = y_soft[:, :, 1]  # (batch, n_vision)
         else:
-            # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
-            probs = F.softmax(stacked_logits / self.temperature, dim=-1)  # (batch, n_vision, 2)
-
-        # 提取P(keep)
-        soft_mask = probs[..., 1]  # (batch, n_vision)
+            # 推理模式：确定性argmax
+            probs = F.softmax(logits / self.temperature, dim=-1)
+            soft_mask = (probs[:, :, 1] > 0.5).float()  # (batch, n_vision)
 
         return soft_mask
 
