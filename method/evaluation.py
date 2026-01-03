@@ -12,7 +12,6 @@ from .utils import (
     remove_hooks,
     replace_vision_tokens_in_embeddings
 )
-from .utils_batch import replace_vision_tokens_in_embeddings_batch
 
 
 def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> Dict[str, float]:
@@ -113,7 +112,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 merged_vision_batch = backbone.model.multi_modal_projector(merged_vision_batch)  # (B, M, 4096)
 
                 # 批量替换vision部分
-                embeddings_merged_batch, new_vision_pos_batch, new_attention_mask_batch = replace_vision_tokens_in_embeddings_batch(
+                embeddings_merged_batch, new_vision_pos_batch, new_attention_mask_batch = replace_vision_tokens_in_embeddings(
                     original_embeddings_batch,
                     original_vision_pos_batch,
                     merged_vision_batch,
@@ -122,7 +121,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
             else:
                 # 禁用token merger，使用原始vision features
                 vision_features_projected_batch = backbone.model.multi_modal_projector(vision_features_raw_batch)  # (B, 576, 4096)
-                embeddings_merged_batch, new_vision_pos_batch, new_attention_mask_batch = replace_vision_tokens_in_embeddings_batch(
+                embeddings_merged_batch, new_vision_pos_batch, new_attention_mask_batch = replace_vision_tokens_in_embeddings(
                     original_embeddings_batch,
                     original_vision_pos_batch,
                     vision_features_projected_batch,
@@ -170,7 +169,13 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 with torch.no_grad():
                     emb_info = backbone.preprocess(sample["image"], sample["question"], None)
                     original_embeddings = emb_info['embeddings']
-                    original_vision_pos = emb_info['vision_token_positions']
+                    original_vision_pos_tuple = emb_info['vision_token_positions']  # tuple (start, end)
+                    # 转换为tensor格式以适配批量函数
+                    original_vision_pos = torch.tensor(
+                        [[original_vision_pos_tuple[0], original_vision_pos_tuple[1]]],
+                        device=original_embeddings.device,
+                        dtype=torch.long
+                    )  # (1, 2)
 
                     # 获取未投影的vision features (1024维，CLIP输出)
                     vision_features_raw = emb_info['raw_vision_features']  # (1, 576, 1024)
@@ -180,7 +185,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
 
                     if enable_token_merger and token_merger is not None:
                         # 提取question embeddings（用于question-aware merger）
-                        _, v_end = original_vision_pos
+                        v_end = original_vision_pos[0, 1].item()
                         question_embeddings_for_merger = original_embeddings[:, v_end+1:, :]
 
                         # Token Merge (在1024维空间操作)
@@ -211,11 +216,19 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                         )
 
                     # 提取question embeddings（用于layer pruners）
-                    question_embeddings = embeddings_merged[:, new_vision_pos[1]+1:, :]
+                    question_embeddings = embeddings_merged[:, new_vision_pos[0, 1].item()+1:, :]
 
             # 统计
-            num_original_tokens = original_vision_pos[1] - original_vision_pos[0] + 1
-            num_merged_tokens = new_vision_pos[1] - new_vision_pos[0] + 1
+            # 处理不同情况下vision_pos的格式
+            if isinstance(original_vision_pos, torch.Tensor):
+                num_original_tokens = original_vision_pos[0, 1].item() - original_vision_pos[0, 0].item() + 1
+            else:
+                num_original_tokens = original_vision_pos[1] - original_vision_pos[0] + 1
+
+            if isinstance(new_vision_pos, torch.Tensor):
+                num_merged_tokens = new_vision_pos[0, 1].item() - new_vision_pos[0, 0].item() + 1
+            else:
+                num_merged_tokens = new_vision_pos[1] - new_vision_pos[0] + 1
             results["avg_original_tokens"] += float(num_original_tokens)
             results["avg_merged_tokens"] += float(num_merged_tokens)
             results["keep_ratio_merge"] += float(num_merged_tokens) / float(num_original_tokens)

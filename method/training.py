@@ -10,18 +10,15 @@ from typing import Dict, Any, List
 
 from collections import defaultdict
 from .utils import (
-    extract_text_hidden_states,
     weighted_pool_text_hidden_states,
     add_position_aware_noise_to_pooled,
     remove_hooks,
     update_temperature_for_all,
-    get_current_sparsity_weight
-)
-from .utils_batch import (
-    replace_vision_tokens_in_embeddings_batch,
-    register_multi_layer_hooks_batch,
-    extract_text_hidden_batch,
-    compute_task_loss_batch
+    get_current_sparsity_weight,
+    replace_vision_tokens_in_embeddings,
+    register_multi_layer_hooks,
+    extract_text_hidden_states,
+    compute_task_loss
 )
 
 
@@ -148,7 +145,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             merged_vision = backbone.model.multi_modal_projector(merged_vision)  # (batch_size, M, 4096)
 
             # 替换vision部分（batch版本）
-            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
                 original_embeddings,
                 original_vision_pos,
                 merged_vision,
@@ -157,7 +154,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         else:
             # 禁用token merger
             vision_features_projected = backbone.model.multi_modal_projector(vision_features_raw)
-            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings_batch(
+            embeddings_merged, new_vision_pos, new_attention_mask = replace_vision_tokens_in_embeddings(
                 original_embeddings,
                 original_vision_pos,
                 vision_features_projected,
@@ -173,7 +170,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     pruning_masks = []
 
     use_attn_residual = config["method_settings"].get("use_attn_residual", False)
-    handles = register_multi_layer_hooks_batch(
+    handles = register_multi_layer_hooks(
         backbone,
         layer_pruners,
         new_vision_pos,
@@ -196,7 +193,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         fake_hidden_list = []
         for layer_idx in disc_target_layers:
             hidden = result_fake['all_hidden_states'][layer_idx]  # (batch_size, seq_len, dim)
-            text_hidden = extract_text_hidden_batch(hidden, new_vision_pos)  # 向量化操作
+            text_hidden = extract_text_hidden_states(hidden, new_vision_pos)  # 向量化操作
             fake_hidden_list.append(text_hidden)
 
     finally:
@@ -215,7 +212,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         real_hidden_list = []
         for layer_idx in disc_target_layers:
             hidden = result_real['all_hidden_states'][layer_idx]  # (batch_size, seq_len, dim)
-            text_hidden = extract_text_hidden_batch(hidden, original_vision_pos)  # 向量化操作
+            text_hidden = extract_text_hidden_states(hidden, original_vision_pos)  # 向量化操作
             real_hidden_list.append(text_hidden)
 
     # ========== Phase 4: Discriminator Judgment ==========
@@ -269,7 +266,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         token_merger_losses["adv_loss"] = adv_loss
 
         # Task loss（批量计算）
-        task_loss = compute_task_loss_batch(
+        task_loss = compute_task_loss(
             result_fake['logits'],
             answer_pos,
             answers,
@@ -280,7 +277,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     # Layer Pruners Loss
     if not enable_token_merger:
         # Task loss（批量计算）
-        task_loss = compute_task_loss_batch(
+        task_loss = compute_task_loss(
             result_fake['logits'],
             answer_pos,
             answers,

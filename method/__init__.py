@@ -3,7 +3,6 @@
 对抗训练的视觉token剪枝方法。
 """
 
-from .models.generator import Generator
 from .models.discriminator import Discriminator
 from .models.token_merger import LearnableTokenMerger, LearnableTokenMergerV2, LearnableTokenMergerV3
 from .models.layer_pruner import LayerSpecificPruner, VisionPrunerHead, VisionPrunerHeadSimple
@@ -16,7 +15,6 @@ from .utils import (
     extract_target_hidden_states,
     compute_task_loss,
     get_current_sparsity_weight,
-    update_generator_temperature,
     get_target_token_num,
     # Multi-layer hook utilities
     create_layer_pruning_modifier,
@@ -28,7 +26,6 @@ from .utils import (
 
 __all__ = [
     # Models
-    'Generator',
     'Discriminator',
     'LearnableTokenMerger',
     'LearnableTokenMergerV2',
@@ -46,7 +43,6 @@ __all__ = [
     'extract_target_hidden_states',
     'compute_task_loss',
     'get_current_sparsity_weight',
-    'update_generator_temperature',
     'get_target_token_num',
     # Multi-layer hook utilities
     'create_layer_pruning_modifier',
