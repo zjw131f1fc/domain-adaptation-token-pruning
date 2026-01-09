@@ -132,18 +132,20 @@ trainer.build_trainer(
 ## 关键文件
 
 ### 现有实现
-- `method/training.py`: 当前的train_step逻辑
+- `method/training.py`: 当前的train_step逻辑（已被统一到VisionTokenPruningModel）
 - `method/utils.py`: 工具函数（hook注册、token替换等）
 - `method/models/layer_pruner.py`: Layer Pruner实现
 - `method/models/token_merger.py`: Token Merger实现
 - `method/models/discriminator.py`: Discriminator实现
 - `engine/trainers/impl/basic_pytorch.py`: 当前trainer
-- `configs/vision_token_pruning.yaml`: 训练配置
+- `configs/vision_token_pruning.yaml`: 原训练配置
 
-### 新增文件（计划）
-- `method/models/pruning_wrapper.py`: LLaVAWithPruning + PruningLayerWrapper
-- `method/models/unified_model.py`: VisionTokenPruningModel
-- `engine/trainers/impl/hf_trainer.py`: ✅ 已添加（HFTrainerWrapper）
+### 新增文件（✅ 已实现）
+- `method/models/pruning_wrapper.py`: ✅ LLaVAWithPruning + PruningLayerWrapper
+- `method/models/unified_model.py`: ✅ VisionTokenPruningModel
+- `engine/trainers/impl/hf_trainer.py`: ✅ HFTrainerWrapper增强版（支持FSDP）
+- `configs/vision_token_pruning_fsdp.yaml`: ✅ FSDP配置示例
+- `test_vtp_hf_trainer.py`: ✅ 集成测试脚本
 
 ## 待验证问题
 
@@ -166,12 +168,15 @@ trainer.build_trainer(
 
 ## 实现计划
 
-### Phase 1: Prototype验证（当前阶段）
+### Phase 1: Prototype验证（✅ 已完成）
 1. [x] 添加HF Trainer到trainer loader
-2. [ ] 实现简化版PruningLayerWrapper
-3. [ ] 实现简化版VisionTokenPruningModel
-4. [ ] 单GPU测试forward逻辑正确性
-5. [ ] 验证parameter groups optimizer
+2. [x] 实现PruningLayerWrapper（method/models/pruning_wrapper.py）
+3. [x] 实现LLaVAWithPruning包装模型（method/models/pruning_wrapper.py）
+4. [x] 实现VisionTokenPruningModel统一模型（method/models/unified_model.py）
+5. [x] 增强HFTrainerWrapper支持自定义optimizer和FSDP（engine/trainers/impl/hf_trainer.py）
+6. [x] 创建配置示例（configs/vision_token_pruning_fsdp.yaml）
+7. [x] 创建测试脚本（test_vtp_hf_trainer.py）
+8. [ ] 单GPU测试验证（下一步）
 
 ### Phase 2: FSDP集成
 1. [ ] 配置FSDP策略
