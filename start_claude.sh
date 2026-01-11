@@ -1,0 +1,3 @@
+export ANTHROPIC_BASE_UR=https://www.packyapi.com
+export ANTHROPIC_AUTH_TOKEN=sk-UIm4nLIZlX9LbGMyFRm2P8jksTxirnILEjMmjYchufuqOOZc
+claude
