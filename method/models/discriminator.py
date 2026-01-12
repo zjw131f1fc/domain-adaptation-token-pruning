@@ -86,17 +86,17 @@ class Discriminator(nn.Module):
     def forward(self, hidden_states, padding_mask=None):
         """
         Classify token hidden state as real (from unpruned) or fake (from pruned).
-        
+
         Args:
             hidden_states: list of tensors, each (batch, seq_len, d_model) or (batch * seq_len, d_model)
                           Hidden states from multiple LLM layers
                           Length of list should be num_layers
             padding_mask: (batch, seq_len) - True for valid tokens, False for padding (optional)
-        
+
         Returns:
-            prob: (batch, seq_len) or (batch * seq_len,)
-                  Sigmoid probability in (0, 1)
-                  Close to 1 = real (unpruned), close to 0 = fake (pruned)
+            logits: (batch, seq_len) or (batch * seq_len,)
+                    Raw logits before sigmoid. Use with F.binary_cross_entropy_with_logits.
+                    Positive = real (unpruned), negative = fake (pruned)
         """
         # Handle single tensor input (backward compatibility)
         if not isinstance(hidden_states, list):
@@ -147,17 +147,18 @@ class Discriminator(nn.Module):
         h_fused = self.fusion_linear2(h_fused)  # (N, d_d)
         h_fused = F.gelu(h_fused)
         logits = self.fusion_linear3(h_fused)  # (N, 1)
-        prob = torch.sigmoid(logits.squeeze(-1))  # (N,)
-        
+        logits = logits.squeeze(-1)  # (N,)
+
         # Reshape back if input was 3D
         if reshape_needed:
-            prob = prob.view(batch_size, seq_len)
-        
-        # Apply padding mask: zero out padding positions
+            logits = logits.view(batch_size, seq_len)
+
+        # Apply padding mask: set padding positions to large negative value
+        # so sigmoid(logits) -> 0 for padding positions
         if padding_mask is not None:
-            prob = prob * padding_mask.float()
-        
-        return prob
+            logits = logits.masked_fill(~padding_mask, -1e9)
+
+        return logits
     
     def get_logits(self, hidden_states):
         """

@@ -192,8 +192,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     )
     layer_pruners_losses["task_loss"] = task_loss
 
-    # 2. Adversarial loss
-    adv_loss = F.binary_cross_entropy(
+    # 2. Adversarial loss (使用 logits，数值更稳定)
+    adv_loss = F.binary_cross_entropy_with_logits(
         fake_pred_for_gen,
         torch.ones_like(fake_pred_for_gen),
         reduction='mean'
@@ -255,25 +255,27 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     discriminator.train()
 
-    # Real loss
-    disc_losses["real_loss"] = F.binary_cross_entropy(
+    # Real loss (使用 logits)
+    disc_losses["real_loss"] = F.binary_cross_entropy_with_logits(
         real_pred,
         torch.ones_like(real_pred),
         reduction='mean'
     )
 
-    # Fake loss
+    # Fake loss (使用 logits)
     fake_hidden_detached = [h.detach() for h in fake_hidden_list]
     fake_pred_for_disc = discriminator(fake_hidden_detached)
-    disc_losses["fake_loss"] = F.binary_cross_entropy(
+    disc_losses["fake_loss"] = F.binary_cross_entropy_with_logits(
         fake_pred_for_disc,
         torch.zeros_like(fake_pred_for_disc),
         reduction='mean'
     )
 
-    # 判别器准确率
-    real_correct = (real_pred > 0.5).float().mean()
-    fake_correct = (fake_pred_for_disc < 0.5).float().mean()
+    # 判别器准确率 (对 logits 应用 sigmoid 后判断)
+    real_prob = torch.sigmoid(real_pred)
+    fake_prob = torch.sigmoid(fake_pred_for_disc)
+    real_correct = (real_prob > 0.5).float().mean()
+    fake_correct = (fake_prob < 0.5).float().mean()
     disc_accuracy = (real_correct + fake_correct) / 2.0
     stats["disc_accuracy"] = disc_accuracy.item()
     stats["disc_real_acc"] = real_correct.item()
