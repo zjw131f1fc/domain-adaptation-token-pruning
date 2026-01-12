@@ -1,0 +1,15 @@
+# 测试所有 Loss 一起的收敛性
+
+method_settings:
+  task_loss_weight_start: 100.0
+  task_loss_weight: 100.0
+  adv_loss_weight_start: 50.0
+  adv_loss_weight: 50.0
+  sparsity_weight: 10.0
+  sparsity_weight_max: 10.0
+  token_count_loss_weight: 0.1
+  binarization_loss_weight: 1.0
+
+global_settings:
+  save_dir: "./outputs/loss_tests/all_losses"
+  log_dir: "./outputs/loss_tests/all_losses/logs"

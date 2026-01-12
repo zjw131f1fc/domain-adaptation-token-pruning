@@ -1,0 +1,10 @@
+# 测试 Task Loss 收敛性
+# 只启用 task_loss，其他 loss 权重为 0
+
+method_settings:
+  task_loss_weight_start: 1.0
+  task_loss_weight: 1.0
+
+global_settings:
+  save_dir: "./outputs/loss_tests/task_loss"
+  log_dir: "./outputs/loss_tests/task_loss/logs"

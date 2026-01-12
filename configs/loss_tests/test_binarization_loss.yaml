@@ -1,0 +1,9 @@
+# 测试 Binarization Loss 收敛性
+# 只启用 binarization_loss，其他 loss 权重为 0
+
+method_settings:
+  binarization_loss_weight: 1.0
+
+global_settings:
+  save_dir: "./outputs/loss_tests/binarization_loss"
+  log_dir: "./outputs/loss_tests/binarization_loss/logs"
