@@ -16,21 +16,17 @@ import sys
 import os
 import yaml
 import torch
-from copy import deepcopy
 from collections import defaultdict
+from torch.utils.data import DataLoader
+
+from engine.configs.loader import load_config
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def merge_dict(base: dict, override: dict) -> dict:
-    """递归合并字典"""
-    result = deepcopy(base)
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge_dict(result[key], value)
-        else:
-            result[key] = deepcopy(value)
-    return result
+def _collate_fn(batch):
+    """简单的 collate 函数，保持样本为列表"""
+    return batch
 
 
 def analyze_and_print_results(test_name: str, loss_history: dict, num_steps: int):
@@ -157,7 +153,9 @@ def run_test(test_name: str, config: dict, num_steps: int = 200):
     # 加载数据集
     print("[2/4] 加载数据集...")
     dataset_bundle = load_dataset(config)
-    train_loader = dataset_bundle["train_loader"]
+    train_dataset = dataset_bundle["splits"]["train"]
+    batch_size = config.get("trainer_settings", {}).get("dl_settings", {}).get("batch_size", 4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate_fn, num_workers=0)
 
     # 创建模块
     print("[3/4] 创建模块...")
@@ -276,26 +274,15 @@ def main():
         print(f"可用: task_loss, adv_loss, sparsity_loss, token_count_loss, binarization_loss, disc_loss, all_losses")
         sys.exit(1)
 
-    # 加载并合并配置
-    with open(base_config_path, 'r') as f:
-        base_config = yaml.safe_load(f)
-
+    # 加载测试特定配置作为 override_dict
     with open(test_config_path, 'r') as f:
-        test_config = yaml.safe_load(f)
+        test_config = yaml.safe_load(f) or {}
 
-    config = merge_dict(base_config, test_config)
-
-    # 添加必要的默认值
-    config.setdefault("logger", type('Logger', (), {
-        'info': lambda self, msg: print(f"[INFO] {msg}"),
-        'warning': lambda self, msg: print(f"[WARN] {msg}"),
-        'error': lambda self, msg: print(f"[ERROR] {msg}"),
-        'debug': lambda self, msg: None
-    })())
-
-    # 设置 hidden_dim 和 vision_dim（如果没有）
-    config["backbone_settings"]["mllm_settings"].setdefault("hidden_dim", 4096)
-    config["backbone_settings"]["mllm_settings"].setdefault("vision_dim", 1024)
+    # 使用 load_config 加载配置（自动处理默认值、logger 等）
+    config = load_config(
+        override_file=base_config_path,
+        override_dict=test_config
+    )
 
     # 运行测试
     run_test(test_name, config, num_steps)

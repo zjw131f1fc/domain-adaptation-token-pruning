@@ -61,9 +61,10 @@ DEFAULT_CONFIG = {
     "global_settings": {
         "seed": 42,
         "device": "cuda",
+        "dtype": "float",  # 训练数据类型: "half" (float16) 或 "float" (float32)
         "pytorch_cuda_alloc_conf": "expandable_segments:True",
-        "dataset_cache_dir": "/data/users/zjw/dataset_cache",
-        "hf_cache_dir": "/data/users/zjw/huggingface_cache",
+        "dataset_cache_dir": "/root/autodl-tmp/dataset_cache",
+        "hf_cache_dir": "/huggingface_cache",
         "save_dir": "./outputs/checkpoints",
         "log_dir": "./outputs/logs",
         "study_name": ""  # 可选的研究名称，为空则不使用
@@ -73,36 +74,42 @@ DEFAULT_CONFIG = {
         "name": "basic-pytorch",
         "dl_settings": {
             "epochs": 3,
-            "batch_size": 8,
+            "batch_size": 4,
             "optimizers": {
                 "generator": {
                     "type": "adam",
-                    "lr": "2e-05"
+                    "lr": 2e-05
                 },
                 "discriminator": {
                     "type": "adam",
-                    "lr": "5e-05"
+                    "lr": 3.2e-04
+                },
+                "token_merger": {
+                    "type": "adam",
+                    "lr": 1e-05
+                },
+                "layer_pruners": {
+                    "type": "adam",
+                    "lr": 1.7e-05
                 }
             },
-            # 评估/打印/保存改为以 batch 为单位
-            "print_loss_every_batches": 10,
-            "eval_every_batches": 80,
-            "eval_max_samples": 50,
-            "save_every_batches": 0,
+            "print_loss_every_batches": 100,
+            "eval_every_batches": 2000,
+            "eval_max_samples": 2000,
+            "save_every_batches": 2000,
             "save_every_epochs": 1,
-            # Optuna超参数搜索时的评估间隔（每隔多少步评估一次）
-            "optuna_eval_interval_batches": 50,
-            # 梯度裁剪（None 表示不裁剪）
-            "grad_clip_max_norm": None,
+            "optuna_eval_interval_batches": 40,
+            "grad_clip_max_norm": 1.0,
         }
     },
     "manager_settings": {
-        "name": "basic",  # Manager 类型: basic
-        "gpus_per_subtask": 1,  # 每个子任务使用的 GPU 数量
-        "available_gpus": [4, 5, 6],  # 可用的 GPU ID 列表
-        "poll_interval": 1.0,  # 调度循环轮询间隔（秒）
-        "mode": None,  # 预定义模式: None, "optuna", "batch_configs"
-        "batch_configs_dir": None,  # batch_configs模式下的配置文件夹路径
+        "name": "basic",
+        "gpus_per_subtask": 1,
+        "available_gpus": [0],
+        "poll_interval": 5.0,
+        "mode": "direct",  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
+        "num_subtasks": 1,
+        "batch_configs_dir": None,
     },
     "search_settings": {
         "enable": False,
@@ -120,17 +127,16 @@ DEFAULT_CONFIG = {
             "n_startup_trials": 10,
             "multivariate": True
         },
-        "params": {
-        }
+        "params": {}
     },
     "dataset_settings": {
-        "name": "vqa-mme",
+        "name": "vqa-vqav2",
         "split": {
             "train": 500,
             "test": 500,
         },
         "category_priority": {
-            "enable": True,
+            "enable": False,
             "values": [
                 {"train": "mean"},
                 {"test": "mean"},
@@ -145,28 +151,59 @@ DEFAULT_CONFIG = {
     },
     "backbone_settings": {
         "type": "mllm",
-        "name": "qwen-2.5-3b",
+        "name": "llava-1.5-7b",
         "mllm_settings": {
-            "device_map": "balanced",
+            "device_map": "auto",
             "max_text_tokens": 128,
-            "max_vision_tokens": 1800,
-            "hidden_dim": 2048,
-            "vision_dim": 2048,
-            "image_max_size": 1500,
+            "max_vision_tokens": 576,
+            "hidden_dim": 4096,
+            "vision_dim": 1024,
+            "image_max_size": 336,
         }
     },
     "method_settings": {
-        "target_sparsity": 0.5,
-        "target_token_num": 128,
+        # Token Merger配置
+        "enable_token_merger": False,
+        "merger_type": "fixed_pooling",
+        "merge_ratio": 1.0,
+        "merger_dropout": 0.1,
+        "merger_d_internal": 512,
+
+        # Layer-wise Pruner配置
+        "pruning_layers": [5, 15, 25],
+        "pruner_d_internal": 512,
+        "pruner_num_heads": 4,
+        "pruner_type": "cross_attention",
+        "pruner_dropout": 0.1,
+
+        # Attention Residual配置
+        "use_attn_residual": False,
+        "attn_residual_weight": 0.5,
+        "learnable_attn_weight": False,
+
+        # 剪枝目标配置
         "use_token_num_target": True,
-        "adv_loss_weight": 1.0,
-        "sparsity_weight": 4e-04,
-        "sparsity_weight_max": 6e-04,
+        "target_token_num": 200,
+        "target_sparsity": 0.3,
+
+        # Sparsity Loss配置
         "sparsity_loss_only_on_excess": True,
-        "sparsity_warmup_ratio": 0.70,
-        "token_count_loss_weight": 1e-4,
-        "task_loss_weight": 10.0,
-        "entropy_weight": 12.0,
+        "sparsity_warmup_enable": True,
+        "sparsity_weight": 10.0,
+        "sparsity_weight_max": 40.0,
+        "sparsity_warmup_ratio": 0.4,
+        "token_count_loss_weight": 0.04,
+        "binarization_loss_weight": 0.81,
+
+        # Temperature Annealing
+        "temperature": 0.8,
+        "temperature_min": 0.2,
+        "temperature_anneal_rate": 0.4,
+
+        # Hard Pruning配置
+        "hard_pruning_threshold": 0.5,
+
+        # Generator配置（遗留）
         "gen_num_layers": 2,
         "gen_num_heads": 2,
         "gen_d_ff": 2048,
@@ -177,15 +214,25 @@ DEFAULT_CONFIG = {
         "gen_temperature_anneal": True,
         "gen_temperature_min": 0.237,
         "gen_temperature_anneal_rate": 0.543,
+
+        # Discriminator配置
         "disc_num_layers": 3,
-        "disc_d_d": 2048,
-        "disc_dropout": 0.1,
+        "disc_d_d": 512,
+        "disc_dropout": 0.15,
         "disc_target_layers": [-1, -3, -5],
-        "disc_reinit_prob": 0.02,
-        "disc_use_spectral_norm": True,
+        "disc_reinit_prob": 0.15,
+        "disc_use_spectral_norm": False,
+
+        # 损失权重（动态调度）
+        "task_loss_weight_start": 150.0,
+        "task_loss_weight": 120.0,
+        "adv_loss_weight_start": 10.0,
+        "adv_loss_weight": 80.0,
+        "entropy_weight": 12.0,
+        "loss_weight_warmup_ratio": 0.3,
     },
     "evaluation_settings": {
-        "eval_mode": ["origin", "full"],
+        "eval_mode": ["origin", "hard"],
     }
 }
 

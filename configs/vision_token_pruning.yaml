@@ -5,10 +5,8 @@ global_settings:
   device: "cuda"
   dtype: "float"  # 训练数据类型: "half" (float16) 或 "float" (float32)
   pytorch_cuda_alloc_conf: "expandable_segments:True"
-  # dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
-  # hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
-  dataset_cache_dir: "/data/users/zjw/dataset_cache"
-  hf_cache_dir: "/data/users/zjw/huggingface_cache"
+  dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
+  hf_cache_dir: "/huggingface_cache"
   save_dir: "./outputs/checkpoints"
   log_dir: "./outputs/logs"
   study_name: "gan_vtp"  # Vision Token Pruning研究名称
@@ -44,8 +42,8 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [1,2,3]  # 单卡
-  gpus_per_subtask: 3
+  available_gpus: [0]  # 单卡（GPU索引从0开始）
+  gpus_per_subtask: 1
   poll_interval: 5.0
   batch_configs_dir: null
 
