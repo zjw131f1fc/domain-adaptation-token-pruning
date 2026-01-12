@@ -255,14 +255,13 @@ class Generator(nn.Module):
             # Gumbel-Softmax: 对每个token的keep/drop进行采样
             stacked_logits = torch.stack([torch.zeros_like(logits), logits], dim=-1)  # (batch, N, 2)
             if self.training:
-                # 训练模式：添加Gumbel噪声实现可微分采样
-                gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
-                gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-                m_soft = F.softmax(gumbel_logits, dim=-1)
+                # 训练模式：使用 PyTorch 的 Gumbel-Softmax 配合 hard=True
+                y_soft = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
+                m = y_soft[..., 1]  # 提取 P(keep)
             else:
-                # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
+                # 推理模式：确定性 argmax
                 m_soft = F.softmax(stacked_logits / self.temperature, dim=-1)
-            m = m_soft[..., 1]  # 取P(keep)
+                m = (m_soft[..., 1] > 0.5).float()
         else:
             # 不使用Gumbel时，直接用sigmoid
             m = torch.sigmoid(logits / self.temperature)

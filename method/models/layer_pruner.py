@@ -224,16 +224,14 @@ class VisionPrunerHead(nn.Module):
         ], dim=-1)  # (batch, n_vision, 2)
 
         if use_gumbel and self.training:
-            # 训练模式：添加Gumbel噪声实现可微分采样
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
-            gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-            probs = F.softmax(gumbel_logits, dim=-1)  # (batch, n_vision, 2)
+            # 训练模式：使用 PyTorch 的 Gumbel-Softmax 配合 hard=True
+            # hard=True: 前向传播使用 one-hot，反向传播使用软梯度（STE 变体）
+            y_soft = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
+            soft_mask = y_soft[..., 1]  # 提取 P(keep)
         else:
-            # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
-            probs = F.softmax(stacked_logits / self.temperature, dim=-1)  # (batch, n_vision, 2)
-
-        # 提取P(keep)
-        soft_mask = probs[..., 1]  # (batch, n_vision)
+            # 推理模式：确定性 argmax
+            probs = F.softmax(stacked_logits / self.temperature, dim=-1)
+            soft_mask = (probs[..., 1] > 0.5).float()
 
         return soft_mask
 
@@ -297,16 +295,13 @@ class VisionPrunerHeadSimple(nn.Module):
         ], dim=-1)
 
         if use_gumbel and self.training:
-            # 训练模式：添加Gumbel噪声实现可微分采样
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(stacked_logits) + 1e-8) + 1e-8)
-            gumbel_logits = (stacked_logits + gumbel_noise) / self.temperature
-            probs = F.softmax(gumbel_logits, dim=-1)
+            # 训练模式：使用 PyTorch 的 Gumbel-Softmax 配合 hard=True
+            y_soft = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
+            soft_mask = y_soft[..., 1]
         else:
-            # 推理模式：不添加噪声，但使用相同的softmax公式保持一致性
+            # 推理模式：确定性 argmax
             probs = F.softmax(stacked_logits / self.temperature, dim=-1)
-
-        # 提取P(keep)
-        soft_mask = probs[..., 1]
+            soft_mask = (probs[..., 1] > 0.5).float()
 
         return soft_mask
 

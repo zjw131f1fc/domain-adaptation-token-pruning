@@ -142,13 +142,70 @@ def extract_target_hidden_states(
     """提取指定层和位置的hidden states"""
     start, end = target_positions
     selected_hidden_states = []
-    
+
     for layer_idx in target_layer_indices:
         hidden = all_hidden_states[layer_idx]
         # 不再强制移动设备，保持在原始设备上
         hidden_slice = hidden[:, start:None if end+1==0 else end+1, :]
         selected_hidden_states.append(hidden_slice)
-    
+
+    return selected_hidden_states
+
+
+def extract_target_hidden_states_batch(
+    all_hidden_states: tuple,
+    answer_positions_list: List[Tuple[int, int]],
+    target_layer_indices: List[int],
+    batch_size: int,
+    attention_mask: Optional[torch.Tensor] = None
+) -> List[torch.Tensor]:
+    """批量提取指定层和位置的hidden states
+
+    参数:
+        all_hidden_states: tuple of (batch, seq_len, hidden_dim)
+        answer_positions_list: List of (start, end) for each sample
+        target_layer_indices: 目标层索引列表
+        batch_size: batch大小
+        attention_mask: (batch, seq_len) attention mask
+
+    返回:
+        List of tensors, each (batch, max_answer_len, hidden_dim)
+    """
+    selected_hidden_states = []
+    seq_len = all_hidden_states[0].shape[1]
+
+    # 计算每个样本的answer位置（转换负索引）
+    answer_ranges = []
+    max_answer_len = 0
+    for i, (start, end) in enumerate(answer_positions_list):
+        if start is None:
+            answer_ranges.append((0, 0))
+            continue
+        # 转换负索引
+        if start < 0:
+            start = seq_len + start
+        if end < 0:
+            end = seq_len + end
+        answer_len = end - start + 1
+        max_answer_len = max(max_answer_len, answer_len)
+        answer_ranges.append((start, end))
+
+    for layer_idx in target_layer_indices:
+        hidden = all_hidden_states[layer_idx]  # (batch, seq_len, hidden_dim)
+        hidden_dim = hidden.shape[-1]
+
+        # 创建输出tensor
+        batch_hidden = torch.zeros(batch_size, max_answer_len, hidden_dim,
+                                   device=hidden.device, dtype=hidden.dtype)
+
+        for i, (start, end) in enumerate(answer_ranges):
+            if start == end == 0:
+                continue
+            answer_len = end - start + 1
+            batch_hidden[i, :answer_len, :] = hidden[i, start:end+1, :]
+
+        selected_hidden_states.append(batch_hidden)
+
     return selected_hidden_states
 
 
@@ -227,6 +284,82 @@ def compute_task_loss(
     )
 
     return loss
+
+
+def compute_task_loss_batch(
+    logits: torch.Tensor,
+    answer_positions_list: List[Tuple[int, int]],
+    answers: List[str],
+    processor,
+    attention_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """批量计算任务损失
+
+    参数:
+        logits: (batch, seq_len, vocab_size) - 模型输出的logits
+        answer_positions_list: List of (start, end) for each sample
+        answers: List of answer strings
+        processor: tokenizer所在的processor
+        attention_mask: (batch, seq_len) attention mask
+
+    返回:
+        task_loss: torch.Tensor - 平均交叉熵损失
+    """
+    batch_size = logits.shape[0]
+    seq_len = logits.shape[1]
+    vocab_size = logits.shape[-1]
+
+    total_loss = torch.tensor(0.0, device=logits.device)
+    valid_samples = 0
+
+    for i in range(batch_size):
+        answer = answers[i]
+        answer_start, answer_end = answer_positions_list[i]
+
+        if answer_start is None:
+            continue
+
+        # 转换负索引
+        if answer_start < 0:
+            answer_start = seq_len + answer_start
+        if answer_end < 0:
+            answer_end = seq_len + answer_end
+
+        # 验证位置有效性
+        if answer_start < 0 or answer_end >= seq_len or answer_start > answer_end:
+            continue
+
+        answer_token_ids_list = processor.tokenizer.encode(answer, add_special_tokens=False)
+        if len(answer_token_ids_list) == 0:
+            continue
+
+        max_id = max(answer_token_ids_list)
+        min_id = min(answer_token_ids_list)
+        if max_id >= vocab_size or min_id < 0:
+            continue
+
+        answer_token_ids = torch.tensor(answer_token_ids_list, device=logits.device, dtype=torch.long)
+
+        # 从 answer_start-1 开始取logits
+        logits_for_answer = logits[i:i+1, answer_start-1:answer_end, :]
+
+        expected_len = len(answer_token_ids)
+        actual_len = logits_for_answer.shape[1]
+        if actual_len != expected_len:
+            continue
+
+        loss = F.cross_entropy(
+            logits_for_answer.reshape(-1, vocab_size),
+            answer_token_ids,
+            reduction='mean'
+        )
+        total_loss = total_loss + loss
+        valid_samples += 1
+
+    if valid_samples > 0:
+        return total_loss / valid_samples
+    else:
+        return total_loss
 
 
 def get_current_sparsity_weight(config: Dict, current_step: int, total_steps: int) -> float:
@@ -445,6 +578,37 @@ def register_multi_layer_hooks(
         handles.append(handle)
 
     return handles
+
+
+def register_multi_layer_hooks_batch(
+    backbone,
+    layer_pruners,
+    vision_positions: Tuple[int, int],
+    question_embeddings: torch.Tensor,
+    mask_collector: Optional[List] = None,
+    use_attn_residual: bool = False
+) -> List[Any]:
+    """批量版本的多层剪枝hooks注册
+
+    与单样本版本相同，因为hooks本身就支持batch处理。
+    这个函数主要是为了API一致性。
+
+    参数:
+        backbone: LLaVA backbone实例
+        layer_pruners: LayerSpecificPruner实例
+        vision_positions: (start, end) - vision tokens位置（所有样本相同）
+        question_embeddings: (batch, n_text, d_text) - question embeddings
+        mask_collector: 可选的列表，用于收集soft_mask
+        use_attn_residual: 是否启用attention residual
+
+    返回:
+        handles: hook handle列表
+    """
+    # 批量版本直接使用原有的hooks，因为它们本身就支持batch
+    return register_multi_layer_hooks(
+        backbone, layer_pruners, vision_positions, question_embeddings,
+        mask_collector, use_attn_residual
+    )
 
 
 def register_multi_layer_hooks_v2(

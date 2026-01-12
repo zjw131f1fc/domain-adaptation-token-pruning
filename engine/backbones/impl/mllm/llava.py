@@ -324,6 +324,205 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
             if hook_handle is not None:
                 hook_handle.remove()
 
+    def preprocess_batch(
+        self,
+        images: List[Image.Image],
+        questions: List[str],
+        answers: Optional[List[str]] = None,
+        target_image_size: Optional[Tuple[int, int]] = None
+    ) -> Dict[str, Any]:
+        """批量预处理输入，将图像和文本转换为 embedding 序列。
+
+        通过将图像resize到统一大小，确保vision token数量一致，从而支持批量处理。
+        对text token做右填充，使序列长度一致。
+
+        参数:
+            images: PIL Image 对象列表
+            questions: 问题文本列表
+            answers: 答案文本列表（可选）
+            target_image_size: 目标图像大小 (width, height)，如果为None则使用第一张图像的大小
+
+        返回:
+            包含以下键的字典:
+            - embeddings: torch.Tensor, shape (batch, max_seq_len, hidden_dim)
+            - attention_mask: torch.Tensor, shape (batch, max_seq_len)
+            - vision_token_positions: Tuple[int, int]，(start, end) vision token 的位置（所有样本相同）
+            - answer_token_positions: List[Tuple[int, int]]，每个样本的 answer token 位置
+            - raw_vision_features: torch.Tensor, shape (batch, num_vision_tokens, vision_dim)
+            - seq_lengths: List[int]，每个样本的原始序列长度（padding前）
+        """
+        batch_size = len(images)
+        if answers is None:
+            answers = [None] * batch_size
+
+        # 确定目标图像大小
+        if target_image_size is None:
+            # 使用配置的最大尺寸作为统一大小
+            target_size = (336, 336)  # LLaVA默认的vision tower输入大小
+        else:
+            target_size = target_image_size
+
+        # 将所有图像resize到统一大小
+        resized_images = []
+        for img in images:
+            img_rgb = img.convert("RGB")
+            if img_rgb.size != target_size:
+                img_rgb = img_rgb.resize(target_size, Image.Resampling.LANCZOS)
+            resized_images.append(img_rgb)
+
+        # 构建prompts
+        prompts = [self._build_prompt(q, a) for q, a in zip(questions, answers)]
+        prompts_no_answer = [self._build_prompt(q) for q in questions]
+
+        # 批量处理
+        inputs = self.processor(
+            text=prompts,
+            images=resized_images,
+            return_tensors="pt",
+            padding=True,  # 启用padding
+            truncation=True
+        )
+
+        # 移动到模型设备
+        target_device = next(self.model.parameters()).device
+        inputs = {k: v.to(target_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            input_ids = inputs['input_ids']  # (batch, seq_len)
+            pixel_values = inputs['pixel_values']  # (batch, C, H, W)
+            attention_mask = inputs['attention_mask']  # (batch, seq_len)
+
+            # 1) 获取文本 token 的嵌入
+            text_token_embeds = self.model.get_input_embeddings()(input_ids)  # (batch, seq_len, D)
+
+            # 2) 获取vision features
+            raw_vision_features = None
+            image_token_embeds = None
+
+            if hasattr(self.model, 'vision_tower') and hasattr(self.model, 'multi_modal_projector'):
+                vision_tower = self.model.vision_tower
+                projector = self.model.multi_modal_projector
+
+                # 调用 vision_tower 获取原始 features
+                vision_outputs = vision_tower(pixel_values, output_hidden_states=True)
+
+                # 获取指定层的 hidden states
+                vision_feature_layer = self.model.config.vision_feature_layer
+                if isinstance(vision_feature_layer, int):
+                    selected_features = vision_outputs.hidden_states[vision_feature_layer]
+                else:
+                    selected_features = torch.cat(
+                        [vision_outputs.hidden_states[idx] for idx in vision_feature_layer],
+                        dim=-1
+                    )
+
+                # 根据 vision_feature_select_strategy 决定是否去掉 CLS
+                vision_feature_select_strategy = self.model.config.vision_feature_select_strategy
+                if vision_feature_select_strategy == "default":
+                    selected_features = selected_features[:, 1:]  # 去掉 CLS token
+
+                # raw_vision_features: 未投影的 CLIP 输出 (batch, num_patches, vision_dim)
+                raw_vision_features = selected_features
+
+                # 通过 projector 投影到 LLM hidden dim
+                image_token_embeds = projector(selected_features)
+                image_token_embeds = image_token_embeds.to(text_token_embeds.dtype)
+            else:
+                raise ValueError("Model must have vision_tower and multi_modal_projector")
+
+            # 3) 找到图像占位 token 的位置（所有样本应该相同，因为图像大小一致）
+            image_token_id = self.model.config.image_token_index
+            # 使用第一个样本确定位置
+            image_token_indices = torch.where(input_ids[0] == image_token_id)[0]
+
+            if len(image_token_indices) == 0:
+                raise ValueError("未找到图像占位 token (<image>)")
+
+            img_token_start_idx = int(image_token_indices[0])
+            img_token_end_idx = int(image_token_indices[-1])
+            num_vision_tokens = image_token_embeds.shape[1]
+
+            # 4) 构建完整序列: 文本前段 + 视觉token + 文本后段
+            text_embeds_part1 = text_token_embeds[:, :img_token_start_idx, :]
+            text_embeds_part2 = text_token_embeds[:, img_token_end_idx + 1:, :]
+
+            full_embeddings = torch.cat([
+                text_embeds_part1,
+                image_token_embeds,
+                text_embeds_part2
+            ], dim=1)  # (batch, seq_len_new, D)
+
+            # 5) 构建对应的 attention mask
+            vision_attention = torch.ones(
+                (batch_size, num_vision_tokens),
+                dtype=torch.long,
+                device=target_device
+            )
+
+            attention_part1 = attention_mask[:, :img_token_start_idx]
+            attention_part2 = attention_mask[:, img_token_end_idx + 1:]
+            full_attention_mask = torch.cat([
+                attention_part1,
+                vision_attention,
+                attention_part2
+            ], dim=1)
+
+            # vision token 在完整序列中的位置
+            vision_start = text_embeds_part1.shape[1]
+            vision_end = vision_start + num_vision_tokens - 1
+
+            # 6) 计算每个样本的 answer token 位置
+            answer_positions_list = []
+            if answers[0] is not None:
+                # 处理不带answer的prompts来计算位置
+                inputs_no_answer = self.processor(
+                    text=prompts_no_answer,
+                    images=resized_images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True
+                )
+
+                for i in range(batch_size):
+                    # 计算 answer token 的长度差异
+                    # 注意：由于padding，需要计算实际的token长度
+                    total_added_len = (input_ids[i] != self.processor.tokenizer.pad_token_id).sum().item() - \
+                                     (inputs_no_answer['input_ids'][i] != self.processor.tokenizer.pad_token_id).sum().item()
+
+                    # 单独 tokenize answer
+                    answer_tokens = self.processor.tokenizer(
+                        answers[i],
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    )['input_ids']
+                    answer_len = answer_tokens.shape[1]
+
+                    # 计算answer在新序列中的位置
+                    # 需要考虑vision token数量的变化
+                    original_img_tokens = img_token_end_idx - img_token_start_idx + 1
+                    token_diff = num_vision_tokens - original_img_tokens
+
+                    # 找到该样本的实际序列长度（不含padding）
+                    actual_seq_len = full_attention_mask[i].sum().item()
+
+                    # answer位置（使用负索引）
+                    answer_start = -total_added_len
+                    answer_end = answer_start + answer_len - 1
+
+                    answer_positions_list.append((answer_start, answer_end))
+            else:
+                answer_positions_list = [None] * batch_size
+
+            result = {
+                "embeddings": full_embeddings.to(self.output_device),
+                "attention_mask": full_attention_mask.to(self.output_device),
+                "vision_token_positions": (vision_start, vision_end),
+                "answer_token_positions": answer_positions_list,
+                "raw_vision_features": raw_vision_features.to(self.output_device) if raw_vision_features is not None else None,
+            }
+
+        return result
+
     def preprocess(
         self,
         image: Image.Image,
