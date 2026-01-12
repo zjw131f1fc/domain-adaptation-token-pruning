@@ -104,7 +104,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     new_attention_mask = attention_mask
 
     # 提取question embeddings（用于layer pruners）
-    question_embeddings = embeddings_for_forward[:, v_end+1:, :]  # (batch, remaining_len, 4096)
+    # 注意：只取question部分，排除answer token
+    # answer_positions是List of (start, end)，取最小的answer_start作为截止点
+    min_answer_start = min(pos[0] for pos in answer_positions)
+    question_embeddings = embeddings_for_forward[:, v_end+1:min_answer_start, :]  # (batch, question_len, 4096)
 
     # ========== Phase 2: Layer-wise Pruning Forward（带hooks） ==========
 
