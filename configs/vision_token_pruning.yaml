@@ -5,8 +5,8 @@ global_settings:
   device: "cuda"
   dtype: "float"  # 训练数据类型: "half" (float16) 或 "float" (float32)
   pytorch_cuda_alloc_conf: "expandable_segments:True"
-  dataset_cache_dir: "/data/users/zjw/dataset_cache"
-  hf_cache_dir: "/data/users/zjw/huggingface_cache"
+  dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
+  hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
   save_dir: "./outputs/checkpoints"
   log_dir: "./outputs/logs"
   study_name: "gan_vtp"  # Vision Token Pruning研究名称
@@ -15,8 +15,8 @@ trainer_settings:  # 训练框架设置
   type: "deep-learning"
   name: "basic-pytorch"
   dl_settings:
-    epochs: 1
-    batch_size: 10
+    epochs: 3
+    batch_size: 4  # 单卡显存有限，减小batch size
     optimizers:
       generator:
         type: "adam"
@@ -31,10 +31,10 @@ trainer_settings:  # 训练框架设置
         type: "adam"
         lr: 1.7e-05
     print_loss_every_batches: 100
-    eval_every_batches: 1000
+    eval_every_batches: 2000
     eval_max_samples: 2000
-    save_every_batches: 1000
-    save_every_epochs: 0
+    save_every_batches: 2000
+    save_every_epochs: 1
     optuna_eval_interval_batches: 40
     grad_clip_max_norm: 1.0
 
@@ -42,7 +42,7 @@ manager_settings:
   name: "basic"
   mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
   num_subtasks: 1
-  available_gpus: [5,6,7]
+  available_gpus: [1,2,4]  # 单卡
   gpus_per_subtask: 3
   poll_interval: 5.0
   batch_configs_dir: null
@@ -164,10 +164,10 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 50000
+    train: 30000  # VQA v2 全量训练集
     test: 5000
   category_priority:
-    enable: true  # 禁用类别均衡，加快数据加载
+    enable: false  # 大规模训练禁用类别均衡，加快数据加载
     values:
       - train: "mean"
   fast_load_no_random: false  # 快速加载模式（Optuna搜索时加速）
@@ -180,12 +180,11 @@ config_settings:
 backbone_settings:  # 多模态大模型骨架配置
   type: "mllm"  # 骨架类型
   name: "llava-1.5-7b"  # 模型名称
-# name: "llava-1.5-7b" "qwen-2.5-3b"
   mllm_settings:
-    device_map: "balanced"  # 显存分配策略（balanced/auto）
+    device_map: "auto"  # 单卡使用auto
     max_text_tokens: 128  # 最大文本token数
-    max_vision_tokens: 1600  # 最大视觉token数（减少降低显存占用）
-    image_max_size: 1100  # 图像最大尺寸（减少降低vision token数）
+    max_vision_tokens: 576  # 固定vision token数（336x336图像）
+    image_max_size: 336  # 图像统一大小（batch处理需要）
 
 
 method_settings:
