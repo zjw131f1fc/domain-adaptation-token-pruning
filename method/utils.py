@@ -10,29 +10,31 @@ from typing import Dict, Any, List, Tuple, Optional, Callable
 
 # === DEBUG 工具函数 ===
 def _debug_check_tensor(tensor, name, context=""):
-    """检查tensor是否包含NaN或Inf"""
-    if tensor is None:
-        return False
-
-    has_nan = torch.isnan(tensor).any().item()
-    has_inf = torch.isinf(tensor).any().item()
-
-    if has_nan:
-        nan_count = torch.isnan(tensor).sum().item()
-        valid_vals = tensor[~torch.isnan(tensor)]
-        if valid_vals.numel() > 0:
-            print(f"[DEBUG NaN] {context} {name}: nan_count={nan_count}, "
-                  f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
-        else:
-            print(f"[DEBUG NaN] {context} {name}: ALL VALUES ARE NaN!")
-        return True
-
-    if has_inf:
-        inf_count = torch.isinf(tensor).sum().item()
-        print(f"[DEBUG Inf] {context} {name}: inf_count={inf_count}")
-        return True
-
+    """检查tensor是否包含NaN或Inf - 暂时禁用输出"""
+    # 暂时禁用NaN检测输出，避免刷屏
     return False
+    # if tensor is None:
+    #     return False
+    #
+    # has_nan = torch.isnan(tensor).any().item()
+    # has_inf = torch.isinf(tensor).any().item()
+    #
+    # if has_nan:
+    #     nan_count = torch.isnan(tensor).sum().item()
+    #     valid_vals = tensor[~torch.isnan(tensor)]
+    #     if valid_vals.numel() > 0:
+    #         print(f"[DEBUG NaN] {context} {name}: nan_count={nan_count}, "
+    #               f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
+    #     else:
+    #         print(f"[DEBUG NaN] {context} {name}: ALL VALUES ARE NaN!")
+    #     return True
+    #
+    # if has_inf:
+    #     inf_count = torch.isinf(tensor).sum().item()
+    #     print(f"[DEBUG Inf] {context} {name}: inf_count={inf_count}")
+    #     return True
+    #
+    # return False
 
 
 def extract_target_hidden_states_batch(
@@ -118,40 +120,60 @@ def compute_task_loss_batch(
     total_loss = torch.tensor(0.0, device=logits.device)
     valid_samples = 0
 
+    # DEBUG: 打印整体信息
+    print(f"[DEBUG task_loss] batch_size={batch_size}, seq_len={seq_len}, vocab_size={vocab_size}")
+    print(f"[DEBUG task_loss] answer_positions_list={answer_positions_list}")
+    print(f"[DEBUG task_loss] answers={answers}")
+
     for i in range(batch_size):
         answer = answers[i]
         answer_start, answer_end = answer_positions_list[i]
 
+        print(f"[DEBUG task_loss] Sample {i}: answer='{answer}', pos=({answer_start}, {answer_end})")
+
         if answer_start is None:
+            print(f"[DEBUG task_loss] Sample {i}: SKIP - answer_start is None")
             continue
 
         # 转换负索引
+        orig_start, orig_end = answer_start, answer_end
         if answer_start < 0:
             answer_start = seq_len + answer_start
         if answer_end < 0:
             answer_end = seq_len + answer_end
 
+        if orig_start != answer_start or orig_end != answer_end:
+            print(f"[DEBUG task_loss] Sample {i}: converted pos ({orig_start}, {orig_end}) -> ({answer_start}, {answer_end})")
+
         # 验证位置有效性
         if answer_start < 0 or answer_end >= seq_len or answer_start > answer_end:
+            print(f"[DEBUG task_loss] Sample {i}: SKIP - invalid pos: start={answer_start}, end={answer_end}, seq_len={seq_len}")
             continue
 
         answer_token_ids_list = processor.tokenizer.encode(answer, add_special_tokens=False)
         if len(answer_token_ids_list) == 0:
+            print(f"[DEBUG task_loss] Sample {i}: SKIP - empty tokenized answer")
             continue
 
         max_id = max(answer_token_ids_list)
         min_id = min(answer_token_ids_list)
         if max_id >= vocab_size or min_id < 0:
+            print(f"[DEBUG task_loss] Sample {i}: SKIP - token id out of range: min={min_id}, max={max_id}, vocab_size={vocab_size}")
             continue
 
         answer_token_ids = torch.tensor(answer_token_ids_list, device=logits.device, dtype=torch.long)
 
-        # 从 answer_start-1 开始取logits
+        # 从 answer_start-1 开始取logits (因为要预测下一个token)
         logits_for_answer = logits[i:i+1, answer_start-1:answer_end, :]
 
         expected_len = len(answer_token_ids)
         actual_len = logits_for_answer.shape[1]
+
+        print(f"[DEBUG task_loss] Sample {i}: token_ids={answer_token_ids_list}, expected_len={expected_len}, actual_len={actual_len}")
+        print(f"[DEBUG task_loss] Sample {i}: logits slice [{answer_start-1}:{answer_end}], shape={logits_for_answer.shape}")
+
         if actual_len != expected_len:
+            print(f"[DEBUG task_loss] Sample {i}: SKIP - length mismatch: expected={expected_len}, actual={actual_len}")
             continue
 
         loss = F.cross_entropy(
@@ -159,12 +181,16 @@ def compute_task_loss_batch(
             answer_token_ids,
             reduction='mean'
         )
+        print(f"[DEBUG task_loss] Sample {i}: loss={loss.item():.4f}")
         total_loss = total_loss + loss
         valid_samples += 1
+
+    print(f"[DEBUG task_loss] valid_samples={valid_samples}, total_loss={total_loss.item():.4f}")
 
     if valid_samples > 0:
         return total_loss / valid_samples
     else:
+        print(f"[DEBUG task_loss] WARNING: No valid samples! Returning zero loss.")
         return total_loss
 
 

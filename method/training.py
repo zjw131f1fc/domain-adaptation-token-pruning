@@ -20,31 +20,33 @@ from .utils import (
 
 # === DEBUG 工具函数 ===
 def debug_check_tensor(tensor, name, step=None):
-    """检查tensor是否包含NaN或Inf"""
-    if tensor is None:
-        return False
-
-    has_nan = torch.isnan(tensor).any().item()
-    has_inf = torch.isinf(tensor).any().item()
-
-    step_str = f"[Step {step}] " if step is not None else ""
-
-    if has_nan:
-        nan_count = torch.isnan(tensor).sum().item()
-        valid_vals = tensor[~torch.isnan(tensor)]
-        if valid_vals.numel() > 0:
-            print(f"{step_str}[DEBUG NaN] {name}: nan_count={nan_count}, "
-                  f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
-        else:
-            print(f"{step_str}[DEBUG NaN] {name}: ALL VALUES ARE NaN!")
-        return True
-
-    if has_inf:
-        inf_count = torch.isinf(tensor).sum().item()
-        print(f"{step_str}[DEBUG Inf] {name}: inf_count={inf_count}")
-        return True
-
+    """检查tensor是否包含NaN或Inf - 暂时禁用输出"""
+    # 暂时禁用NaN检测输出，避免刷屏
     return False
+    # if tensor is None:
+    #     return False
+    #
+    # has_nan = torch.isnan(tensor).any().item()
+    # has_inf = torch.isinf(tensor).any().item()
+    #
+    # step_str = f"[Step {step}] " if step is not None else ""
+    #
+    # if has_nan:
+    #     nan_count = torch.isnan(tensor).sum().item()
+    #     valid_vals = tensor[~torch.isnan(tensor)]
+    #     if valid_vals.numel() > 0:
+    #         print(f"{step_str}[DEBUG NaN] {name}: nan_count={nan_count}, "
+    #               f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
+    #     else:
+    #         print(f"{step_str}[DEBUG NaN] {name}: ALL VALUES ARE NaN!")
+    #     return True
+    #
+    # if has_inf:
+    #     inf_count = torch.isinf(tensor).sum().item()
+    #     print(f"{step_str}[DEBUG Inf] {name}: inf_count={inf_count}")
+    #     return True
+    #
+    # return False
 
 
 def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
