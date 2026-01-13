@@ -7,7 +7,7 @@ global_settings:
   dtype: "float"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
   dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
-  hf_cache_dir: "/huggingface_cache"
+  hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
   save_dir: "./outputs/loss_tests"
   log_dir: "./outputs/loss_tests/logs"
   study_name: "loss_test"

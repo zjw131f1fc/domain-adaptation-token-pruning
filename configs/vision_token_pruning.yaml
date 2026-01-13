@@ -6,7 +6,7 @@ global_settings:
   dtype: "float"  # 训练数据类型: "half" (float16) 或 "float" (float32)
   pytorch_cuda_alloc_conf: "expandable_segments:True"
   dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
-  hf_cache_dir: "/huggingface_cache"
+  hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
   save_dir: "./outputs/checkpoints"
   log_dir: "./outputs/logs"
   study_name: "gan_vtp"  # Vision Token Pruning研究名称

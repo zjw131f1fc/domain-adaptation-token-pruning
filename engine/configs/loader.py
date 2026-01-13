@@ -4,7 +4,7 @@ import sys
 # 自动检测工作目录：从当前文件位置向上找到项目根目录
 CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_DIR = os.path.abspath(os.path.join(CURRENT_FILE_DIR, '../..'))
-HF_HOME = "/data/users/zjw/huggingface_cache"
+HF_HOME = "/data/users/zjw/root/autodl-tmp/huggingface_cache"
 HF_ENDPOINT = "https://hf-mirror.com"
 os.environ["HF_HOME"] = HF_HOME
 os.environ["HF_ENDPOINT"] = HF_ENDPOINT
@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
         "dtype": "float",  # 训练数据类型: "half" (float16) 或 "float" (float32)
         "pytorch_cuda_alloc_conf": "expandable_segments:True",
         "dataset_cache_dir": "/root/autodl-tmp/dataset_cache",
-        "hf_cache_dir": "/huggingface_cache",
+        "hf_cache_dir": "/root/autodl-tmp/huggingface_cache",
         "save_dir": "./outputs/checkpoints",
         "log_dir": "./outputs/logs",
         "study_name": ""  # 可选的研究名称，为空则不使用
