@@ -30,7 +30,7 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: 1.7e-05
-    print_loss_every_batches: 100
+    print_loss_every_batches: 2
     eval_every_batches: 2000
     eval_max_samples: 2000
     save_every_batches: 2000
@@ -253,8 +253,8 @@ method_settings:
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 150.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 120.0 # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 80.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 40.0 # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
   adv_loss_weight_start: 10.0  # 初始权重（低对抗，避免过早压制pruner）

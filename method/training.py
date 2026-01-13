@@ -18,6 +18,35 @@ from .utils import (
 )
 
 
+# === DEBUG 工具函数 ===
+def debug_check_tensor(tensor, name, step=None):
+    """检查tensor是否包含NaN或Inf"""
+    if tensor is None:
+        return False
+
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+
+    step_str = f"[Step {step}] " if step is not None else ""
+
+    if has_nan:
+        nan_count = torch.isnan(tensor).sum().item()
+        valid_vals = tensor[~torch.isnan(tensor)]
+        if valid_vals.numel() > 0:
+            print(f"{step_str}[DEBUG NaN] {name}: nan_count={nan_count}, "
+                  f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
+        else:
+            print(f"{step_str}[DEBUG NaN] {name}: ALL VALUES ARE NaN!")
+        return True
+
+    if has_inf:
+        inf_count = torch.isinf(tensor).sum().item()
+        print(f"{step_str}[DEBUG Inf] {name}: inf_count={inf_count}")
+        return True
+
+    return False
+
+
 def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """批量版本的训练step函数
 
@@ -134,6 +163,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             output_hidden_states=True
         )
 
+        # === DEBUG: 检查forward输出 ===
+        debug_check_tensor(result_fake['logits'], "result_fake['logits']", current_step)
+
         # 2.4 提取hidden states from target layers
         fake_hidden_list = extract_target_hidden_states_batch(
             result_fake['all_hidden_states'],
@@ -142,6 +174,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             batch_size=batch_size,
             attention_mask=new_attention_mask
         )
+
+        # === DEBUG: 检查fake hidden states ===
+        for i, fh in enumerate(fake_hidden_list):
+            debug_check_tensor(fh, f"fake_hidden_list[{i}]", current_step)
 
     finally:
         remove_hooks(handles)
@@ -172,11 +208,17 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     fake_pred_for_gen = discriminator(fake_hidden_list)  # (batch, seq_len)
 
+    # === DEBUG: 检查discriminator输出 ===
+    debug_check_tensor(fake_pred_for_gen, "fake_pred_for_gen", current_step)
+
     for p in discriminator.parameters():
         p.requires_grad = True
 
     # 3.2 判别real
     real_pred = discriminator(real_hidden_list)
+
+    # === DEBUG: 检查real_pred ===
+    debug_check_tensor(real_pred, "real_pred", current_step)
 
     # ========== Phase 4: Loss Computation ==========
 
@@ -192,6 +234,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     )
     layer_pruners_losses["task_loss"] = task_loss
 
+    # === DEBUG: 检查task_loss ===
+    debug_check_tensor(task_loss, "task_loss (before weight)", current_step)
+
     # 2. Adversarial loss (使用 logits，数值更稳定)
     adv_loss = F.binary_cross_entropy_with_logits(
         fake_pred_for_gen,
@@ -200,8 +245,18 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     )
     layer_pruners_losses["adv_loss"] = adv_loss
 
+    # === DEBUG: 检查adv_loss ===
+    debug_check_tensor(adv_loss, "adv_loss (before weight)", current_step)
+
     # 3. Sparsity Loss
     if len(pruning_masks) > 0:
+        # === DEBUG: 检查pruning_masks ===
+        for i, mask in enumerate(pruning_masks):
+            if debug_check_tensor(mask, f"pruning_masks[{i}]", current_step):
+                print(f"[Step {current_step}] [DEBUG] pruning_masks[{i}] stats: "
+                      f"shape={mask.shape}, min={mask.min().item():.4f}, max={mask.max().item():.4f}, "
+                      f"mean={mask.mean().item():.4f}")
+
         target_sparsity = config['method_settings'].get('target_sparsity')
         use_token_num_target = config['method_settings'].get('use_token_num_target')
         sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
@@ -220,6 +275,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         final_mask = pruning_masks[-1]
         final_kept_ratio = final_mask.mean()
 
+        # === DEBUG: 检查kept_ratios ===
+        debug_check_tensor(avg_kept_ratio, "avg_kept_ratio", current_step)
+
         if sparsity_loss_only_on_excess:
             excess = torch.relu(avg_kept_ratio - target_kept_ratio)
             sparsity_constraint_loss = excess.to(device).pow(2)
@@ -228,16 +286,19 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
 
+        # === DEBUG: 检查sparsity_loss ===
+        debug_check_tensor(sparsity_constraint_loss, "sparsity_loss (before weight)", current_step)
+
         # Token Count Loss
         token_count_loss = avg_kept_ratio.to(device)
         layer_pruners_losses["token_count_loss"] = token_count_loss
 
-        # Binarization Loss
+        # Binarization Loss: 鼓励 mask 接近 0 或 1
+        # binary_term = mask * (1 - mask) 在 mask=0 或 1 时为 0，在 mask=0.5 时最大 (0.25)
         binarization_loss = torch.tensor(0.0, device=device)
         for mask in pruning_masks:
             binary_term = (mask * (1 - mask)).mean()
-            variance_term = mask.var()
-            binarization_loss = binarization_loss + (binary_term - 0.5 * variance_term).to(device)
+            binarization_loss = binarization_loss + binary_term.to(device)
         binarization_loss = binarization_loss / len(pruning_masks)
         layer_pruners_losses["binarization_loss"] = binarization_loss
 
@@ -262,6 +323,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         reduction='mean'
     )
 
+    # === DEBUG: 检查disc real_loss ===
+    debug_check_tensor(disc_losses["real_loss"], "disc_real_loss", current_step)
+
     # Fake loss (使用 logits)
     fake_hidden_detached = [h.detach() for h in fake_hidden_list]
     fake_pred_for_disc = discriminator(fake_hidden_detached)
@@ -270,6 +334,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         torch.zeros_like(fake_pred_for_disc),
         reduction='mean'
     )
+
+    # === DEBUG: 检查disc fake_loss ===
+    debug_check_tensor(disc_losses["fake_loss"], "disc_fake_loss", current_step)
 
     # 判别器准确率 (对 logits 应用 sigmoid 后判断)
     real_prob = torch.sigmoid(real_pred)

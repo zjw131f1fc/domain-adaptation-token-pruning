@@ -8,6 +8,33 @@ import torch.nn.functional as F
 from typing import Dict, Any, List, Tuple, Optional, Callable
 
 
+# === DEBUG 工具函数 ===
+def _debug_check_tensor(tensor, name, context=""):
+    """检查tensor是否包含NaN或Inf"""
+    if tensor is None:
+        return False
+
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+
+    if has_nan:
+        nan_count = torch.isnan(tensor).sum().item()
+        valid_vals = tensor[~torch.isnan(tensor)]
+        if valid_vals.numel() > 0:
+            print(f"[DEBUG NaN] {context} {name}: nan_count={nan_count}, "
+                  f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
+        else:
+            print(f"[DEBUG NaN] {context} {name}: ALL VALUES ARE NaN!")
+        return True
+
+    if has_inf:
+        inf_count = torch.isinf(tensor).sum().item()
+        print(f"[DEBUG Inf] {context} {name}: inf_count={inf_count}")
+        return True
+
+    return False
+
+
 def extract_target_hidden_states_batch(
     all_hidden_states: tuple,
     answer_positions_list: List[Tuple[int, int]],
@@ -198,6 +225,10 @@ def create_layer_pruning_modifier(
         v_start, v_end = vision_positions
         vision_hidden = hidden_states[:, v_start:v_end+1, :]  # (batch, n_vision, d_model)
 
+        # === DEBUG: 检查输入hidden_states ===
+        _debug_check_tensor(hidden_states, "hidden_states (hook input)", "[Hook Modifier]")
+        _debug_check_tensor(vision_hidden, "vision_hidden (extracted)", "[Hook Modifier]")
+
         # === Step 2: 计算text→vision attention（如果启用） ===
         text_to_vision_attn = None
         if use_attn_residual:
@@ -219,6 +250,9 @@ def create_layer_pruning_modifier(
         with torch.enable_grad():
             soft_mask = pruner(vision_hidden, question_embeddings, text_to_vision_attn=text_to_vision_attn)
 
+        # === DEBUG: 检查soft_mask ===
+        _debug_check_tensor(soft_mask, "soft_mask (from pruner)", "[Hook Modifier]")
+
         # === Step 4: 收集mask ===
         if mask_collector is not None:
             mask_collector.append(soft_mask)
@@ -227,9 +261,15 @@ def create_layer_pruning_modifier(
         soft_mask = soft_mask.to(vision_hidden.dtype)
         scaled_vision = vision_hidden * soft_mask.unsqueeze(-1)
 
+        # === DEBUG: 检查scaled_vision ===
+        _debug_check_tensor(scaled_vision, "scaled_vision (after mask)", "[Hook Modifier]")
+
         # === Step 6: 替换到完整hidden_states中 ===
         new_hidden = hidden_states.clone()
         new_hidden[:, v_start:v_end+1, :] = scaled_vision
+
+        # === DEBUG: 检查new_hidden ===
+        _debug_check_tensor(new_hidden, "new_hidden (output)", "[Hook Modifier]")
 
         return new_hidden, attention_mask
 
@@ -371,6 +411,10 @@ def register_multi_layer_hooks_v2(
                 hidden_states_out = output
                 vision_hidden = hidden_states_out[:, v_start:v_end+1, :]
 
+                # === DEBUG: 检查输入 ===
+                _debug_check_tensor(hidden_states_out, f"hidden_states_out (L{layer_idx_ref})", "[Hook V2]")
+                _debug_check_tensor(vision_hidden, f"vision_hidden (L{layer_idx_ref})", "[Hook V2]")
+
                 text_to_vision_attn = None
                 if use_attn_ref:
                     attn_weights = None
@@ -413,12 +457,18 @@ def register_multi_layer_hooks_v2(
                         text_to_vision_attn=text_to_vision_attn
                     )
 
+                # === DEBUG: 检查soft_mask ===
+                _debug_check_tensor(soft_mask, f"soft_mask (L{layer_idx_ref})", "[Hook V2]")
+
                 if collector_ref is not None:
                     collector_ref.append(soft_mask)
 
                 soft_mask = soft_mask.to(hidden_states_out.dtype)
                 new_hidden = hidden_states_out.clone()
                 new_hidden[:, v_start:v_end+1, :] = vision_hidden * soft_mask.unsqueeze(-1)
+
+                # === DEBUG: 检查输出 ===
+                _debug_check_tensor(new_hidden, f"new_hidden (L{layer_idx_ref})", "[Hook V2]")
 
                 return new_hidden
 

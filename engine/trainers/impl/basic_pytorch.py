@@ -654,17 +654,22 @@ class BasicPytorchTrainer:
                     loss = sum(group_out.values())
                 else:
                     loss = group_out
-                
+
                 if not torch.is_tensor(loss):
                     loss = torch.tensor(float(loss), dtype=torch.float32, device=self.device)
-                
+
                 # 记录损失（先detach避免警告）
                 batch_losses[group_name].append(loss.detach().item())
-                
+
                 # 保留计算图（除了最后一个组）
                 retain_graph = (idx < len(group_names) - 1)
                 loss.backward(retain_graph=retain_graph)
-            
+
+            # 梯度裁剪（在 backward 之后，optimizer.step 之前）
+            if self.grad_clip_max_norm is not None:
+                for group_name, spec in self.param_groups.items():
+                    torch.nn.utils.clip_grad_norm_(spec.params, self.grad_clip_max_norm)
+
             # 优化步骤
             for opt in self.optimizers.values():
                 opt.step()

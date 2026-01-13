@@ -193,6 +193,18 @@ def run_test(test_name: str, config: dict, num_steps: int = 200):
     loss_history = defaultdict(list)
     data_iter = iter(train_loader)
 
+    # 构建 info 字典（与 trainer 调用方式一致）
+    info = {
+        "config": config,
+        "models": {
+            "backbone": backbone,
+            "layer_pruners": layer_pruners,
+            "discriminator": discriminator
+        },
+        "global_batch_index": 0,
+        "total_planned_batches": num_steps
+    }
+
     for step in range(num_steps):
         try:
             batch = next(data_iter)
@@ -201,39 +213,60 @@ def run_test(test_name: str, config: dict, num_steps: int = 200):
             batch = next(data_iter)
 
         try:
-            losses, stats = train_step(
-                batch=batch,
-                backbone=backbone,
-                token_merger=None,
-                layer_pruners=layer_pruners,
-                discriminator=discriminator,
-                pruner_optimizer=pruner_optimizer,
-                disc_optimizer=disc_optimizer,
-                config=config,
-                current_step=step,
-                total_steps=num_steps * 2,
-                device=device
-            )
+            # 更新当前步数
+            info["global_batch_index"] = step
 
-            # 记录 losses
-            for k, v in losses.items():
+            # 调用 train_step（新签名）
+            result = train_step(batch, device, info)
+
+            # 提取 losses 和 stats
+            layer_pruners_losses = result.get("layer_pruners", {})
+            disc_losses = result.get("discriminator", {})
+            stats = result.get("metrics", {})
+
+            # 记录 layer_pruners losses
+            for k, v in layer_pruners_losses.items():
                 val = v.item() if isinstance(v, torch.Tensor) else float(v)
                 loss_history[k].append(val)
+
+            # 记录 discriminator losses
+            for k, v in disc_losses.items():
+                val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                loss_history[f"disc_{k}"].append(val)
 
             # 记录关键 stats
             for k in ["avg_kept_ratio", "disc_accuracy"]:
                 if k in stats:
                     loss_history[k].append(float(stats[k]))
 
+            # 计算总 loss 用于打印
+            layer_pruners_total = sum(
+                v.item() if isinstance(v, torch.Tensor) else float(v)
+                for v in layer_pruners_losses.values()
+            )
+            disc_total = sum(
+                v.item() if isinstance(v, torch.Tensor) else float(v)
+                for v in disc_losses.values()
+            )
+            loss_history["layer_pruners_total"].append(layer_pruners_total)
+            loss_history["disc_total"].append(disc_total)
+
+            # 执行优化步骤
+            pruner_optimizer.zero_grad()
+            pruner_loss = sum(v for v in layer_pruners_losses.values() if isinstance(v, torch.Tensor))
+            if isinstance(pruner_loss, torch.Tensor) and pruner_loss.requires_grad:
+                pruner_loss.backward(retain_graph=True)
+                pruner_optimizer.step()
+
+            disc_optimizer.zero_grad()
+            disc_loss = sum(v for v in disc_losses.values() if isinstance(v, torch.Tensor))
+            if isinstance(disc_loss, torch.Tensor) and disc_loss.requires_grad:
+                disc_loss.backward()
+                disc_optimizer.step()
+
             # 打印进度
             if (step + 1) % 50 == 0:
-                total_loss = losses.get("layer_pruners_total", torch.tensor(0))
-                if isinstance(total_loss, torch.Tensor):
-                    total_loss = total_loss.item()
-                disc_loss = losses.get("disc_total", torch.tensor(0))
-                if isinstance(disc_loss, torch.Tensor):
-                    disc_loss = disc_loss.item()
-                print(f"  Step {step+1:4d}/{num_steps}: pruner_loss={total_loss:.4f}, disc_loss={disc_loss:.4f}")
+                print(f"  Step {step+1:4d}/{num_steps}: pruner_loss={layer_pruners_total:.4f}, disc_loss={disc_total:.4f}")
 
         except Exception as e:
             print(f"  Step {step+1} 出错: {e}")

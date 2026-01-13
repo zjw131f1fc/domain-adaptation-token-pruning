@@ -225,7 +225,48 @@ A:
 - 过高（>90%）：判别器过强，增加 `disc_dropout` 或 `disc_reinit_prob`
 - 过低（<50%）：判别器过弱，降低 `disc_dropout`，检查 `adv_loss_weight`
 
+### Q: 训练时出现NaN怎么办？
+A:
+NaN问题通常由梯度爆炸引起。**重要：训练时应该让NaN暴露出来，而不是掩盖它**。
+
+**NaN传播路径**：
+```
+梯度爆炸 → Pruner参数NaN → soft_mask NaN →
+scaled_vision NaN → hidden_states NaN → 下一层输入NaN → 级联失败
+```
+
+**调试步骤**：
+
+1. **启用梯度裁剪**（必须）：
+   - 在配置文件中设置 `grad_clip_max_norm`（推荐值：1.0-5.0）
+   - 已在 `train_full` 和 `train_partial` 方法中自动启用
+   - 位置：`engine/trainers/impl/basic_pytorch.py:396-399, 668-671`
+
+2. **检查DEBUG输出**：
+   - 代码中已有详细的NaN检测点，会打印NaN首次出现的位置
+   - 查看 `[DEBUG NaN]` 输出，定位NaN源头
+
+3. **常见原因与解决方案**：
+   - **梯度爆炸**：降低学习率，增大 `grad_clip_max_norm`
+   - **初始化问题**：检查pruner的权重初始化（`layer_pruner.py:144-145`）
+   - **温度过低**：Gumbel-Softmax温度过低可能导致数值不稳定，调高 `temperature_min`
+   - **损失权重过大**：检查 `task_loss_weight`、`adv_loss_weight` 是否过大
+
+4. **数值稳定性措施**（已内置）：
+   - Logits裁剪：`torch.clamp(keep_logits, min=-10.0, max=10.0)`
+   - 使用PyTorch原生的 `F.gumbel_softmax` 提高数值稳定性
+   - LayerNorm自带epsilon防止除零
+
+**不要使用NaN恢复机制**：训练时应该让程序失败并暴露问题，而不是悄悄绕过。
+
 ## 更新日志
+
+### 2026-01-13: 修复train_partial缺失梯度裁剪
+- **修复关键bug**：`train_partial` 方法缺失梯度裁剪代码，导致Optuna模式下训练不稳定
+- **位置**：`engine/trainers/impl/basic_pytorch.py:668-671`
+- **影响**：Optuna超参数搜索模式下容易出现梯度爆炸和NaN
+- **修复方式**：补充与 `train_full` 一致的梯度裁剪逻辑
+- **调试哲学**：移除了NaN恢复机制，让训练失败时暴露真正问题，而不是掩盖
 
 ### 最新改进
 - **使用 PyTorch 原生 Gumbel-Softmax**：替换手动实现，提高数值稳定性和训练/推理一致性
