@@ -12,6 +12,7 @@
 from typing import Any, Dict, List, Callable, Optional
 from dataclasses import dataclass
 import time
+import gc
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -392,11 +393,36 @@ class BasicPytorchTrainer:
                     # 如果不是最后一个组，保留计算图
                     retain_graph = (idx < len(group_names) - 1)
                     loss.backward(retain_graph=retain_graph)
-                
+
                 # 梯度裁剪（在 backward 之后，optimizer.step 之前）
                 if self.grad_clip_max_norm is not None:
                     for group_name, spec in self.param_groups.items():
                         torch.nn.utils.clip_grad_norm_(spec.params, self.grad_clip_max_norm)
+
+                # === DEBUG: 检查 adv_loss 梯度是否传导到 layer_pruners ===
+                import os
+                if os.environ.get("DEBUG_ADV_GRAD") == "1" and batch_count <= 3:
+                    print(f"\n[DEBUG backward] === Batch {batch_count} 梯度检查 ===")
+                    for group_name, spec in self.param_groups.items():
+                        params_with_grad = [(name, p) for name, p in zip(
+                            [f"param_{i}" for i in range(len(spec.params))], spec.params
+                        ) if p.grad is not None]
+                        params_without_grad = [f"param_{i}" for i, p in enumerate(spec.params) if p.grad is None]
+
+                        if params_with_grad:
+                            grad_norms = [p.grad.norm().item() for _, p in params_with_grad]
+                            print(f"[DEBUG backward] {group_name}: {len(params_with_grad)} params with grad, "
+                                  f"grad_norm range: [{min(grad_norms):.6f}, {max(grad_norms):.6f}]")
+                        if params_without_grad:
+                            print(f"[DEBUG backward] {group_name}: {len(params_without_grad)} params WITHOUT grad!")
+
+                    # 特别检查 layer_pruners 的梯度
+                    if "layer_pruners" in self.param_groups:
+                        pruner_params = self.param_groups["layer_pruners"].params
+                        zero_grad_count = sum(1 for p in pruner_params if p.grad is not None and p.grad.abs().max() < 1e-10)
+                        if zero_grad_count > 0:
+                            print(f"[DEBUG backward] 警告: layer_pruners 有 {zero_grad_count} 个参数梯度接近零！")
+                            print(f"[DEBUG backward] 这可能意味着 adv_loss 的梯度没有正确传导到 pruner。")
 
                 # === 收集要打印的所有信息（梯度 + Loss + Metrics） ===
                 if self.print_loss_every_batches and batch_count % self.print_loss_every_batches == 0:
@@ -457,6 +483,11 @@ class BasicPytorchTrainer:
                 # 最后统一执行优化步骤
                 for opt in self.optimizers.values():
                     opt.step()
+
+                # 清理计算图，释放显存
+                del outputs
+                gc.collect()
+                torch.cuda.empty_cache()
 
                 batch_count += 1
 
@@ -673,7 +704,12 @@ class BasicPytorchTrainer:
             # 优化步骤
             for opt in self.optimizers.values():
                 opt.step()
-            
+
+            # 清理计算图，释放显存
+            del outputs
+            gc.collect()
+            torch.cuda.empty_cache()
+
             # 更新计数器
             self._current_epoch_batch_idx += 1
             self._global_batch_count += 1

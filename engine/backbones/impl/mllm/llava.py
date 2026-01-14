@@ -437,7 +437,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
 
             if len(image_token_indices) == 0:
                 raise ValueError("未找到图像占位 token (<image>)")
-
+            # 开头和结尾的5和580都包括
             img_token_start_idx = int(image_token_indices[0])
             img_token_end_idx = int(image_token_indices[-1])
             num_vision_tokens = image_token_embeds.shape[1]

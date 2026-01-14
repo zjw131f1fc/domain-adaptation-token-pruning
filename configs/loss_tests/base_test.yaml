@@ -17,7 +17,7 @@ trainer_settings:
   name: "basic-pytorch"
   dl_settings:
     epochs: 1
-    batch_size: 2
+    batch_size: 6
     optimizers:
       generator:
         type: "adam"

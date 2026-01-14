@@ -55,11 +55,10 @@ class Discriminator(nn.Module):
         self.fusion_linear2 = maybe_spectral_norm(nn.Linear(d_d, d_d))
         self.fusion_linear3 = maybe_spectral_norm(nn.Linear(d_d, 1))
         
-        # Optional input normalization - 使用 BatchNorm1d 替代 LayerNorm
+        # Optional input normalization - 每层独立的 LayerNorm（与 pruner 保持一致）
         if use_layer_norm:
-            # BatchNorm1d 对特征维度进行归一化，更适合处理大数值的 LLM hidden states
-            self.input_norm = nn.BatchNorm1d(d_model, momentum=0.1, eps=1e-5)
-        
+            self.input_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
+
         # Register linear layers as ModuleList
         self.first_linears = nn.ModuleList(self.first_linears)
         self.second_linears = nn.ModuleList(self.second_linears)
@@ -123,19 +122,20 @@ class Discriminator(nn.Module):
             if len(h.shape) == 3:
                 h = h.view(-1, self.d_model)  # (batch * seq_len, d_model)
             h = h.to(device=target_device, dtype=torch.float32)
-            # 【简化方案】直接用 tanh 压缩到 [-1, 1]，避免 BatchNorm 在小 batch 下不稳定
-            # 先除以一个大的常数（如 100）缩小数值范围，再用 tanh
-            h = torch.tanh(h / 100.0)  # 将 [-300, 300] 映射到约 [-1, 1]
-            
+
+            # 使用 LayerNorm 归一化（与 pruner 保持一致）
+            if self.use_layer_norm:
+                h = self.input_norms[i](h)
+
             # First linear layer with GELU
             h = self.first_linears[i](h)       # (N, d_d)
             h = F.gelu(h)                      # (N, d_d)
             h = self.dropout(h)                # (N, d_d)
-            
+
             # Second linear layer with residual connection
             h_res = self.second_linears[i](h)  # (N, d_d)
             h = h + h_res                      # residual connection
-            
+
             layer_outputs.append(h)
         
         # Concatenate all layer outputs
@@ -189,20 +189,21 @@ class Discriminator(nn.Module):
         for i, h in enumerate(hidden_states):
             if len(h.shape) == 3:
                 h = h.view(-1, self.d_model)
-            
-            # 【简化方案】直接用 tanh 压缩到 [-1, 1]
-            h = torch.tanh(h / 100.0)
-            
+
+            # 使用 LayerNorm 归一化（与 pruner 保持一致）
+            if self.use_layer_norm:
+                h = self.input_norms[i](h)
+
             # First linear layer with GELU
             h = self.first_linears[i](h)
             h = F.gelu(h)
             h = self.dropout(h)
-            
+
             # Second linear layer with residual connection
             h_res = self.second_linears[i](h)
             h = h + h_res
             h = F.gelu(h)
-            
+
             layer_outputs.append(h)
         
         # Concatenate all layer outputs

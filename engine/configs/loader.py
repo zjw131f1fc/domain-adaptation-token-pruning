@@ -4,7 +4,7 @@ import sys
 # 自动检测工作目录：从当前文件位置向上找到项目根目录
 CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_DIR = os.path.abspath(os.path.join(CURRENT_FILE_DIR, '../..'))
-HF_HOME = "/data/users/zjw/root/autodl-tmp/huggingface_cache"
+HF_HOME = "/root/autodl-tmp/huggingface_cache"
 HF_ENDPOINT = "https://hf-mirror.com"
 os.environ["HF_HOME"] = HF_HOME
 os.environ["HF_ENDPOINT"] = HF_ENDPOINT

@@ -8,33 +8,47 @@ import torch.nn.functional as F
 from typing import Dict, Any, List, Tuple, Optional, Callable
 
 
-# === DEBUG 工具函数 ===
-def _debug_check_tensor(tensor, name, context=""):
-    """检查tensor是否包含NaN或Inf - 暂时禁用输出"""
-    # 暂时禁用NaN检测输出，避免刷屏
-    return False
-    # if tensor is None:
-    #     return False
-    #
-    # has_nan = torch.isnan(tensor).any().item()
-    # has_inf = torch.isinf(tensor).any().item()
-    #
-    # if has_nan:
-    #     nan_count = torch.isnan(tensor).sum().item()
-    #     valid_vals = tensor[~torch.isnan(tensor)]
-    #     if valid_vals.numel() > 0:
-    #         print(f"[DEBUG NaN] {context} {name}: nan_count={nan_count}, "
-    #               f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
-    #     else:
-    #         print(f"[DEBUG NaN] {context} {name}: ALL VALUES ARE NaN!")
-    #     return True
-    #
-    # if has_inf:
-    #     inf_count = torch.isinf(tensor).sum().item()
-    #     print(f"[DEBUG Inf] {context} {name}: inf_count={inf_count}")
-    #     return True
-    #
-    # return False
+class ScaleVisionWithClippedGrad(torch.autograd.Function):
+    """自定义autograd函数：vision_hidden * soft_mask，但对soft_mask的梯度进行裁剪
+
+    问题：vision_hidden有大值（~200），导致soft_mask的梯度被放大，引起梯度爆炸
+    解决：在backward时对soft_mask的梯度进行裁剪
+    """
+
+    @staticmethod
+    def forward(ctx, vision_hidden, soft_mask, grad_clip_value=1.0):
+        """
+        vision_hidden: (batch, n_vision, d_model)
+        soft_mask: (batch, n_vision)
+        """
+        # 关键：detach vision_hidden 避免保存整个 LLM 计算图
+        # 因为 vision_hidden 是 hidden_states 的 view，不 detach 会保存整个 base tensor
+        # 我们不需要 vision_hidden 的梯度（LLM 是 frozen 的）
+        vision_hidden_detached = vision_hidden.detach()
+        ctx.save_for_backward(vision_hidden_detached, soft_mask)
+        ctx.grad_clip_value = grad_clip_value
+        # 前向计算仍然使用原始 vision_hidden（保持计算图连接到 scaled_vision）
+        return vision_hidden * soft_mask.unsqueeze(-1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        grad_output: (batch, n_vision, d_model) - d_loss/d_scaled_vision
+        """
+        vision_hidden_detached, soft_mask = ctx.saved_tensors
+        grad_clip_value = ctx.grad_clip_value
+
+        # 对vision_hidden的梯度：不需要（LLM是frozen的）
+        grad_vision = None
+
+        # 对soft_mask的梯度
+        # grad_soft_mask = sum(grad_output * vision_hidden, dim=-1)
+        grad_soft_mask = (grad_output * vision_hidden_detached).sum(dim=-1)
+
+        # 关键：裁剪梯度，防止爆炸
+        grad_soft_mask = torch.clamp(grad_soft_mask, -grad_clip_value, grad_clip_value)
+
+        return grad_vision, grad_soft_mask, None  # None for grad_clip_value
 
 
 def extract_target_hidden_states_batch(
@@ -51,13 +65,19 @@ def extract_target_hidden_states_batch(
         answer_positions_list: List of (start, end) for each sample
         target_layer_indices: 目标层索引列表
         batch_size: batch大小
-        attention_mask: (batch, seq_len) attention mask
+        attention_mask: (batch, seq_len) attention mask，用于计算每个样本的实际长度
 
     返回:
         List of tensors, each (batch, max_answer_len, hidden_dim)
     """
     selected_hidden_states = []
     seq_len = all_hidden_states[0].shape[1]
+
+    # 计算每个样本的实际长度（用于转换负索引）
+    if attention_mask is not None:
+        actual_lengths = attention_mask.sum(dim=1).tolist()  # List[int]
+    else:
+        actual_lengths = [seq_len] * batch_size  # 没有mask时假设全部有效
 
     # 计算每个样本的answer位置（转换负索引）
     answer_ranges = []
@@ -66,11 +86,12 @@ def extract_target_hidden_states_batch(
         if start is None:
             answer_ranges.append((0, 0))
             continue
-        # 转换负索引
+        # 转换负索引：使用每个样本的实际长度
+        sample_len = int(actual_lengths[i])
         if start < 0:
-            start = seq_len + start
+            start = sample_len + start
         if end < 0:
-            end = seq_len + end
+            end = sample_len + end
         answer_len = end - start + 1
         max_answer_len = max(max_answer_len, answer_len)
         answer_ranges.append((start, end))
@@ -79,16 +100,25 @@ def extract_target_hidden_states_batch(
         hidden = all_hidden_states[layer_idx]  # (batch, seq_len, hidden_dim)
         hidden_dim = hidden.shape[-1]
 
-        # 创建输出tensor
-        batch_hidden = torch.zeros(batch_size, max_answer_len, hidden_dim,
-                                   device=hidden.device, dtype=hidden.dtype)
-
+        # 使用 torch.cat 保持梯度流（不用 torch.zeros + in-place 赋值）
+        slices = []
         for i, (start, end) in enumerate(answer_ranges):
             if start == end == 0:
-                continue
-            answer_len = end - start + 1
-            batch_hidden[i, :answer_len, :] = hidden[i, start:end+1, :]
+                # 无效样本：用零填充（不需要梯度）
+                slices.append(torch.zeros(1, max_answer_len, hidden_dim,
+                                         device=hidden.device, dtype=hidden.dtype))
+            else:
+                answer_len = end - start + 1
+                # 提取切片（保持梯度）
+                slice_tensor = hidden[i:i+1, start:end+1, :]
+                # 如果需要padding
+                if answer_len < max_answer_len:
+                    padding = torch.zeros(1, max_answer_len - answer_len, hidden_dim,
+                                         device=hidden.device, dtype=hidden.dtype)
+                    slice_tensor = torch.cat([slice_tensor, padding], dim=1)
+                slices.append(slice_tensor)
 
+        batch_hidden = torch.cat(slices, dim=0)
         selected_hidden_states.append(batch_hidden)
 
     return selected_hidden_states
@@ -108,11 +138,12 @@ def compute_task_loss_batch(
         answer_positions_list: List of (start, end) for each sample
         answers: List of answer strings
         processor: tokenizer所在的processor
-        attention_mask: (batch, seq_len) attention mask
+        attention_mask: (batch, seq_len) attention mask，用于计算每个样本的实际长度
 
     返回:
         task_loss: torch.Tensor - 平均交叉熵损失
     """
+    # print(processor.tokenizer.decode(logits.argmax(dim=-1)[0]))
     batch_size = logits.shape[0]
     seq_len = logits.shape[1]
     vocab_size = logits.shape[-1]
@@ -120,45 +151,53 @@ def compute_task_loss_batch(
     total_loss = torch.tensor(0.0, device=logits.device)
     valid_samples = 0
 
+    # 计算每个样本的实际长度（用于转换负索引）
+    if attention_mask is not None:
+        actual_lengths = attention_mask.sum(dim=1).tolist()  # List[int]
+    else:
+        actual_lengths = [seq_len] * batch_size  # 没有mask时假设全部有效
+
     # DEBUG: 打印整体信息
-    print(f"[DEBUG task_loss] batch_size={batch_size}, seq_len={seq_len}, vocab_size={vocab_size}")
-    print(f"[DEBUG task_loss] answer_positions_list={answer_positions_list}")
-    print(f"[DEBUG task_loss] answers={answers}")
+    #print(f"[DEBUG task_loss] batch_size={batch_size}, seq_len={seq_len}, vocab_size={vocab_size}")
+    #print(f"[DEBUG task_loss] answer_positions_list={answer_positions_list}")
+    #print(f"[DEBUG task_loss] answers={answers}")
 
     for i in range(batch_size):
-        answer = answers[i]
+        answer = answers[i].capitalize()  # 对齐LLM输出格式（首字母大写）
         answer_start, answer_end = answer_positions_list[i]
 
-        print(f"[DEBUG task_loss] Sample {i}: answer='{answer}', pos=({answer_start}, {answer_end})")
+        #print(f"[DEBUG task_loss] Sample {i}: answer='{answer}', pos=({answer_start}, {answer_end})")
 
         if answer_start is None:
-            print(f"[DEBUG task_loss] Sample {i}: SKIP - answer_start is None")
+            #print(f"[DEBUG task_loss] Sample {i}: SKIP - answer_start is None")
             continue
 
-        # 转换负索引
+        # 转换负索引：使用每个样本的实际长度
         orig_start, orig_end = answer_start, answer_end
+        sample_len = int(actual_lengths[i])
         if answer_start < 0:
-            answer_start = seq_len + answer_start
+            answer_start = sample_len + answer_start
         if answer_end < 0:
-            answer_end = seq_len + answer_end
+            answer_end = sample_len + answer_end
 
         if orig_start != answer_start or orig_end != answer_end:
-            print(f"[DEBUG task_loss] Sample {i}: converted pos ({orig_start}, {orig_end}) -> ({answer_start}, {answer_end})")
+            pass
+            #print(f"[DEBUG task_loss] Sample {i}: converted pos ({orig_start}, {orig_end}) -> ({answer_start}, {answer_end}) [sample_len={sample_len}]")
 
         # 验证位置有效性
         if answer_start < 0 or answer_end >= seq_len or answer_start > answer_end:
-            print(f"[DEBUG task_loss] Sample {i}: SKIP - invalid pos: start={answer_start}, end={answer_end}, seq_len={seq_len}")
+            #print(f"[DEBUG task_loss] Sample {i}: SKIP - invalid pos: start={answer_start}, end={answer_end}, seq_len={seq_len}")
             continue
 
         answer_token_ids_list = processor.tokenizer.encode(answer, add_special_tokens=False)
         if len(answer_token_ids_list) == 0:
-            print(f"[DEBUG task_loss] Sample {i}: SKIP - empty tokenized answer")
+            #print(f"[DEBUG task_loss] Sample {i}: SKIP - empty tokenized answer")
             continue
 
         max_id = max(answer_token_ids_list)
         min_id = min(answer_token_ids_list)
         if max_id >= vocab_size or min_id < 0:
-            print(f"[DEBUG task_loss] Sample {i}: SKIP - token id out of range: min={min_id}, max={max_id}, vocab_size={vocab_size}")
+            #print(f"[DEBUG task_loss] Sample {i}: SKIP - token id out of range: min={min_id}, max={max_id}, vocab_size={vocab_size}")
             continue
 
         answer_token_ids = torch.tensor(answer_token_ids_list, device=logits.device, dtype=torch.long)
@@ -169,11 +208,11 @@ def compute_task_loss_batch(
         expected_len = len(answer_token_ids)
         actual_len = logits_for_answer.shape[1]
 
-        print(f"[DEBUG task_loss] Sample {i}: token_ids={answer_token_ids_list}, expected_len={expected_len}, actual_len={actual_len}")
-        print(f"[DEBUG task_loss] Sample {i}: logits slice [{answer_start-1}:{answer_end}], shape={logits_for_answer.shape}")
+        #print(f"[DEBUG task_loss] Sample {i}: token_ids={answer_token_ids_list}, expected_len={expected_len}, actual_len={actual_len}")
+        #print(f"[DEBUG task_loss] Sample {i}: logits slice [{answer_start-1}:{answer_end}], shape={logits_for_answer.shape}")
 
         if actual_len != expected_len:
-            print(f"[DEBUG task_loss] Sample {i}: SKIP - length mismatch: expected={expected_len}, actual={actual_len}")
+            #print(f"[DEBUG task_loss] Sample {i}: SKIP - length mismatch: expected={expected_len}, actual={actual_len}")
             continue
 
         loss = F.cross_entropy(
@@ -181,16 +220,19 @@ def compute_task_loss_batch(
             answer_token_ids,
             reduction='mean'
         )
-        print(f"[DEBUG task_loss] Sample {i}: loss={loss.item():.4f}")
+
+        # DEBUG: 打印详细位置信息
+        print(f"[DEBUG] sample={i}, ans_pos=({answer_start}, {answer_end}), logits_slice=[{answer_start-1}:{answer_end}], seq_len={seq_len}, sample_len={sample_len}")
+        print(f"[DEBUG] GT='{processor.tokenizer.decode(answer_token_ids)}', Pred='{processor.tokenizer.decode(logits[i,:].argmax(dim=-1)[answer_start-1:answer_end])}', loss={loss.item():.4f}")
         total_loss = total_loss + loss
         valid_samples += 1
 
-    print(f"[DEBUG task_loss] valid_samples={valid_samples}, total_loss={total_loss.item():.4f}")
+    #print(f"[DEBUG task_loss] valid_samples={valid_samples}, total_loss={total_loss.item():.4f}")
 
     if valid_samples > 0:
         return total_loss / valid_samples
     else:
-        print(f"[DEBUG task_loss] WARNING: No valid samples! Returning zero loss.")
+        #print(f"[DEBUG task_loss] WARNING: No valid samples! Returning zero loss.")
         return total_loss
 
 
@@ -227,7 +269,8 @@ def create_layer_pruning_modifier(
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
     mask_collector: Optional[List] = None,
-    use_attn_residual: bool = False
+    use_attn_residual: bool = False,
+    question_mask: Optional[torch.Tensor] = None
 ) -> Callable:
     """创建层剪枝的modifier函数（用于hook）
 
@@ -237,6 +280,7 @@ def create_layer_pruning_modifier(
         question_embeddings: (batch, n_text, d_text) - question embeddings
         mask_collector: 可选的列表，用于收集soft_mask（用于计算sparsity loss）
         use_attn_residual: 是否启用attention residual
+        question_mask: (batch, n_text) - True表示有效token，False表示padding
 
     返回:
         modifier函数，签名为 (hidden_states, attention_mask) -> (new_hidden, new_mask)
@@ -250,10 +294,6 @@ def create_layer_pruning_modifier(
         # === Step 1: 提取vision token hidden states ===
         v_start, v_end = vision_positions
         vision_hidden = hidden_states[:, v_start:v_end+1, :]  # (batch, n_vision, d_model)
-
-        # === DEBUG: 检查输入hidden_states ===
-        _debug_check_tensor(hidden_states, "hidden_states (hook input)", "[Hook Modifier]")
-        _debug_check_tensor(vision_hidden, "vision_hidden (extracted)", "[Hook Modifier]")
 
         # === Step 2: 计算text→vision attention（如果启用） ===
         text_to_vision_attn = None
@@ -273,11 +313,15 @@ def create_layer_pruning_modifier(
                 attention_storage['attn_weights'] = None
 
         # === Step 3: 调用pruner生成soft_mask ===
-        with torch.enable_grad():
-            soft_mask = pruner(vision_hidden, question_embeddings, text_to_vision_attn=text_to_vision_attn)
+        # 将question_mask转换为key_padding_mask格式（True表示要mask掉的位置）
+        key_padding_mask = None
+        if question_mask is not None:
+            key_padding_mask = ~question_mask  # 反转：False变True（padding位置要mask）
 
-        # === DEBUG: 检查soft_mask ===
-        _debug_check_tensor(soft_mask, "soft_mask (from pruner)", "[Hook Modifier]")
+        with torch.enable_grad():
+            soft_mask = pruner(vision_hidden, question_embeddings,
+                             text_to_vision_attn=text_to_vision_attn,
+                             key_padding_mask=key_padding_mask)
 
         # === Step 4: 收集mask ===
         if mask_collector is not None:
@@ -285,17 +329,30 @@ def create_layer_pruning_modifier(
 
         # === Step 5: 应用mask ===
         soft_mask = soft_mask.to(vision_hidden.dtype)
-        scaled_vision = vision_hidden * soft_mask.unsqueeze(-1)
 
-        # === DEBUG: 检查scaled_vision ===
-        _debug_check_tensor(scaled_vision, "scaled_vision (after mask)", "[Hook Modifier]")
+        # 使用自定义autograd函数，在backward时裁剪soft_mask的梯度
+        # 这样可以避免vision_hidden的大值（~200）导致梯度爆炸
+        scaled_vision = ScaleVisionWithClippedGrad.apply(vision_hidden, soft_mask, 1.0)
 
-        # === Step 6: 替换到完整hidden_states中 ===
-        new_hidden = hidden_states.clone()
-        new_hidden[:, v_start:v_end+1, :] = scaled_vision
+        # === Step 6: 用 torch.cat 构建 new_hidden（保持梯度流）===
+        # 不能用 clone + in-place 赋值，那样会断梯度
+        new_hidden = torch.cat([
+            hidden_states[:, :v_start, :],
+            scaled_vision,
+            hidden_states[:, v_end+1:, :]
+        ], dim=1)
 
-        # === DEBUG: 检查new_hidden ===
-        _debug_check_tensor(new_hidden, "new_hidden (output)", "[Hook Modifier]")
+        # === DEBUG: 检查梯度流 ===
+        # 注意：这个调试输出可以通过环境变量 DEBUG_ADV_GRAD=1 启用
+        import os
+        if os.environ.get("DEBUG_ADV_GRAD") == "1":
+            print(f"\n[DEBUG hook] === Layer Pruning Hook 梯度检查 ===")
+            print(f"[DEBUG hook] soft_mask.requires_grad: {soft_mask.requires_grad}")
+            print(f"[DEBUG hook] soft_mask.grad_fn: {soft_mask.grad_fn}")
+            print(f"[DEBUG hook] scaled_vision.requires_grad: {scaled_vision.requires_grad}")
+            print(f"[DEBUG hook] scaled_vision.grad_fn: {scaled_vision.grad_fn}")
+            print(f"[DEBUG hook] new_hidden.requires_grad: {new_hidden.requires_grad}")
+            print(f"[DEBUG hook] new_hidden.grad_fn: {new_hidden.grad_fn}")
 
         return new_hidden, attention_mask
 
@@ -311,7 +368,8 @@ def register_multi_layer_hooks(
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
     mask_collector: Optional[List] = None,
-    use_attn_residual: bool = False
+    use_attn_residual: bool = False,
+    question_mask: Optional[torch.Tensor] = None
 ) -> List[Any]:
     """在多个LLM层注册剪枝hooks
 
@@ -322,6 +380,7 @@ def register_multi_layer_hooks(
         question_embeddings: (batch, n_text, d_text) - question embeddings
         mask_collector: 可选的列表，用于收集soft_mask
         use_attn_residual: 是否启用attention residual
+        question_mask: (batch, n_text) - True表示有效token，False表示padding
 
     返回:
         handles: hook handle列表
@@ -337,7 +396,8 @@ def register_multi_layer_hooks(
     for layer_idx in layer_pruners.get_all_layers():
         pruner = layer_pruners.get_pruner(layer_idx)
         modifier, _ = create_layer_pruning_modifier(
-            pruner, vision_positions, question_embeddings, mask_collector, use_attn_residual=False
+            pruner, vision_positions, question_embeddings, mask_collector,
+            use_attn_residual=False, question_mask=question_mask
         )
         target_layer = backbone.model.model.language_model.layers[layer_idx]
 
@@ -364,7 +424,8 @@ def register_multi_layer_hooks_batch(
     vision_positions: Tuple[int, int],
     question_embeddings: torch.Tensor,
     mask_collector: Optional[List] = None,
-    use_attn_residual: bool = False
+    use_attn_residual: bool = False,
+    question_mask: Optional[torch.Tensor] = None
 ) -> List[Any]:
     """批量版本的多层剪枝hooks注册
 
@@ -372,7 +433,7 @@ def register_multi_layer_hooks_batch(
     """
     return register_multi_layer_hooks(
         backbone, layer_pruners, vision_positions, question_embeddings,
-        mask_collector, use_attn_residual
+        mask_collector, use_attn_residual, question_mask
     )
 
 
@@ -437,10 +498,6 @@ def register_multi_layer_hooks_v2(
                 hidden_states_out = output
                 vision_hidden = hidden_states_out[:, v_start:v_end+1, :]
 
-                # === DEBUG: 检查输入 ===
-                _debug_check_tensor(hidden_states_out, f"hidden_states_out (L{layer_idx_ref})", "[Hook V2]")
-                _debug_check_tensor(vision_hidden, f"vision_hidden (L{layer_idx_ref})", "[Hook V2]")
-
                 text_to_vision_attn = None
                 if use_attn_ref:
                     attn_weights = None
@@ -483,18 +540,18 @@ def register_multi_layer_hooks_v2(
                         text_to_vision_attn=text_to_vision_attn
                     )
 
-                # === DEBUG: 检查soft_mask ===
-                _debug_check_tensor(soft_mask, f"soft_mask (L{layer_idx_ref})", "[Hook V2]")
-
                 if collector_ref is not None:
                     collector_ref.append(soft_mask)
 
                 soft_mask = soft_mask.to(hidden_states_out.dtype)
-                new_hidden = hidden_states_out.clone()
-                new_hidden[:, v_start:v_end+1, :] = vision_hidden * soft_mask.unsqueeze(-1)
-
-                # === DEBUG: 检查输出 ===
-                _debug_check_tensor(new_hidden, f"new_hidden (L{layer_idx_ref})", "[Hook V2]")
+                # 使用自定义autograd函数，在backward时裁剪soft_mask的梯度
+                scaled_vision = ScaleVisionWithClippedGrad.apply(vision_hidden, soft_mask, 1.0)
+                # 用 torch.cat 构建 new_hidden（保持梯度流）
+                new_hidden = torch.cat([
+                    hidden_states_out[:, :v_start, :],
+                    scaled_vision,
+                    hidden_states_out[:, v_end+1:, :]
+                ], dim=1)
 
                 return new_hidden
 

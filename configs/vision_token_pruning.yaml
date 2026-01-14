@@ -1,5 +1,7 @@
 # Vision Token Pruning with GAN 配置文件
 
+debug_adv_grad: false  # 调试 adv_loss 梯度传导
+
 global_settings:
   seed: 42
   device: "cuda"
@@ -15,8 +17,8 @@ trainer_settings:  # 训练框架设置
   type: "deep-learning"
   name: "basic-pytorch"
   dl_settings:
-    epochs: 3
-    batch_size: 4  # 单卡显存有限，减小batch size
+    epochs: 2
+    batch_size: 2 # 12  # 单卡显存有限，减小batch size
     optimizers:
       generator:
         type: "adam"
@@ -30,10 +32,10 @@ trainer_settings:  # 训练框架设置
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
         lr: 1.7e-05
-    print_loss_every_batches: 2
-    eval_every_batches: 2000
-    eval_max_samples: 2000
-    save_every_batches: 2000
+    print_loss_every_batches: 100
+    eval_every_batches: 1000
+    eval_max_samples: 500
+    save_every_batches: 3000
     save_every_epochs: 1
     optuna_eval_interval_batches: 40
     grad_clip_max_norm: 1.0
@@ -164,7 +166,7 @@ search_settings:
 dataset_settings:  # 数据集配置
   name: "vqa-vqav2"  # 数据集名称
   split:
-    train: 30000  # VQA v2 全量训练集
+    train: 50000  # VQA v2 大规模训练
     test: 5000
   category_priority:
     enable: false  # 大规模训练禁用类别均衡，加快数据加载
@@ -244,20 +246,20 @@ method_settings:
   # ==================== Discriminator配置 ====================
   disc_num_layers: 3  # 使用的LLM隐层数量
   disc_d_d: 512  # 隐层维度
-  disc_dropout: 0.15  # Dropout比率
-  disc_target_layers: [-1, -3, -5]  # 目标LLM层索引
-  disc_reinit_prob: 0.15  # 每个batch重初始化Discriminator的概率
+  disc_dropout: 0.3  # Dropout比率
+  disc_target_layers: [8, 18, 28]  # 剪枝层后3层 (pruning_layers=[5,15,25] + 3)
+  disc_reinit_prob: 0.3  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 80.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 40.0 # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 100.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 80.0 # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
-  adv_loss_weight_start: 10.0  # 初始权重（低对抗，避免过早压制pruner）
+  adv_loss_weight_start: 30.0  # 初始权重（低对抗，避免过早压制pruner）
   adv_loss_weight: 80  # 目标权重（warmup后强化对抗）
 
   # Entropy Loss权重

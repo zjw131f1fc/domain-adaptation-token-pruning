@@ -161,7 +161,8 @@ class VisionPrunerHead(nn.Module):
         vision_hidden: torch.Tensor,
         question_embeddings: torch.Tensor,
         use_gumbel: bool = True,
-        text_to_vision_attn: Optional[torch.Tensor] = None
+        text_to_vision_attn: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """前向传播
 
@@ -170,34 +171,11 @@ class VisionPrunerHead(nn.Module):
             question_embeddings: (batch, n_text, d_text) - question embeddings
             use_gumbel: bool - 是否使用Gumbel-Softmax（训练时True）
             text_to_vision_attn: (batch, n_vision) - 可选的text→vision attention平均值
+            key_padding_mask: (batch, n_text) - True表示要mask掉的位置（padding）
 
         返回:
             soft_mask: (batch, n_vision) - 每个token的保留概率，范围[0, 1]
         """
-        # === DEBUG: 检查输入 ===
-        def check_nan(tensor, name):
-            if tensor is not None and torch.isnan(tensor).any():
-                print(f"[DEBUG NaN] {name} contains NaN! shape={tensor.shape}, "
-                      f"nan_count={torch.isnan(tensor).sum().item()}, "
-                      f"min={tensor[~torch.isnan(tensor)].min().item() if (~torch.isnan(tensor)).any() else 'all_nan'}, "
-                      f"max={tensor[~torch.isnan(tensor)].max().item() if (~torch.isnan(tensor)).any() else 'all_nan'}")
-                return True
-            return False
-
-        def check_inf(tensor, name):
-            if tensor is not None and torch.isinf(tensor).any():
-                print(f"[DEBUG Inf] {name} contains Inf! shape={tensor.shape}, "
-                      f"inf_count={torch.isinf(tensor).sum().item()}")
-                return True
-            return False
-
-        has_nan_input = check_nan(vision_hidden, "vision_hidden") or check_nan(question_embeddings, "question_embeddings")
-        has_inf_input = check_inf(vision_hidden, "vision_hidden") or check_inf(question_embeddings, "question_embeddings")
-
-        if has_nan_input or has_inf_input:
-            print(f"[DEBUG] Input issue detected! vision_hidden.shape={vision_hidden.shape}, "
-                  f"question_embeddings.shape={question_embeddings.shape}")
-
         llm_device = vision_hidden.device
         if self.vision_proj.weight.device != llm_device:
             self.to(llm_device)
@@ -208,9 +186,6 @@ class VisionPrunerHead(nn.Module):
         vision_normed = self.vision_input_norm(vision_hidden)  # (batch, n_vision, d_vision)
         text_normed = self.text_input_norm(question_embeddings)  # (batch, n_text, d_text)
 
-        check_nan(vision_normed, "vision_normed (after LayerNorm)")
-        check_nan(text_normed, "text_normed (after LayerNorm)")
-
         # === Step 2: 投影到内部维度 + 归一化 ===
         V = self.vision_proj(vision_normed)  # (batch, n_vision, d_internal)
         V = self.vision_proj_norm(V)
@@ -218,33 +193,24 @@ class VisionPrunerHead(nn.Module):
         Q = self.text_proj(text_normed)  # (batch, n_text, d_internal)
         Q = self.text_proj_norm(Q)
 
-        check_nan(V, "V (after proj+norm)")
-        check_nan(Q, "Q (after proj+norm)")
-
         # === Step 3: Cross-Attention - vision关注question ===
         # query=V (vision tokens), key=Q, value=Q (question)
         attended_V, attn_weights = self.cross_attn(
             query=V,
             key=Q,
             value=Q,
+            key_padding_mask=key_padding_mask,
             need_weights=False
         )  # (batch, n_vision, d_internal)
 
-        check_nan(attended_V, "attended_V (after cross_attn)")
-
         # === Step 4: Post-Attention归一化 + 残差连接 ===
         attended_V = self.post_attn_norm(V + attended_V)  # 残差 + 归一化
-
-        check_nan(attended_V, "attended_V (after post_attn_norm)")
 
         # === Step 5: 预测keep/drop logits ===
         mask_hidden = self.mask_fc1(attended_V)
         mask_hidden = self.mask_act(mask_hidden)
         mask_hidden = self.mask_dropout(mask_hidden)
         keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
-
-        check_nan(keep_logits, "keep_logits (before clamp)")
-        check_inf(keep_logits, "keep_logits (before clamp)")
 
         # === Step 5.5: Attention Residual（可选） ===
         if self.use_attn_residual and text_to_vision_attn is not None:
@@ -253,32 +219,29 @@ class VisionPrunerHead(nn.Module):
             # 残差连接：keep_logits += weight * attention
             keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
 
-        # === Step 6: Gumbel-Softmax（可微分的二分类） ===
-        # Clamp logits to prevent numerical overflow in softmax
+        # === Step 6: Gumbel-Sigmoid（Binary Concrete）===
+        # Clamp logits to prevent numerical overflow
         keep_logits = torch.clamp(keep_logits, min=-10.0, max=10.0)
 
-        check_nan(keep_logits, "keep_logits (after clamp)")
-
-        # 将二分类问题转换为[drop_logit, keep_logit]的2-way softmax
-        stacked_logits = torch.stack([
-            torch.zeros_like(keep_logits),  # drop的logit固定为0
-            keep_logits                      # keep的logit为预测值
-        ], dim=-1)  # (batch, n_vision, 2)
-
-        check_nan(stacked_logits, "stacked_logits")
-
         if use_gumbel and self.training:
-            # 训练模式：使用 PyTorch 的 Gumbel-Softmax 配合 hard=True
-            # hard=True: 前向传播使用 one-hot，反向传播使用软梯度（STE 变体）
-            y_soft = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
-            check_nan(y_soft, f"y_soft (after gumbel_softmax, tau={self.temperature})")
-            soft_mask = y_soft[..., 1]  # 提取 P(keep)
-        else:
-            # 推理模式：确定性 argmax
-            probs = F.softmax(stacked_logits / self.temperature, dim=-1)
-            soft_mask = (probs[..., 1] > 0.5).float()
+            # 使用clamp避免log(0)
+            u = torch.rand_like(keep_logits).clamp(1e-8, 1 - 1e-8)
+            logistic_noise = torch.log(u) - torch.log(1 - u)
+            # Clamp noise to prevent extreme values
+            logistic_noise = torch.clamp(logistic_noise, min=-5.0, max=5.0)
 
-        check_nan(soft_mask, "soft_mask (final output)")
+            # Binary Concrete: sigmoid((logits + noise) / temperature)
+            noisy_logits = (keep_logits + logistic_noise) / self.temperature
+            # Clamp noisy_logits to prevent sigmoid saturation
+            noisy_logits = torch.clamp(noisy_logits, min=-10.0, max=10.0)
+            y_soft = torch.sigmoid(noisy_logits)
+
+            # Straight-through estimator: 前向用hard，反向用soft
+            y_hard = (y_soft > 0.5).float()
+            soft_mask = y_hard - y_soft.detach() + y_soft
+        else:
+            # 推理模式：确定性 sigmoid + threshold
+            soft_mask = (torch.sigmoid(keep_logits / self.temperature) > 0.5).float()
 
         return soft_mask
 

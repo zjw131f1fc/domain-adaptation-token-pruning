@@ -18,37 +18,6 @@ from .utils import (
 )
 
 
-# === DEBUG 工具函数 ===
-def debug_check_tensor(tensor, name, step=None):
-    """检查tensor是否包含NaN或Inf - 暂时禁用输出"""
-    # 暂时禁用NaN检测输出，避免刷屏
-    return False
-    # if tensor is None:
-    #     return False
-    #
-    # has_nan = torch.isnan(tensor).any().item()
-    # has_inf = torch.isinf(tensor).any().item()
-    #
-    # step_str = f"[Step {step}] " if step is not None else ""
-    #
-    # if has_nan:
-    #     nan_count = torch.isnan(tensor).sum().item()
-    #     valid_vals = tensor[~torch.isnan(tensor)]
-    #     if valid_vals.numel() > 0:
-    #         print(f"{step_str}[DEBUG NaN] {name}: nan_count={nan_count}, "
-    #               f"valid_min={valid_vals.min().item():.4f}, valid_max={valid_vals.max().item():.4f}")
-    #     else:
-    #         print(f"{step_str}[DEBUG NaN] {name}: ALL VALUES ARE NaN!")
-    #     return True
-    #
-    # if has_inf:
-    #     inf_count = torch.isinf(tensor).sum().item()
-    #     print(f"{step_str}[DEBUG Inf] {name}: inf_count={inf_count}")
-    #     return True
-    #
-    # return False
-
-
 def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """批量版本的训练step函数
 
@@ -80,7 +49,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     # === Discriminator随机重初始化 ===
     if torch.rand(1).item() < disc_reinit_prob:
-        config["logger"].info(f"[Step {current_step}] Discriminator reinit triggered")
         discriminator._init_weights()
 
     # === Temperature Annealing ===
@@ -136,9 +104,53 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     # 提取question embeddings（用于layer pruners）
     # 注意：只取question部分，排除answer token
-    # answer_positions是List of (start, end)，取最小的answer_start作为截止点
-    min_answer_start = min(pos[0] for pos in answer_positions)
-    question_embeddings = embeddings_for_forward[:, v_end+1:min_answer_start, :]  # (batch, question_len, 4096)
+    # 每个样本的question长度可能不同，需要分别提取并padding
+    hidden_dim = embeddings_for_forward.shape[2]
+
+    # 计算每个样本的实际长度（用于转换负索引）
+    actual_lengths = attention_mask.sum(dim=1).tolist()  # List[int]
+
+    # 计算每个样本的question范围
+    question_ranges = []
+    seq_len = embeddings_for_forward.shape[1]
+    for i, (ans_start, _) in enumerate(answer_positions):
+        # 转换负索引
+        sample_len = int(actual_lengths[i])
+        if ans_start < 0:
+            ans_start = sample_len + ans_start
+        q_start = v_end + 1
+        q_end = ans_start - 1  # question结束于answer开始前一个位置
+
+        # 边界检查
+        if q_end < q_start:
+            print(f"[WARNING] 样本 {i}: question范围无效 (q_start={q_start}, q_end={q_end}, "
+                  f"ans_start={ans_start}, v_end={v_end}, sample_len={sample_len}, seq_len={seq_len})")
+            print(f"  原始 answer_positions[{i}] = {answer_positions[i]}")
+            print(f"  questions[{i}] = {questions[i][:100]}...")
+            # 使用最小有效范围（至少1个token）
+            q_end = q_start
+        if q_start >= seq_len:
+            print(f"[WARNING] 样本 {i}: q_start={q_start} >= seq_len={seq_len}")
+            q_start = seq_len - 1
+            q_end = seq_len - 1
+
+        question_ranges.append((q_start, q_end))
+
+    # 找到最大question长度
+    max_question_len = max(q_end - q_start + 1 for q_start, q_end in question_ranges)
+
+    # 为每个样本提取question并padding
+    question_embeddings = torch.zeros(batch_size, max_question_len, hidden_dim,
+                                      device=embeddings_for_forward.device,
+                                      dtype=embeddings_for_forward.dtype)
+    question_mask = torch.zeros(batch_size, max_question_len,
+                                device=embeddings_for_forward.device,
+                                dtype=torch.bool)
+
+    for i, (q_start, q_end) in enumerate(question_ranges):
+        q_len = q_end - q_start + 1
+        question_embeddings[i, :q_len, :] = embeddings_for_forward[i, q_start:q_end+1, :]
+        question_mask[i, :q_len] = True
 
     # ========== Phase 2: Layer-wise Pruning Forward（带hooks） ==========
 
@@ -153,7 +165,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         new_vision_pos,
         question_embeddings,
         mask_collector=pruning_masks,
-        use_attn_residual=use_attn_residual
+        use_attn_residual=use_attn_residual,
+        question_mask=question_mask
     )
 
     try:
@@ -165,9 +178,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             output_hidden_states=True
         )
 
-        # === DEBUG: 检查forward输出 ===
-        debug_check_tensor(result_fake['logits'], "result_fake['logits']", current_step)
-
         # 2.4 提取hidden states from target layers
         fake_hidden_list = extract_target_hidden_states_batch(
             result_fake['all_hidden_states'],
@@ -177,9 +187,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             attention_mask=new_attention_mask
         )
 
-        # === DEBUG: 检查fake hidden states ===
-        for i, fh in enumerate(fake_hidden_list):
-            debug_check_tensor(fh, f"fake_hidden_list[{i}]", current_step)
+        # 立即释放 all_hidden_states（32层的hidden states占用大量显存）
+        del result_fake['all_hidden_states']
 
     finally:
         remove_hooks(handles)
@@ -200,6 +209,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
             attention_mask=attention_mask
         )
 
+        # 立即释放 all_hidden_states（32层的hidden states占用大量显存）
+        # del result_real['all_hidden_states']
+        # del result_real
+
     # ========== Phase 3: Discriminator Judgment ==========
 
     discriminator.eval()
@@ -210,17 +223,11 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     fake_pred_for_gen = discriminator(fake_hidden_list)  # (batch, seq_len)
 
-    # === DEBUG: 检查discriminator输出 ===
-    debug_check_tensor(fake_pred_for_gen, "fake_pred_for_gen", current_step)
-
     for p in discriminator.parameters():
         p.requires_grad = True
 
     # 3.2 判别real
     real_pred = discriminator(real_hidden_list)
-
-    # === DEBUG: 检查real_pred ===
-    debug_check_tensor(real_pred, "real_pred", current_step)
 
     # ========== Phase 4: Loss Computation ==========
 
@@ -228,16 +235,14 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     # 1. Task Loss: 保持任务性能
     task_loss = compute_task_loss_batch(
-        result_fake['logits'],
+        result_real['logits'],
         answer_positions,
         answers,
         backbone.processor,
         attention_mask=new_attention_mask
     )
     layer_pruners_losses["task_loss"] = task_loss
-
-    # === DEBUG: 检查task_loss ===
-    debug_check_tensor(task_loss, "task_loss (before weight)", current_step)
+    del task_loss  # 已存入字典，删除局部引用
 
     # 2. Adversarial loss (使用 logits，数值更稳定)
     adv_loss = F.binary_cross_entropy_with_logits(
@@ -245,20 +250,70 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         torch.ones_like(fake_pred_for_gen),
         reduction='mean'
     )
-    layer_pruners_losses["adv_loss"] = adv_loss
 
-    # === DEBUG: 检查adv_loss ===
-    debug_check_tensor(adv_loss, "adv_loss (before weight)", current_step)
+    # === DEBUG: 检查 adv_loss 梯度传导 ===
+    debug_adv_grad = config.get("debug_adv_grad", False)
+    if debug_adv_grad:
+        print(f"\n[DEBUG adv_loss] === 梯度传导检查 ===")
+        print(f"[DEBUG adv_loss] adv_loss.requires_grad: {adv_loss.requires_grad}")
+        print(f"[DEBUG adv_loss] adv_loss.grad_fn: {adv_loss.grad_fn}")
+        print(f"[DEBUG adv_loss] fake_pred_for_gen.requires_grad: {fake_pred_for_gen.requires_grad}")
+        print(f"[DEBUG adv_loss] fake_pred_for_gen.grad_fn: {fake_pred_for_gen.grad_fn}")
+
+        # 检查 fake_hidden_list 的梯度
+        for i, h in enumerate(fake_hidden_list):
+            print(f"[DEBUG adv_loss] fake_hidden_list[{i}].requires_grad: {h.requires_grad}, grad_fn: {h.grad_fn}")
+
+        # 检查 pruning_masks 的梯度
+        for i, mask in enumerate(pruning_masks):
+            print(f"[DEBUG adv_loss] pruning_masks[{i}].requires_grad: {mask.requires_grad}, grad_fn: {mask.grad_fn}")
+
+        # 关键检查：disc_target_layers vs pruning_layers
+        print(f"\n[DEBUG adv_loss] === 层配置检查 ===")
+        print(f"[DEBUG adv_loss] pruning_layers: {layer_pruners.get_all_layers()}")
+        print(f"[DEBUG adv_loss] disc_target_layers: {disc_target_layers}")
+        print(f"[DEBUG adv_loss] 警告: 如果 disc_target_layers 不包含 pruning_layers，")
+        print(f"[DEBUG adv_loss]        adv_loss 的梯度可能无法传导到 pruner！")
+        print(f"[DEBUG adv_loss]        因为 LLM 是 frozen 的，梯度无法通过 LLM 层传导。")
+
+        # 关键测试：单独对 adv_loss 做 backward，检查 pruner 是否收到梯度
+        print(f"\n[DEBUG adv_loss] === 梯度传导测试 ===")
+        # 保存当前梯度
+        for p in layer_pruners.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+
+        # 单独 backward adv_loss
+        adv_loss.backward(retain_graph=True)
+
+        # 检查 pruner 是否收到梯度
+        pruner_grads = []
+        for name, p in layer_pruners.named_parameters():
+            if p.grad is not None:
+                grad_norm = p.grad.norm().item()
+                pruner_grads.append((name, grad_norm))
+                if grad_norm > 1e-10:
+                    print(f"[DEBUG adv_loss] ✓ {name}: grad_norm = {grad_norm:.6f}")
+            else:
+                print(f"[DEBUG adv_loss] ✗ {name}: NO GRAD!")
+
+        if not pruner_grads or all(g < 1e-10 for _, g in pruner_grads):
+            print(f"\n[DEBUG adv_loss] ❌ 严重问题: adv_loss 的梯度没有传导到 layer_pruners!")
+            print(f"[DEBUG adv_loss] 原因: disc_target_layers ({disc_target_layers}) 和 pruning_layers ({layer_pruners.get_all_layers()}) 不匹配")
+            print(f"[DEBUG adv_loss] 解决方案: 将 disc_target_layers 设置为 pruning_layers 或其后一层")
+        else:
+            print(f"\n[DEBUG adv_loss] ✓ adv_loss 的梯度成功传导到 layer_pruners")
+
+        # 清零梯度，让后续正常训练
+        for p in layer_pruners.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+
+    layer_pruners_losses["adv_loss"] = adv_loss
+    del adv_loss  # 已存入字典，删除局部引用
 
     # 3. Sparsity Loss
     if len(pruning_masks) > 0:
-        # === DEBUG: 检查pruning_masks ===
-        for i, mask in enumerate(pruning_masks):
-            if debug_check_tensor(mask, f"pruning_masks[{i}]", current_step):
-                print(f"[Step {current_step}] [DEBUG] pruning_masks[{i}] stats: "
-                      f"shape={mask.shape}, min={mask.min().item():.4f}, max={mask.max().item():.4f}, "
-                      f"mean={mask.mean().item():.4f}")
-
         target_sparsity = config['method_settings'].get('target_sparsity')
         use_token_num_target = config['method_settings'].get('use_token_num_target')
         sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
@@ -277,9 +332,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         final_mask = pruning_masks[-1]
         final_kept_ratio = final_mask.mean()
 
-        # === DEBUG: 检查kept_ratios ===
-        debug_check_tensor(avg_kept_ratio, "avg_kept_ratio", current_step)
-
         if sparsity_loss_only_on_excess:
             excess = torch.relu(avg_kept_ratio - target_kept_ratio)
             sparsity_constraint_loss = excess.to(device).pow(2)
@@ -288,20 +340,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
 
-        # === DEBUG: 检查sparsity_loss ===
-        debug_check_tensor(sparsity_constraint_loss, "sparsity_loss (before weight)", current_step)
-
         # Token Count Loss
         token_count_loss = avg_kept_ratio.to(device)
         layer_pruners_losses["token_count_loss"] = token_count_loss
 
-        # Binarization Loss: 鼓励 mask 接近 0 或 1
-        # binary_term = mask * (1 - mask) 在 mask=0 或 1 时为 0，在 mask=0.5 时最大 (0.25)
+        # Binarization Loss: 禁用
         binarization_loss = torch.tensor(0.0, device=device)
-        for mask in pruning_masks:
-            binary_term = (mask * (1 - mask)).mean()
-            binarization_loss = binarization_loss + binary_term.to(device)
-        binarization_loss = binarization_loss / len(pruning_masks)
         layer_pruners_losses["binarization_loss"] = binarization_loss
 
         # 统计信息
@@ -314,6 +358,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         stats["final_token_count"] = final_mask.sum().item() / batch_size
         stats["target_kept_ratio"] = target_kept_ratio
 
+        # 立即清理sparsity计算的中间变量
+        del kept_ratios, avg_kept_ratio, final_mask, final_kept_ratio
+        del sparsity_constraint_loss, token_count_loss, binarization_loss
+        if sparsity_loss_only_on_excess:
+            del excess
+
     # --- Discriminator Loss ---
 
     discriminator.train()
@@ -325,9 +375,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         reduction='mean'
     )
 
-    # === DEBUG: 检查disc real_loss ===
-    debug_check_tensor(disc_losses["real_loss"], "disc_real_loss", current_step)
-
     # Fake loss (使用 logits)
     fake_hidden_detached = [h.detach() for h in fake_hidden_list]
     fake_pred_for_disc = discriminator(fake_hidden_detached)
@@ -336,9 +383,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         torch.zeros_like(fake_pred_for_disc),
         reduction='mean'
     )
-
-    # === DEBUG: 检查disc fake_loss ===
-    debug_check_tensor(disc_losses["fake_loss"], "disc_fake_loss", current_step)
 
     # 判别器准确率 (对 logits 应用 sigmoid 后判断)
     real_prob = torch.sigmoid(real_pred)
@@ -350,10 +394,13 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     stats["disc_real_acc"] = real_correct.item()
     stats["disc_fake_acc"] = fake_correct.item()
 
-    # 清理
-    del embeddings_for_forward, result_fake, result_real
+    # 清理中间变量（释放显存）
+    del embeddings_for_forward, result_fake
     del fake_hidden_list, real_hidden_list, fake_hidden_detached
     del fake_pred_for_gen, real_pred, fake_pred_for_disc, pruning_masks
+    del original_embeddings, vision_features_raw, vision_features_projected
+    del question_embeddings, question_mask, emb_info
+    del real_prob, fake_prob, real_correct, fake_correct, disc_accuracy
 
     # ========== Phase 5: 应用权重 ==========
 
@@ -407,8 +454,6 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         for k in losses_dict:
             if isinstance(losses_dict[k], torch.Tensor):
                 losses_dict[k] = losses_dict[k].to(target_device)
-
-    torch.cuda.empty_cache()
 
     return {
         "discriminator": dict(disc_losses),

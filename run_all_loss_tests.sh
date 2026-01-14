@@ -12,7 +12,6 @@ TESTS=(
     "adv_loss"
     "sparsity_loss"
     "token_count_loss"
-    "binarization_loss"
     "disc_loss"
     "all_losses"
 )
@@ -116,4 +115,4 @@ echo "详细结果已保存到: $RESULTS_FILE"
 echo ""
 echo "测试完成，系统将在 10 秒后关机..."
 sleep 10
-# sudo shutdown -h now
+sudo shutdown -h now
