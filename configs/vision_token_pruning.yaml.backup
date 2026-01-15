@@ -1,0 +1,257 @@
+# Vision Token Pruning with GAN 配置文件
+
+debug_adv_grad: false  # 调试 adv_loss 梯度传导
+
+global_settings:
+  seed: 42
+  device: "cuda"
+  dtype: "float"  # 训练数据类型: "half" (float16) 或 "float" (float32)
+  pytorch_cuda_alloc_conf: "expandable_segments:True"
+  dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
+  hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
+  save_dir: "./outputs/checkpoints"
+  log_dir: "./outputs/logs"
+  study_name: "gan_vtp"  # Vision Token Pruning研究名称
+
+trainer_settings:  # 训练框架设置
+  type: "deep-learning"
+  name: "basic-pytorch"
+  dl_settings:
+    epochs: 2
+    batch_size: 12 # 12  # 单卡显存有限，减小batch size
+    optimizers:
+      generator:
+        type: "adam"
+        lr: 2.0e-05
+      discriminator:  # Discriminator优化器
+        type: "adam"
+        lr: 2.0e-04
+      token_merger:  # Token Merger优化器（可以设置更高的学习率）
+        type: "adam"
+        lr: 1.0e-05
+      layer_pruners:  # Layer Pruners优化器
+        type: "adam"
+        lr: 1.7e-04
+    print_loss_every_batches: 50
+    eval_every_batches: 500
+    eval_max_samples: 400
+    save_every_batches: 3000
+    save_every_epochs: 1
+    optuna_eval_interval_batches: 40
+    grad_clip_max_norm: 10.0
+
+manager_settings:
+  name: "basic"
+  mode: "direct"  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
+  num_subtasks: 1
+  available_gpus: [0]  # 单卡（GPU索引从0开始）
+  gpus_per_subtask: 1
+  poll_interval: 5.0
+  batch_configs_dir: null
+
+search_settings:
+  enable: false
+  type: "optuna"
+  n_trials: 200  # 减少trial数量（单worker串行执行）
+  study_name: "attn_bias_search"
+  pruner:
+    type: "successive_halving"
+    min_resource: 2  # 最少跑2个评估点才能被剪枝
+    reduction_factor: 3
+    min_early_stopping_rate: 0
+  sampler:
+    type: "tpe"
+    n_startup_trials: 15  # TPE warmup：前10个trial随机采样
+    multivariate: true  # 考虑参数间相关性
+  params:
+    # 搜索范围：基于最优参数上下两个数量级
+    # 最优参数来源: best_params.json (trial)
+
+    # Layer Pruners 学习率 (最优: 1.27e-4)
+    trainer_settings.dl_settings.optimizers.layer_pruners.lr:
+      type: "float"
+      low: 1.0e-6   # 1.27e-4 / 100
+      high: 1.0e-2  # 1.27e-4 * 100
+      log: true
+
+    # Discriminator 学习率 (最优: 1.30e-4)
+    trainer_settings.dl_settings.optimizers.discriminator.lr:
+      type: "float"
+      low: 1.0e-6   # 1.30e-4 / 100
+      high: 1.0e-2  # 1.30e-4 * 100
+      log: true
+
+    # Loss权重（基于最优参数上下两个数量级）
+    # adv_loss_weight (最优: 29.1)
+    method_settings.adv_loss_weight:
+      type: "float"
+      low: 0.3      # 29.1 / 100
+      high: 3000.0  # 29.1 * 100
+      log: true
+
+    # task_loss_weight (最优: 3.87)
+    method_settings.task_loss_weight:
+      type: "float"
+      low: 0.04     # 3.87 / 100
+      high: 400.0   # 3.87 * 100
+      log: true
+
+    # sparsity_weight (最优: 0.212)
+    method_settings.sparsity_weight:
+      type: "float"
+      low: 0.001    # 0.212 / 100
+      high: 100.0    # 0.212 * 100
+      log: true
+
+    # Discriminator配置（线性搜索，±0.1范围）
+    # disc_reinit_prob (最优: 0.084)
+    method_settings.disc_reinit_prob:
+      type: "float"
+      low: 0.0      # max(0, 0.084 - 0.1)
+      high: 0.18    # 0.084 + 0.1
+      log: false
+
+    # disc_dropout (最优: 0.115)
+    method_settings.disc_dropout:
+      type: "float"
+      low: 0.02     # max(0, 0.115 - 0.1)
+      high: 0.22    # 0.115 + 0.1
+      log: false
+
+    # Attention Bias相关参数（新增）
+    # use_attn_residual: 是否启用attention residual
+    method_settings.use_attn_residual:
+      type: "bool"
+
+    # learnable_attn_weight: attention weight是否可学习
+    method_settings.learnable_attn_weight:
+      type: "bool"
+
+    # ==================== Gumbel Softmax 相关参数 ====================
+    # temperature: 初始temperature（控制soft/hard程度，典型值0.5-2.0）
+    method_settings.temperature:
+      type: "float"
+      low: 0.5
+      high: 2.0
+      log: false
+
+    # temperature_min: 最小temperature（annealing终点，典型值0.05-0.5）
+    method_settings.temperature_min:
+      type: "float"
+      low: 0.05
+      high: 0.5
+      log: false
+
+    # temperature_anneal_rate: Anneal比例（前X%步数进行annealing，0.3-0.8）
+    method_settings.temperature_anneal_rate:
+      type: "float"
+      low: 0.1
+      high: 0.8
+      log: false
+
+dataset_settings:  # 数据集配置
+  name: "vqa-vqav2"  # 数据集名称
+  split:
+    train: 50000  # VQA v2 大规模训练
+    test: 5000
+  category_priority:
+    enable: false  # 大规模训练禁用类别均衡，加快数据加载
+    values:
+      - train: "mean"
+  fast_load_no_random: false  # 快速加载模式（Optuna搜索时加速）
+
+config_settings:
+  enable_dict_overrides: true
+  enable_yaml_overrides: true
+  log_config_on_load: true
+
+backbone_settings:  # 多模态大模型骨架配置
+  type: "mllm"  # 骨架类型
+  name: "llava-1.5-7b"  # 模型名称
+  mllm_settings:
+    device_map: "auto"  # 单卡使用auto
+    max_text_tokens: 128  # 最大文本token数
+    max_vision_tokens: 576  # 固定vision token数（336x336图像）
+    image_max_size: 336  # 图像统一大小（batch处理需要）
+
+
+method_settings:
+  # ==================== Token Merger配置（新增） ====================
+  enable_token_merger: false  # 是否启用token merger（true=启用, false=禁用）
+  merger_type: "fixed_pooling"  # "simple" / "question_aware" / "fixed_pooling" (推荐V3)
+  merge_ratio: 1.0  # 保留比例
+  merger_dropout: 0.1  # Token Merger 的 dropout（防过拟合）
+  merger_d_internal: 512  # Merger内部维度
+
+  # ==================== Layer-wise Pruner配置（新增） ====================
+  pruning_layers: [5, 15, 25]  # 要剪枝的LLM层索引
+  pruner_d_internal: 512  # Pruner内部维度
+  pruner_num_heads: 4  # Cross-attention头数
+  pruner_type: "cross_attention"  # "cross_attention" 或 "simple"
+  pruner_dropout: 0.1  # Layer Pruner 的 dropout（防过拟合）
+
+  # Attention Residual配置（新功能）
+  use_attn_residual: false  # 是否启用attention residual（残差连接text→vision attention）
+  attn_residual_weight: 0.5  # Residual权重（固定值或初始值）
+  learnable_attn_weight: true  # Residual weight是否可学习（true=可学习参数，false=固定值）
+
+  # ==================== 剪枝目标配置 ====================
+  use_token_num_target: true  # true=使用绝对token数目标, false=使用稀疏度比例
+  target_token_num: 200  # 目标保留的绝对token数（use_token_num_target=true时生效）
+  target_sparsity: 0.3  # 目标稀疏度（use_token_num_target=false时生效，0.3表示剪掉30%）
+
+  # ==================== Sparsity Loss配置 ====================
+  sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚, false=双向惩罚（防止过度剪枝）
+  sparsity_warmup_enable: true  # 是否启用sparsity weight warmup
+  sparsity_weight: 1.0  # Sparsity约束loss权重初始值（L_target）
+  sparsity_weight_max: 2.0  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
+  sparsity_warmup_ratio: 0.4  # Warmup比例（前40%步数）
+  atp_loss_weight: 0.01  # L_ATP权重：层深度加权惩罚（鼓励早期剪枝）
+
+  # ==================== Temperature Annealing（新增） ====================
+  temperature: 1.0  # 初始temperature
+  temperature_min: 0.3  # 最小temperature
+  temperature_anneal_rate: 0.4  # Anneal比例（前50%步数进行annealing）
+
+  # ==================== Hard Pruning配置（评估时使用） ====================
+  hard_pruning_threshold: 0.5  # Hard剪枝阈值（soft_mask > threshold则保留）
+
+  # ==================== Generator配置 ====================
+  gen_num_layers: 2
+  gen_num_heads: 2
+  gen_d_ff: 2048
+  gen_use_pos_encoding: false
+  gen_enable_token_bias: true
+  gen_use_gumbel: true
+  gen_temperature: 0.906
+  gen_temperature_anneal: true
+  gen_temperature_min: 0.237
+  gen_temperature_anneal_rate: 0.543
+
+  # ==================== Discriminator配置 ====================
+  disc_num_layers: 3  # 使用的LLM隐层数量
+  disc_d_d: 512  # 隐层维度
+  disc_dropout: 0.3  # Dropout比率
+  disc_target_layers: [8, 18, 28]  # 剪枝层后3层 (pruning_layers=[5,15,25] + 3)
+  disc_reinit_prob: 0.2  # 每个batch重初始化Discriminator的概率
+  disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
+
+  # ==================== 损失权重（动态调度） ====================
+  # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
+
+  # Task Loss权重（递减）
+  task_loss_weight_start: 20.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 10.0 # 目标权重（warmup后的稳定值）
+
+  # Adversarial Loss权重（递增）
+  adv_loss_weight_start: 2.0  # 初始权重（低对抗，避免过早压制pruner）
+  adv_loss_weight: 8.0  # 目标权重（warmup后强化对抗）
+
+  # Entropy Loss权重
+  entropy_weight: 6.0
+
+  # Warmup配置
+  loss_weight_warmup_ratio: 0.3  # 前30%步数进行warmup（0.0=关闭动态调度）
+
+evaluation_settings:  # 评估配置
+  eval_mode: ["origin", "hard"]  # origin=无剪枝, merge_only=只merge, soft=软剪枝, hard=硬剪枝
