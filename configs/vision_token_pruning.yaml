@@ -218,8 +218,8 @@ method_settings:
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚, false=双向惩罚（防止过度剪枝）
   min_layer_keep_ratio: 0.02  # 每层最小保留率（防止单层mode collapse，目标avg<20%需每层约12%）
   sparsity_warmup_enable: true  # 是否启用sparsity weight warmup
-  sparsity_weight: 0.05  # Sparsity约束loss权重初始值
-  sparsity_weight_max: 0.1  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
+  sparsity_weight: 1.0  # Sparsity约束loss权重初始值
+  sparsity_weight_max: 2.0  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
   sparsity_warmup_ratio: 0.4  # Warmup比例（前40%步数）
   token_count_loss_weight: 0.00002  # Token总数loss权重（弱惩罚，鼓励减少token）
   binarization_loss_weight: 0  # Binarization loss权重，鼓励soft_mask接近0或1

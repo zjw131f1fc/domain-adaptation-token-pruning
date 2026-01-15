@@ -233,9 +233,9 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     # --- Layer Pruners Loss ---
 
-    # 1. Task Loss: 保持任务性能
+    # 1. Task Loss: 保持任务性能（使用fake sample的logits，梯度传导到pruner）
     task_loss = compute_task_loss_batch(
-        result_real['logits'],
+        result_fake['logits'],
         answer_positions,
         answers,
         backbone.processor,
