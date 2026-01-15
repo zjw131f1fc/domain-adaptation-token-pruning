@@ -238,6 +238,22 @@ class VisionPrunerHead(nn.Module):
 
             # Straight-through estimator: 前向用hard，反向用soft
             y_hard = (y_soft > 0.5).float()
+
+            # === 关键修复：保证每层至少保留一定比例的 token ===
+            # 防止单层完全剪枝导致 mode collapse
+            # 目标 avg_kept_ratio < 20%，每层约需 12%，设最小值为 5%
+            min_keep_ratio = 0.05  # 至少保留 5% 的 token
+            batch_size, n_vision = y_hard.shape
+            min_keep_count = max(1, int(n_vision * min_keep_ratio))
+
+            # 检查每个样本是否保留了足够的 token
+            for b in range(batch_size):
+                kept_count = y_hard[b].sum().item()
+                if kept_count < min_keep_count:
+                    # 强制保留 top-k 个 token（基于 y_soft 概率）
+                    _, top_indices = y_soft[b].topk(min_keep_count)
+                    y_hard[b, top_indices] = 1.0
+
             soft_mask = y_hard - y_soft.detach() + y_soft
         else:
             # 推理模式：确定性 sigmoid + threshold

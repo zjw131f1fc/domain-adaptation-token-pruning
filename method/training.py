@@ -317,6 +317,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         target_sparsity = config['method_settings'].get('target_sparsity')
         use_token_num_target = config['method_settings'].get('use_token_num_target')
         sparsity_loss_only_on_excess = config['method_settings'].get('sparsity_loss_only_on_excess')
+        min_layer_keep_ratio = config['method_settings'].get('min_layer_keep_ratio', 0.02)
 
         n_vision = pruning_masks[0].shape[1]
 
@@ -326,17 +327,60 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         else:
             target_kept_ratio = 1.0 - target_sparsity
 
-        # 计算每层的保留率
+        # 计算每层的保留率（用于统计）
         kept_ratios = [mask.mean().to(device) for mask in pruning_masks]
-        avg_kept_ratio = torch.stack(kept_ratios).mean()
-        final_mask = pruning_masks[-1]
-        final_kept_ratio = final_mask.mean()
+
+        # 计算累积 mask（所有层 mask 相乘）- 反映真实的最终保留率
+        cumulative_mask = pruning_masks[0]
+        for mask in pruning_masks[1:]:
+            cumulative_mask = cumulative_mask * mask
+        final_kept_ratio = cumulative_mask.mean()
+
+        # === 新增：Per-layer minimum constraint ===
+        # 防止任何单层剪枝过度导致mode collapse
+        per_layer_penalty = torch.tensor(0.0, device=device)
+        for ratio in kept_ratios:
+            # 当保留率低于最小值时，施加强惩罚
+            violation = torch.relu(min_layer_keep_ratio - ratio)
+            per_layer_penalty = per_layer_penalty + violation.pow(2) * 100.0  # 强惩罚
+
+        # 计算 LLM 所有层的加权平均保留率（考虑 KV cache）
+        # 假设 LLaMA-7B 有 32 层，剪枝层是 [5, 15, 25]
+        # Layer 0-4: 保留率=1.0, Layer 5-14: 保留率=L5, Layer 15-24: 保留率=L5*L15, Layer 25-31: 保留率=L5*L15*L25
+        pruning_layers = layer_pruners.get_all_layers()  # e.g., [5, 15, 25]
+        total_llm_layers = 32  # LLaMA-7B
+
+        # 计算每个区间的累积保留率
+        cumulative_ratios = []
+        cum_ratio = torch.tensor(1.0, device=device)
+        for mask in pruning_masks:
+            cum_ratio = cum_ratio * mask.mean().to(device)
+            cumulative_ratios.append(cum_ratio)
+
+        # 计算加权平均：每个区间的层数 × 该区间的保留率
+        weighted_sum = torch.tensor(0.0, device=device)
+        prev_layer = 0
+        for i, layer_idx in enumerate(pruning_layers):
+            # 剪枝层之前的区间：保留率是上一个累积值（或1.0）
+            n_layers_before = layer_idx - prev_layer
+            ratio_before = cumulative_ratios[i-1] if i > 0 else torch.tensor(1.0, device=device)
+            weighted_sum = weighted_sum + n_layers_before * ratio_before
+            prev_layer = layer_idx
+
+        # 最后一个剪枝层之后的区间
+        n_layers_after = total_llm_layers - prev_layer
+        weighted_sum = weighted_sum + n_layers_after * cumulative_ratios[-1]
+
+        avg_kept_ratio = weighted_sum / total_llm_layers
 
         if sparsity_loss_only_on_excess:
             excess = torch.relu(avg_kept_ratio - target_kept_ratio)
             sparsity_constraint_loss = excess.to(device).pow(2)
         else:
             sparsity_constraint_loss = (avg_kept_ratio - target_kept_ratio).to(device).pow(2)
+
+        # 加入per-layer penalty防止mode collapse
+        sparsity_constraint_loss = sparsity_constraint_loss + per_layer_penalty
 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
 
@@ -349,18 +393,17 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         layer_pruners_losses["binarization_loss"] = binarization_loss
 
         # 统计信息
-        pruning_layers = layer_pruners.get_all_layers()
         for idx, mask in enumerate(pruning_masks):
             layer_num = pruning_layers[idx]
             stats[f"L{layer_num}_kept"] = mask.mean().item()
         stats["avg_kept_ratio"] = avg_kept_ratio.item()
         stats["final_kept_ratio"] = final_kept_ratio.item()
-        stats["final_token_count"] = final_mask.sum().item() / batch_size
+        stats["final_token_count"] = cumulative_mask.sum().item() / batch_size
         stats["target_kept_ratio"] = target_kept_ratio
 
         # 立即清理sparsity计算的中间变量
-        del kept_ratios, avg_kept_ratio, final_mask, final_kept_ratio
-        del sparsity_constraint_loss, token_count_loss, binarization_loss
+        del kept_ratios, avg_kept_ratio, cumulative_mask, final_kept_ratio, cumulative_ratios
+        del sparsity_constraint_loss, token_count_loss, binarization_loss, per_layer_penalty
         if sparsity_loss_only_on_excess:
             del excess
 
@@ -437,6 +480,12 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     stats["current_task_weight"] = float(task_weight)
     stats["current_adv_weight"] = float(adv_weight)
     stats["current_sparsity_weight"] = float(sparsity_weight)
+
+    # 保存原始loss（未加权）
+    stats["raw_task_loss"] = layer_pruners_losses["task_loss"].item()
+    stats["raw_adv_loss"] = layer_pruners_losses["adv_loss"].item()
+    if "sparsity_loss" in layer_pruners_losses:
+        stats["raw_sparsity_loss"] = layer_pruners_losses["sparsity_loss"].item()
 
     # 应用权重
     layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] * adv_weight

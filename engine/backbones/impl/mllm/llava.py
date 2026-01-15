@@ -80,6 +80,9 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
         )
         self.processor = AutoProcessor.from_pretrained(model_id)
 
+        # 设置右padding（训练时需要，确保位置计算正确）
+        self.processor.tokenizer.padding_side = "right"
+
         # 设置 pad_token（LLaVA 使用 unk_token 作为 pad_token）
         if self.processor.tokenizer.pad_token is None:
             self.processor.tokenizer.pad_token = self.processor.tokenizer.unk_token
@@ -486,8 +489,9 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                 for i in range(batch_size):
                     # 计算 answer token 的长度差异
                     # 注意：由于padding，需要计算实际的token长度
-                    total_added_len = (input_ids[i] != self.processor.tokenizer.pad_token_id).sum().item() - \
-                                     (inputs_no_answer['input_ids'][i] != self.processor.tokenizer.pad_token_id).sum().item()
+                    len_with_answer = (input_ids[i] != self.processor.tokenizer.pad_token_id).sum().item()
+                    len_without_answer = (inputs_no_answer['input_ids'][i] != self.processor.tokenizer.pad_token_id).sum().item()
+                    total_added_len = len_with_answer - len_without_answer
 
                     # 单独 tokenize answer
                     answer_tokens = self.processor.tokenizer(

@@ -18,27 +18,27 @@ trainer_settings:  # 训练框架设置
   name: "basic-pytorch"
   dl_settings:
     epochs: 2
-    batch_size: 2 # 12  # 单卡显存有限，减小batch size
+    batch_size: 12 # 12  # 单卡显存有限，减小batch size
     optimizers:
       generator:
         type: "adam"
         lr: 2.0e-05
       discriminator:  # Discriminator优化器
         type: "adam"
-        lr: 3.2e-04
+        lr: 2.0e-04
       token_merger:  # Token Merger优化器（可以设置更高的学习率）
         type: "adam"
         lr: 1.0e-05
       layer_pruners:  # Layer Pruners优化器
         type: "adam"
-        lr: 1.7e-05
-    print_loss_every_batches: 100
-    eval_every_batches: 1000
-    eval_max_samples: 500
+        lr: 1.7e-04
+    print_loss_every_batches: 50
+    eval_every_batches: 500
+    eval_max_samples: 400
     save_every_batches: 3000
     save_every_epochs: 1
     optuna_eval_interval_batches: 40
-    grad_clip_max_norm: 1.0
+    grad_clip_max_norm: 10.0
 
 manager_settings:
   name: "basic"
@@ -215,17 +215,18 @@ method_settings:
   target_sparsity: 0.3  # 目标稀疏度（use_token_num_target=false时生效，0.3表示剪掉30%）
 
   # ==================== Sparsity Loss配置 ====================
-  sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚（强约束）, false=双向惩罚
+  sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚, false=双向惩罚（防止过度剪枝）
+  min_layer_keep_ratio: 0.02  # 每层最小保留率（防止单层mode collapse，目标avg<20%需每层约12%）
   sparsity_warmup_enable: true  # 是否启用sparsity weight warmup
-  sparsity_weight: 10  # Sparsity约束loss权重初始值
-  sparsity_weight_max: 40  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
+  sparsity_weight: 0.05  # Sparsity约束loss权重初始值
+  sparsity_weight_max: 0.1  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
   sparsity_warmup_ratio: 0.4  # Warmup比例（前40%步数）
-  token_count_loss_weight: 0.04  # Token总数loss权重（弱惩罚，鼓励减少token）
-  binarization_loss_weight: 0.81  # Binarization loss权重，鼓励soft_mask接近0或1
+  token_count_loss_weight: 0.00002  # Token总数loss权重（弱惩罚，鼓励减少token）
+  binarization_loss_weight: 0  # Binarization loss权重，鼓励soft_mask接近0或1
 
   # ==================== Temperature Annealing（新增） ====================
-  temperature: 0.8  # 初始temperature
-  temperature_min: 0.2  # 最小temperature
+  temperature: 1.0  # 初始temperature
+  temperature_min: 0.3  # 最小temperature
   temperature_anneal_rate: 0.4  # Anneal比例（前50%步数进行annealing）
 
   # ==================== Hard Pruning配置（评估时使用） ====================
@@ -248,22 +249,22 @@ method_settings:
   disc_d_d: 512  # 隐层维度
   disc_dropout: 0.3  # Dropout比率
   disc_target_layers: [8, 18, 28]  # 剪枝层后3层 (pruning_layers=[5,15,25] + 3)
-  disc_reinit_prob: 0.3  # 每个batch重初始化Discriminator的概率
+  disc_reinit_prob: 0.2  # 每个batch重初始化Discriminator的概率
   disc_use_spectral_norm: false  # 谱归一化（GAN稳定性）
 
   # ==================== 损失权重（动态调度） ====================
   # 余弦调度策略：训练初期优先任务性能，后期强化对抗训练
 
   # Task Loss权重（递减）
-  task_loss_weight_start: 100.0  # 初始权重（高优先级，优先学习保留信息）
-  task_loss_weight: 80.0 # 目标权重（warmup后的稳定值）
+  task_loss_weight_start: 20.0  # 初始权重（高优先级，优先学习保留信息）
+  task_loss_weight: 10.0 # 目标权重（warmup后的稳定值）
 
   # Adversarial Loss权重（递增）
-  adv_loss_weight_start: 30.0  # 初始权重（低对抗，避免过早压制pruner）
-  adv_loss_weight: 80  # 目标权重（warmup后强化对抗）
+  adv_loss_weight_start: 2.0  # 初始权重（低对抗，避免过早压制pruner）
+  adv_loss_weight: 8.0  # 目标权重（warmup后强化对抗）
 
   # Entropy Loss权重
-  entropy_weight: 12.0
+  entropy_weight: 6.0
 
   # Warmup配置
   loss_weight_warmup_ratio: 0.3  # 前30%步数进行warmup（0.0=关闭动态调度）

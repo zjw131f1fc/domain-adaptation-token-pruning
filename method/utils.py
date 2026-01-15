@@ -9,14 +9,14 @@ from typing import Dict, Any, List, Tuple, Optional, Callable
 
 
 class ScaleVisionWithClippedGrad(torch.autograd.Function):
-    """自定义autograd函数：vision_hidden * soft_mask，但对soft_mask的梯度进行裁剪
+    """自定义autograd函数：vision_hidden * soft_mask
 
-    问题：vision_hidden有大值（~200），导致soft_mask的梯度被放大，引起梯度爆炸
-    解决：在backward时对soft_mask的梯度进行裁剪
+    保持梯度流通，不做裁剪。
+    LLM 是 frozen 的，所以只需要 soft_mask 的梯度。
     """
 
     @staticmethod
-    def forward(ctx, vision_hidden, soft_mask, grad_clip_value=1.0):
+    def forward(ctx, vision_hidden, soft_mask, grad_clip_value=None):
         """
         vision_hidden: (batch, n_vision, d_model)
         soft_mask: (batch, n_vision)
@@ -26,7 +26,6 @@ class ScaleVisionWithClippedGrad(torch.autograd.Function):
         # 我们不需要 vision_hidden 的梯度（LLM 是 frozen 的）
         vision_hidden_detached = vision_hidden.detach()
         ctx.save_for_backward(vision_hidden_detached, soft_mask)
-        ctx.grad_clip_value = grad_clip_value
         # 前向计算仍然使用原始 vision_hidden（保持计算图连接到 scaled_vision）
         return vision_hidden * soft_mask.unsqueeze(-1)
 
@@ -36,19 +35,15 @@ class ScaleVisionWithClippedGrad(torch.autograd.Function):
         grad_output: (batch, n_vision, d_model) - d_loss/d_scaled_vision
         """
         vision_hidden_detached, soft_mask = ctx.saved_tensors
-        grad_clip_value = ctx.grad_clip_value
 
         # 对vision_hidden的梯度：不需要（LLM是frozen的）
         grad_vision = None
 
-        # 对soft_mask的梯度
+        # 对soft_mask的梯度（不裁剪，让全局 grad_clip 处理）
         # grad_soft_mask = sum(grad_output * vision_hidden, dim=-1)
         grad_soft_mask = (grad_output * vision_hidden_detached).sum(dim=-1)
 
-        # 关键：裁剪梯度，防止爆炸
-        grad_soft_mask = torch.clamp(grad_soft_mask, -grad_clip_value, grad_clip_value)
-
-        return grad_vision, grad_soft_mask, None  # None for grad_clip_value
+        return grad_vision, grad_soft_mask, None
 
 
 def extract_target_hidden_states_batch(
@@ -221,9 +216,6 @@ def compute_task_loss_batch(
             reduction='mean'
         )
 
-        # DEBUG: 打印详细位置信息
-        print(f"[DEBUG] sample={i}, ans_pos=({answer_start}, {answer_end}), logits_slice=[{answer_start-1}:{answer_end}], seq_len={seq_len}, sample_len={sample_len}")
-        print(f"[DEBUG] GT='{processor.tokenizer.decode(answer_token_ids)}', Pred='{processor.tokenizer.decode(logits[i,:].argmax(dim=-1)[answer_start-1:answer_end])}', loss={loss.item():.4f}")
         total_loss = total_loss + loss
         valid_samples += 1
 

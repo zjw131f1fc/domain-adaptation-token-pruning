@@ -465,6 +465,12 @@ class BasicPytorchTrainer:
                         metric_strs.append(f"disc_R={metrics_info['disc_real_acc']:.3f}")
                         metric_strs.append(f"disc_F={metrics_info['disc_fake_acc']:.3f}")
 
+                    # 原始loss（未加权）
+                    if "raw_task_loss" in metrics_info:
+                        metric_strs.append(f"raw_task={metrics_info['raw_task_loss']:.4f}")
+                    if "raw_adv_loss" in metrics_info:
+                        metric_strs.append(f"raw_adv={metrics_info['raw_adv_loss']:.4f}")
+
                     # 4. 组装完整消息
                     all_parts = grad_stats + loss_parts + metric_strs
 
