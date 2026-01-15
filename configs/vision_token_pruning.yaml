@@ -203,9 +203,10 @@ method_settings:
   # ==================== Sparsity Loss配置 ====================
   sparsity_loss_only_on_excess: true  # true=只在超出目标时惩罚, false=双向惩罚（防止过度剪枝）
   sparsity_warmup_enable: true  # 是否启用sparsity weight warmup
-  sparsity_weight: 1.0  # Sparsity约束loss权重初始值
+  sparsity_weight: 1.0  # Sparsity约束loss权重初始值（L_target）
   sparsity_weight_max: 2.0  # Sparsity约束loss权重最大值（warmup终点，防止后期token数反弹）
   sparsity_warmup_ratio: 0.4  # Warmup比例（前40%步数）
+  atp_loss_weight: 0.01  # L_ATP权重：层深度加权惩罚（鼓励早期剪枝）
 
   # ==================== Temperature Annealing（新增） ====================
   temperature: 1.0  # 初始temperature

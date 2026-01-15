@@ -364,13 +364,21 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         avg_kept_ratio = weighted_sum / total_llm_layers
 
+        # L_target: 目标约束损失（L1范数）
         if sparsity_loss_only_on_excess:
             excess = torch.relu(avg_kept_ratio - target_kept_ratio)
-            sparsity_constraint_loss = excess.to(device).pow(2)
+            sparsity_constraint_loss = excess.to(device).abs()
         else:
-            sparsity_constraint_loss = (avg_kept_ratio - target_kept_ratio).to(device).pow(2)
+            sparsity_constraint_loss = (avg_kept_ratio - target_kept_ratio).to(device).abs()
 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
+
+        # L_ATP: 层深度加权惩罚项（鼓励早期剪枝）
+        # L_ATP = Σ (mask_k.mean()) * layer_index_k
+        atp_loss = torch.tensor(0.0, device=device)
+        for i, (layer_idx, mask) in enumerate(zip(pruning_layers, pruning_masks)):
+            atp_loss = atp_loss + mask.mean().to(device) * layer_idx
+        layer_pruners_losses["atp_loss"] = atp_loss
 
         # 统计信息
         for idx, mask in enumerate(pruning_masks):
@@ -383,7 +391,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # 立即清理sparsity计算的中间变量
         del kept_ratios, avg_kept_ratio, cumulative_mask, final_kept_ratio, cumulative_ratios
-        del sparsity_constraint_loss
+        del sparsity_constraint_loss, atp_loss
         if sparsity_loss_only_on_excess:
             del excess
 
@@ -454,6 +462,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         adv_weight = adv_weight_end
 
     sparsity_weight = get_current_sparsity_weight(config, current_step, total_steps)
+    atp_weight = config['method_settings'].get('atp_loss_weight', 1.0)
 
     stats["current_task_weight"] = float(task_weight)
     stats["current_adv_weight"] = float(adv_weight)
@@ -464,12 +473,16 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
     stats["raw_adv_loss"] = layer_pruners_losses["adv_loss"].item()
     if "sparsity_loss" in layer_pruners_losses:
         stats["raw_sparsity_loss"] = layer_pruners_losses["sparsity_loss"].item()
+    if "atp_loss" in layer_pruners_losses:
+        stats["raw_atp_loss"] = layer_pruners_losses["atp_loss"].item()
 
     # 应用权重
     layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] * adv_weight
     layer_pruners_losses["task_loss"] = layer_pruners_losses["task_loss"] * task_weight
     if "sparsity_loss" in layer_pruners_losses:
         layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] * sparsity_weight
+    if "atp_loss" in layer_pruners_losses:
+        layer_pruners_losses["atp_loss"] = layer_pruners_losses["atp_loss"] * atp_weight
 
     # 确保tensor在正确设备上
     target_device = next(layer_pruners.parameters()).device
