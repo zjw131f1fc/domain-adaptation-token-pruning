@@ -374,10 +374,10 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
 
         # L_ATP: 层深度加权惩罚项（鼓励早期剪枝）
-        # L_ATP = Σ (mask_k.mean()) * layer_index_k
+        # 使用相对索引 (1, 2, 3, ...) 而不是原始层索引，使各层权重更均衡
         atp_loss = torch.tensor(0.0, device=device)
         for i, (layer_idx, mask) in enumerate(zip(pruning_layers, pruning_masks)):
-            atp_loss = atp_loss + mask.mean().to(device) * layer_idx
+            atp_loss = atp_loss + mask.mean().to(device) * (i + 1)
         layer_pruners_losses["atp_loss"] = atp_loss
 
         # 统计信息

@@ -18,7 +18,7 @@ trainer_settings:
   type: "deep-learning"
   name: "basic-pytorch"
   dl_settings:
-    epochs: 1
+    epochs: 2
     batch_size: 12
     optimizers:
       # ===== 学习率设计思路 =====
@@ -170,21 +170,21 @@ method_settings:
 
   # ==================== 剪枝目标配置 ====================
   use_token_num_target: true
-  target_token_num: 144  # ATP-LLaVA: 144 (~75%压缩)
+  target_token_num: 200  # ATP-LLaVA: 144 (~75%压缩)
   target_sparsity: 0.75
 
   # ==================== Sparsity Loss配置 ====================
   # ATP-LLaVA: λ_target=0.2, λ_ATP=0.01-0.1 (相对于L_ntp=1)
   sparsity_loss_only_on_excess: false
   sparsity_warmup_enable: false
-  sparsity_weight: 0.2  # L_target权重，参考ATP-LLaVA
-  sparsity_weight_max: 0.2
+  sparsity_weight: 4.0  # 提高以增加剪枝量
+  sparsity_weight_max: 4.0
   sparsity_warmup_ratio: 0.0
-  atp_loss_weight: 0.05  # L_ATP权重
+  atp_loss_weight: 1.0  # 提高以鼓励早期剪枝
 
   # ==================== Temperature配置 ====================
-  temperature: 1.0
-  temperature_min: 0.5
+  temperature: 1.5  # Gumbel-Softmax 适用
+  temperature_min: 0.8
   temperature_anneal_rate: 0.5
 
   # ==================== Hard Pruning配置 ====================
@@ -205,8 +205,8 @@ method_settings:
   # - adv_loss是GAN信号，确保剪枝后表示质量
   # - 两者需要平衡：task_loss太大会忽略GAN，adv_loss太大会忽略任务
 
-  task_loss_weight_start: 1.0
-  task_loss_weight: 1.0  # 基准权重=1，对应ATP-LLaVA的L_ntp
+  task_loss_weight_start: 1.5
+  task_loss_weight: 1.5  # 提高以优先保证任务性能
 
   adv_loss_weight_start: 0.5
   adv_loss_weight: 0.5  # 比task_loss小，优先保证任务性能

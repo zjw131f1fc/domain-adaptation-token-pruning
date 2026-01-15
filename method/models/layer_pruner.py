@@ -219,45 +219,22 @@ class VisionPrunerHead(nn.Module):
             # 残差连接：keep_logits += weight * attention
             keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
 
-        # === Step 6: Gumbel-Sigmoid（Binary Concrete）===
-        # Clamp logits to prevent numerical overflow
+        # === Step 6: Gumbel-Softmax ===
+        # 将 keep_logits 转换为 [drop, keep] 的二分类 logits
         keep_logits = torch.clamp(keep_logits, min=-10.0, max=10.0)
+        stacked_logits = torch.stack([
+            torch.zeros_like(keep_logits),  # drop logit = 0
+            keep_logits                      # keep logit
+        ], dim=-1)  # (batch, n_vision, 2)
 
         if use_gumbel and self.training:
-            # 使用clamp避免log(0)
-            u = torch.rand_like(keep_logits).clamp(1e-8, 1 - 1e-8)
-            logistic_noise = torch.log(u) - torch.log(1 - u)
-            # Clamp noise to prevent extreme values
-            logistic_noise = torch.clamp(logistic_noise, min=-5.0, max=5.0)
-
-            # Binary Concrete: sigmoid((logits + noise) / temperature)
-            noisy_logits = (keep_logits + logistic_noise) / self.temperature
-            # Clamp noisy_logits to prevent sigmoid saturation
-            noisy_logits = torch.clamp(noisy_logits, min=-10.0, max=10.0)
-            y_soft = torch.sigmoid(noisy_logits)
-
-            # Straight-through estimator: 前向用hard，反向用soft
-            y_hard = (y_soft > 0.5).float()
-
-            # === 关键修复：保证每层至少保留一定比例的 token ===
-            # 防止单层完全剪枝导致 mode collapse
-            # 目标 avg_kept_ratio < 20%，每层约需 12%，设最小值为 5%
-            min_keep_ratio = 0.05  # 至少保留 5% 的 token
-            batch_size, n_vision = y_hard.shape
-            min_keep_count = max(1, int(n_vision * min_keep_ratio))
-
-            # 检查每个样本是否保留了足够的 token
-            for b in range(batch_size):
-                kept_count = y_hard[b].sum().item()
-                if kept_count < min_keep_count:
-                    # 强制保留 top-k 个 token（基于 y_soft 概率）
-                    _, top_indices = y_soft[b].topk(min_keep_count)
-                    y_hard[b, top_indices] = 1.0
-
-            soft_mask = y_hard - y_soft.detach() + y_soft
+            # 使用 PyTorch 原生 Gumbel-Softmax，hard=True 实现 STE
+            y = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
+            soft_mask = y[..., 1]  # 取 keep 的概率
         else:
-            # 推理模式：确定性 sigmoid + threshold
-            soft_mask = (torch.sigmoid(keep_logits / self.temperature) > 0.5).float()
+            # 推理模式：确定性 argmax
+            probs = F.softmax(stacked_logits / self.temperature, dim=-1)
+            soft_mask = (probs[..., 1] > 0.5).float()
 
         return soft_mask
 

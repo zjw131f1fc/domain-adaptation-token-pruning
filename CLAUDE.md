@@ -40,32 +40,34 @@
 ## 损失函数
 
 ### Layer Pruners 损失
-1. **Task Loss**：答案预测的交叉熵损失，保持任务性能
+1. **Task Loss**：剪枝后输出的交叉熵损失（使用 fake sample 的 logits），保持任务性能
 2. **Adversarial Loss**：GAN 损失，使剪枝后的表示能欺骗判别器
-3. **Sparsity Loss**：约束 token 保留率，确保达到目标稀疏度
-   - 基于所有层的平均保留率
+3. **Sparsity Loss (L_target)**：约束 token 保留率到目标值（L1 范数）
+   - 基于 KV cache 加权平均保留率
    - 可选：仅在超过目标时惩罚（sparsity_loss_only_on_excess）
-4. **Token Count Loss**：直接优化 token 数量，鼓励减少
-5. **Binarization Loss**：鼓励 soft_mask 接近 0 或 1，减少模糊决策
+4. **ATP Loss (L_ATP)**：层深度加权惩罚，鼓励早期剪枝
+   - 公式：`Σ mask_k.mean() * layer_index_k`
+   - 深层保留 token 惩罚更重
 
 ### Discriminator 损失
 - **Real Loss**：将真实样本判别为真
 - **Fake Loss**：将剪枝样本判别为假
 
-### 动态权重调度
-- **Task weight**：从高开始（150.0），逐渐降低至 120.0（优先学习保留信息）
-- **Adversarial weight**：从低开始（10.0），逐渐提高至 80.0（后期强化对抗）
-- **Sparsity weight**：从低（10.0）warmup 到高（40.0），防止 token 数反弹
-- **余弦调度**：平滑过渡，避免训练不稳定
+### 损失权重设计（参考 ATP-LLaVA）
+- **task_loss_weight: 1.0**：基准权重，对应 ATP-LLaVA 的 L_ntp
+- **adv_loss_weight: 0.5**：比 task_loss 小，优先保证任务性能
+- **sparsity_weight: 0.2**：参考 ATP-LLaVA 的 λ_target
+- **atp_loss_weight: 0.05**：参考 ATP-LLaVA 的 λ_ATP (0.01-0.1)
 
 ## 配置
 
 ### 关键超参数
 - `pruning_layers: [5, 15, 25]`：要剪枝的 LLM 层索引
-- `target_token_num: 200`：目标保留的 token 数量
-- `temperature: 0.8`：Gumbel-Softmax 初始温度
-- `temperature_min: 0.2`：Gumbel-Softmax 最小温度
-- `temperature_anneal_rate: 0.4`：温度退火比例（前 40% 步数）
+- `target_token_num: 144`：目标保留的 token 数量（参考 ATP-LLaVA）
+- `temperature: 1.0`：Gumbel-Softmax 初始温度
+- `temperature_min: 0.5`：Gumbel-Softmax 最小温度
+- `temperature_anneal_rate: 0.5`：温度退火比例
+- `atp_loss_weight: 0.05`：L_ATP 权重（层深度加权惩罚）
 
 完整配置选项请参见 `configs/vision_token_pruning.yaml`。
 
@@ -216,9 +218,9 @@ A:
 
 ### Q: Token 保留率不收敛？
 A:
-1. 增加 `sparsity_weight` 和 `sparsity_weight_max`
-2. 检查 `sparsity_loss_only_on_excess` 设置
-3. 增加 `token_count_loss_weight`
+1. 增加 `sparsity_weight`
+2. 增加 `atp_loss_weight`（鼓励早期剪枝）
+3. 检查 `sparsity_loss_only_on_excess` 设置
 
 ### Q: 判别器准确率过高/过低？
 A:
@@ -261,6 +263,16 @@ scaled_vision NaN → hidden_states NaN → 下一层输入NaN → 级联失败
 
 ## 更新日志
 
+### 2026-01-15: 参考 ATP-LLaVA 重构损失函数
+- **修复 task_loss bug**：改用 fake sample（剪枝后）的 logits 计算，梯度可传导到 pruner
+- **删除冗余损失**：移除 token_count_loss、binarization_loss、per_layer_penalty
+- **Sparsity Loss 改为 L1 范数**：`|avg - target|` 替代 `(avg - target)²`
+- **新增 ATP Loss**：层深度加权惩罚 `Σ mask_k.mean() * layer_index_k`，鼓励早期剪枝
+- **重写配置文件**：参考 ATP-LLaVA 参数，针对 GAN 训练特点调整
+  - layer_pruners 学习率：1e-4（参考 ATP Module）
+  - discriminator 学习率：1.5e-4（Pruner 的 1.5 倍）
+  - 损失权重：task=1.0, adv=0.5, sparsity=0.2, atp=0.05
+
 ### 2026-01-13: 修复train_partial缺失梯度裁剪
 - **修复关键bug**：`train_partial` 方法缺失梯度裁剪代码，导致Optuna模式下训练不稳定
 - **位置**：`engine/trainers/impl/basic_pytorch.py:668-671`
@@ -273,6 +285,7 @@ scaled_vision NaN → hidden_states NaN → 下一层输入NaN → 级联失败
 - **优化损失权重调度**：余弦调度，更平滑的训练过程
 
 ## 参考文献
+- ATP-LLaVA: [Adaptive Token Pruning for LLaVA](https://arxiv.org/abs/2401.xxxxx) - 本项目损失函数设计的主要参考
 - Gumbel-Softmax: [Categorical Reparameterization with Gumbel-Softmax](https://arxiv.org/abs/1611.01144)
 - LLaVA: [Visual Instruction Tuning](https://arxiv.org/abs/2304.08485)
 - Straight-Through Estimator: [Estimating or Propagating Gradients Through Stochastic Neurons](https://arxiv.org/abs/1308.3432)
