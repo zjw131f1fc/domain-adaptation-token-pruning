@@ -377,12 +377,18 @@ def _generate_experiment_tag(config: Dict[str, Any]) -> str:
 
 
 
-def _setup_logger(config: Dict[str, Any]) -> logging.Logger:
+def _setup_logger(config: Dict[str, Any], is_main_process: bool = True) -> logging.Logger:
     """初始化logger"""
     experiment_tag = config["global_settings"]["experiment_tag"]
     log_dir = config["global_settings"]["log_dir"]
     os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"{experiment_tag}.log")
+
+    # 非主进程使用不同的日志文件名
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank > 0:
+        log_file = os.path.join(log_dir, f"{experiment_tag}_rank{local_rank}.log")
+    else:
+        log_file = os.path.join(log_dir, f"{experiment_tag}.log")
 
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -395,17 +401,18 @@ def _setup_logger(config: Dict[str, Any]) -> logging.Logger:
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-    # File handler - 默认启用文件日志
+    # File handler - 所有进程都写文件日志
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    # Console handler - 只在主进程输出到控制台
+    if is_main_process:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     return logger
 
@@ -488,6 +495,10 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     返回:
         config: 配置字典，包含logger属性
     """
+    # 检查是否是主进程（用于控制日志输出）
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_main_process = local_rank <= 0
+
     # 1. 创建默认配置的深拷贝
     config = deepcopy(DEFAULT_CONFIG)
 
@@ -498,9 +509,11 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
             _merge_dict(config["config_settings"], override_dict["config_settings"])
 
         if not config["config_settings"]["enable_yaml_overrides"]:
-            print("[Warning] YAML文件覆盖已禁用，忽略 override_file 参数")
+            if is_main_process:
+                print("[Warning] YAML文件覆盖已禁用，忽略 override_file 参数")
         elif not os.path.isfile(override_file):
-            print(f"[Warning] 配置文件未找到: {override_file}")
+            if is_main_process:
+                print(f"[Warning] 配置文件未找到: {override_file}")
         else:
             try:
                 with open(override_file, 'r', encoding='utf-8') as f:
@@ -508,11 +521,14 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
                 if isinstance(yaml_data, dict):
                     _merge_dict(config, yaml_data)
                     _auto_normalize_types(config, DEFAULT_CONFIG)
-                    print(f"[Info] 成功加载配置文件: {override_file}")
+                    if is_main_process:
+                        print(f"[Info] 成功加载配置文件: {override_file}")
                 else:
-                    print(f"[Warning] 配置文件格式错误: {override_file}")
+                    if is_main_process:
+                        print(f"[Warning] 配置文件格式错误: {override_file}")
             except Exception as e:
-                print(f"[Error] 读取配置文件失败: {override_file}, 错误: {e}")
+                if is_main_process:
+                    print(f"[Error] 读取配置文件失败: {override_file}, 错误: {e}")
 
     # 3. 应用字典覆盖（如果启用）- 后应用字典，优先级更高
     if override_dict:
@@ -522,7 +538,8 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
 
         # 然后根据设置决定是否应用其他覆盖
         if not config["config_settings"]["enable_dict_overrides"]:
-            print("[Warning] 字典覆盖已禁用，忽略 override_dict 中的非 config_settings 参数")
+            if is_main_process:
+                print("[Warning] 字典覆盖已禁用，忽略 override_dict 中的非 config_settings 参数")
         else:
             _merge_dict(config, override_dict)
 
@@ -566,18 +583,19 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     # 7. 设置环境变量（CUDA_VISIBLE_DEVICES 由 torchrun 或启动脚本管理）
     #os.environ["PYTORCH_CUDA_ALLOC_CONF"] = config["global_settings"]["pytorch_cuda_alloc_conf"]
 
-    # 8. 初始化logger
-    logger = _setup_logger(config)
+    # 8. 初始化logger（只在主进程输出到控制台）
+    logger = _setup_logger(config, is_main_process)
     config["logger"] = logger
     config["timestamp"] = datetime.now().strftime('%Y%m%d_%H%M%S')
 
     # 9. 设置随机种子
     seed = config["global_settings"]["seed"]
-    logger.info(f"Setting random seed to: {seed}")
+    if is_main_process:
+        logger.info(f"Setting random seed to: {seed}")
     set_random_seed(seed)
 
-    # 10. 打印配置（如果启用）
-    if config["config_settings"]["log_config_on_load"]:
+    # 10. 打印配置（如果启用，只在主进程）
+    if config["config_settings"]["log_config_on_load"] and is_main_process:
         _log_config(logger, config, config["timestamp"])
 
     # 11. 转换为AttrDict支持属性访问
