@@ -62,7 +62,6 @@ DEFAULT_CONFIG = {
         "seed": 42,
         "device": "cuda",
         "dtype": "float",  # 训练数据类型: "half" (float16) 或 "float" (float32)
-        "pytorch_cuda_alloc_conf": "expandable_segments:True",
         "dataset_cache_dir": "/root/autodl-tmp/dataset_cache",
         "hf_cache_dir": "/root/autodl-tmp/huggingface_cache",
         "save_dir": "./outputs/checkpoints",
@@ -564,38 +563,8 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
         if "log_dir" in config["global_settings"]:
             os.makedirs(config["global_settings"]["log_dir"], exist_ok=True)
 
-    # 7. 设置环境变量
-    # 设置CUDA_VISIBLE_DEVICES（如果Manager提供了）
-    if "cuda_visible_devices" in config["global_settings"]:
-        os.environ["CUDA_VISIBLE_DEVICES"] = config["global_settings"]["cuda_visible_devices"]
-
-    # 提前设置 CUDA_VISIBLE_DEVICES 以确保在任何 CUDA 初始化之前生效
-    if "manager_settings" in config:
-        ms = config["manager_settings"]
-        available_gpus = ms.get("available_gpus", [])
-        mode = ms.get("mode")
-
-        # 确保 available_gpus 是列表
-        if isinstance(available_gpus, str):
-             available_gpus = [int(x.strip()) for x in available_gpus.split(",") if x.strip()]
-
-        if available_gpus:
-            gpu_str = ""
-            if mode == "direct":
-                # Direct模式：只设置分配给当前任务的GPU
-                gpus_per_subtask = ms.get("gpus_per_subtask", 1)
-                assigned_gpus = available_gpus[:gpus_per_subtask]
-                gpu_str = ",".join(map(str, assigned_gpus))
-            else:
-                # 其他模式：设置所有可用GPU，防止主进程占用未分配的GPU
-                gpu_str = ",".join(map(str, available_gpus))
-
-            if gpu_str:
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_str
-                print(f"[ConfigLoader] Set CUDA_VISIBLE_DEVICES={gpu_str} (mode={mode})")
-
-    # 设置PYTORCH_CUDA_ALLOC_CONF
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = config["global_settings"]["pytorch_cuda_alloc_conf"]
+    # 7. 设置环境变量（CUDA_VISIBLE_DEVICES 由 torchrun 或启动脚本管理）
+    #os.environ["PYTORCH_CUDA_ALLOC_CONF"] = config["global_settings"]["pytorch_cuda_alloc_conf"]
 
     # 8. 初始化logger
     logger = _setup_logger(config)

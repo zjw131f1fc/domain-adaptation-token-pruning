@@ -7,20 +7,20 @@
 - 自动 checkpoint 保存
 
 启动方式：
-- 单 GPU: python refactor/main.py
-- 多 GPU DDP: torchrun --nproc_per_node=2 refactor/main.py
-- 或使用 accelerate: accelerate launch refactor/main.py
+- 单 GPU: python ./main.py
+- 多 GPU DDP: torchrun --nproc_per_node=2 ./main.py
+- 或使用 accelerate: accelerate launch ./main.py
 """
 
 import os
 import torch
 from transformers import TrainingArguments
 
-from refactor.configs.loader import load_config
-from refactor.datas.loader import load_dataset
-from refactor.backbones.loader import load_backbone
-from refactor.models import LayerSpecificPruner, Discriminator
-from refactor.training import PruningTrainer
+from configs.loader import load_config
+from datas.loader import load_dataset
+from backbones.loader import load_backbone
+from models import LayerSpecificPruner, Discriminator, PruningModelWrapper
+from training import PruningTrainer
 
 
 def main():
@@ -38,24 +38,14 @@ def main():
         logger.info("Vision Token Pruning with GAN (HuggingFace Trainer)")
         logger.info("=" * 60)
 
-    # 设置设备
+    # 设置设备（FSDP 会自动管理）
     if local_rank >= 0:
-        device = f"cuda:{local_rank}"
         torch.cuda.set_device(local_rank)
-    else:
-        device = config.get("global_settings", {}).get("device", "cuda")
 
     # ==================== 加载 Backbone ====================
     if local_rank <= 0:
         logger.info("加载 Backbone...")
     backbone = load_backbone(config)
-
-    # 冻结 Backbone 参数
-    if local_rank <= 0:
-        logger.info("冻结 Backbone 参数...")
-    if hasattr(backbone, "model"):
-        for param in backbone.model.parameters():
-            param.requires_grad = False
 
     # ==================== 加载数据集 ====================
     if local_rank <= 0:
@@ -77,7 +67,7 @@ def main():
     mllm_cfg = backbone_cfg.get("mllm_settings", {})
     trainer_cfg = config.get("trainer_settings", {}).get("dl_settings", {})
 
-    # Layer-Specific Pruners
+    # Layer-Specific Pruners（不指定 device，让 FSDP 管理）
     if local_rank <= 0:
         logger.info("创建 Layer-Specific Pruners...")
     layer_pruners = LayerSpecificPruner(
@@ -89,7 +79,7 @@ def main():
         use_attn_residual=method_cfg.get("use_attn_residual", False),
         attn_residual_weight=method_cfg.get("attn_residual_weight", 0.5),
         learnable_attn_weight=method_cfg.get("learnable_attn_weight", False)
-    ).to(device=device)
+    )
 
     # Discriminator
     if local_rank <= 0:
@@ -101,10 +91,20 @@ def main():
         dropout=method_cfg.get("disc_dropout", 0.1),
         use_layer_norm=True,
         use_spectral_norm=method_cfg.get("disc_use_spectral_norm", True)
-    ).to(device=device)
+    )
+
+    # 创建统一的 Wrapper 模型（包含 backbone、pruner、discriminator）
+    if local_rank <= 0:
+        logger.info("创建 PruningModelWrapper...")
+    model = PruningModelWrapper(
+        backbone=backbone,
+        layer_pruners=layer_pruners,
+        discriminator=discriminator,
+        freeze_backbone=True
+    )
 
     # ==================== 配置 TrainingArguments ====================
-    output_dir = config.get("global_settings", {}).get("save_dir", "outputs/refactor")
+    output_dir = config.get("global_settings", {}).get("save_dir", "outputs/.")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -120,25 +120,26 @@ def main():
         eval_steps=trainer_cfg.get("eval_every_batches", 500) if eval_dataset else None,
         save_total_limit=3,
         remove_unused_columns=False,
-        dataloader_num_workers=0,  # 使用原有的数据加载方式
+        dataloader_num_workers=0,
         fp16=torch.cuda.is_available() and trainer_cfg.get("fp16", True),
         bf16=trainer_cfg.get("bf16", False),
         gradient_accumulation_steps=trainer_cfg.get("gradient_accumulation_steps", 1),
         max_grad_norm=trainer_cfg.get("grad_clip_max_norm", 1.0),
-        # DDP 设置
-        ddp_find_unused_parameters=False,
         dataloader_pin_memory=True,
+        # FSDP 设置 - 将模型参数分片到多个 GPU
+        fsdp="full_shard auto_wrap",
+        fsdp_config={
+            "transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
+        },
     )
 
     # ==================== 创建 Trainer ====================
     if local_rank <= 0:
         logger.info("创建 PruningTrainer...")
     trainer = PruningTrainer(
-        model=layer_pruners,
+        model=model,  # 传入 wrapper，包含所有组件
         args=training_args,
         config=config,
-        backbone=backbone,
-        discriminator=discriminator,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         judge_fn=judge_fn,

@@ -3,3 +3,4 @@ outputs
 *.pyc
 .history
 .history_basic_trainer
+start_claude.sh

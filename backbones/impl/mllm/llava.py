@@ -51,7 +51,7 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
         """加载 LLaVA-1.5 模型和处理器。"""
         # 优先使用 config 中的 logger，保证日志格式一致
         logger = getattr(self.config, "logger", None) or logging.getLogger(__name__)
-        
+
         # 从配置获取模型 ID
         model_id = self.backbone_cfg.get("model_id", None)
         if model_id is None:
@@ -62,21 +62,13 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
                 "llava-1.5-13b": "llava-hf/llava-1.5-13b-hf",
             }
             model_id = model_map[model_name]
-        
+
         logger.info(f"Loading LLaVA model: {model_id} (this may take a while)...")
-        device_map = self.mllm_cfg["device_map"]
 
-        # 根据设备选择 dtype：GPU 用 float16，CPU 用 float32
-        if device_map == "cpu" or self.device == "cpu":
-            model_dtype = torch.float32
-            device_map = "cpu"
-        else:
-            model_dtype = torch.float32
-
+        # 使用 float16 节省显存，device_map=None 让 FSDP 管理设备分配
         self.model = LlavaForConditionalGeneration.from_pretrained(
             model_id,
-            device_map=device_map,
-            torch_dtype=model_dtype,
+            torch_dtype=torch.float16,
         )
         self.processor = AutoProcessor.from_pretrained(model_id)
 

@@ -23,33 +23,29 @@ class PruningTrainer(Trainer):
     """支持 GAN 训练的 HuggingFace Trainer
 
     特点:
-    - 继承 HuggingFace Trainer，支持 DDP 并行
+    - 继承 HuggingFace Trainer，支持 FSDP 并行
     - 多优化器支持（layer_pruners 和 discriminator）
     - 使用原有的 train_step 逻辑
     """
 
     def __init__(
         self,
-        model: nn.Module,  # 这里传入 layer_pruners 作为主模型
+        model: nn.Module,  # PruningModelWrapper，包含 backbone、layer_pruners、discriminator
         args: TrainingArguments,
         config: Dict[str, Any],
-        backbone,
-        discriminator: nn.Module,
         train_dataset=None,
         eval_dataset=None,
         data_collator=None,
-        judge_fn=None,  # 评估函数
+        judge_fn=None,
         **kwargs
     ):
         # 保存额外组件
         self.full_config = config
-        self.backbone = backbone
-        self.discriminator = discriminator
         self.judge_fn = judge_fn
 
         # 调用父类初始化
         super().__init__(
-            model=model,  # layer_pruners
+            model=model,
             args=args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
@@ -60,15 +56,38 @@ class PruningTrainer(Trainer):
         # 创建判别器优化器
         self._create_discriminator_optimizer()
 
-        # 模型字典（用于 train_step）
-        self.models = {
-            "backbone": backbone,
-            "layer_pruners": model,
-            "discriminator": discriminator,
-        }
-
         # 训练状态
         self._global_step = 0
+
+    @property
+    def backbone(self):
+        """获取 backbone（兼容 FSDP wrapped model）"""
+        if hasattr(self.model, "module"):
+            return self.model.module.backbone
+        return self.model.backbone
+
+    @property
+    def layer_pruners(self):
+        """获取 layer_pruners（兼容 FSDP wrapped model）"""
+        if hasattr(self.model, "module"):
+            return self.model.module.layer_pruners
+        return self.model.layer_pruners
+
+    @property
+    def discriminator(self):
+        """获取 discriminator（兼容 FSDP wrapped model）"""
+        if hasattr(self.model, "module"):
+            return self.model.module.discriminator
+        return self.model.discriminator
+
+    @property
+    def models(self):
+        """模型字典（用于 train_step）"""
+        return {
+            "backbone": self.backbone,
+            "layer_pruners": self.layer_pruners,
+            "discriminator": self.discriminator,
+        }
 
     def _create_discriminator_optimizer(self):
         """创建判别器的独立优化器"""
@@ -91,9 +110,9 @@ class PruningTrainer(Trainer):
 
         lr = opt_cfg.get("lr", 1e-4)
 
-        # 只优化剪枝器参数（self.model 是 layer_pruners）
+        # 只优化 layer_pruners 参数
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            self.layer_pruners.parameters(),
             lr=lr,
             betas=(0.9, 0.999),
             weight_decay=0.01
@@ -380,7 +399,7 @@ class PruningTrainer(Trainer):
 
         # 保存剪枝器
         pruner_path = os.path.join(output_dir, "layer_pruners.pt")
-        torch.save(self.model.state_dict(), pruner_path)
+        torch.save(self.layer_pruners.state_dict(), pruner_path)
 
         # 保存判别器
         disc_path = os.path.join(output_dir, "discriminator.pt")
@@ -398,31 +417,6 @@ class PruningTrainer(Trainer):
 
         self.log({"save": output_dir})
 
-    def _wrap_model(self, model, training=True, dataloader=None):
-        """包装模型用于分布式训练 (覆盖父类方法)
-
-        同时包装 discriminator
-        """
-        # 调用父类方法包装 layer_pruners
-        wrapped_model = super()._wrap_model(model, training, dataloader)
-
-        # 如果是分布式训练，也包装 discriminator
-        if self.args.parallel_mode.value != "not_parallel":
-            if not hasattr(self, '_wrapped_discriminator'):
-                from torch.nn.parallel import DistributedDataParallel
-                self._wrapped_discriminator = DistributedDataParallel(
-                    self.discriminator,
-                    device_ids=[self.args.local_rank] if self.args.local_rank != -1 else None,
-                )
-                # 更新 models 字典和 self.discriminator
-                self.models["discriminator"] = self._wrapped_discriminator
-                self._original_discriminator = self.discriminator
-                self.discriminator = self._wrapped_discriminator
-
-        return wrapped_model
-
     def _get_discriminator_params(self):
-        """获取 discriminator 的参数（兼容 DDP）"""
-        if hasattr(self, '_original_discriminator'):
-            return self._original_discriminator.parameters()
+        """获取 discriminator 的参数"""
         return self.discriminator.parameters()
