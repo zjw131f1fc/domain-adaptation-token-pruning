@@ -65,10 +65,10 @@ class LLaVAMLLMBackbone(BaseMLLMBackbone):
 
         logger.info(f"Loading LLaVA model: {model_id} (this may take a while)...")
 
-        # 使用 float16 节省显存，device_map=None 让 FSDP 管理设备分配
+        # 使用 float32，让 FSDP 统一管理 dtype
         self.model = LlavaForConditionalGeneration.from_pretrained(
             model_id,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float32,
         )
         self.processor = AutoProcessor.from_pretrained(model_id)
 

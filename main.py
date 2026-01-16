@@ -130,6 +130,7 @@ def main():
         fsdp="full_shard auto_wrap",
         fsdp_config={
             "transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
+            "use_orig_params": True,  # 保持原始参数形状，让 get_input_embeddings() 正常工作
         },
     )
 

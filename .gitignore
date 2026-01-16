@@ -4,3 +4,4 @@ outputs
 .history
 .history_basic_trainer
 start_claude.sh
+wandb
