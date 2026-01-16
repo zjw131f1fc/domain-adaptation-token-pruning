@@ -17,20 +17,28 @@ class PruningModelWrapper(nn.Module):
 
     def __init__(
         self,
-        backbone: nn.Module,
+        backbone,  # LLaVAMLLMBackbone (非 nn.Module)
         layer_pruners: nn.Module,
         discriminator: nn.Module,
         freeze_backbone: bool = True
     ):
         super().__init__()
-        self.backbone = backbone
+        # 保留 backbone wrapper 引用（用于调用 preprocess_batch, generate 等方法）
+        self._backbone_wrapper = backbone
+        # 注册 backbone.model 为子模块，让 FSDP 能找到 LlamaDecoderLayer
+        self.backbone_model = backbone.model
         self.layer_pruners = layer_pruners
         self.discriminator = discriminator
 
         # 冻结 backbone
-        if freeze_backbone and hasattr(backbone, "model"):
-            for param in backbone.model.parameters():
+        if freeze_backbone:
+            for param in self.backbone_model.parameters():
                 param.requires_grad = False
+
+    @property
+    def backbone(self):
+        """返回 backbone wrapper，保留所有方法（preprocess_batch, generate 等）"""
+        return self._backbone_wrapper
 
     def forward(self, *args, **kwargs):
         """Forward 方法（实际训练逻辑在 train_step 中）"""
