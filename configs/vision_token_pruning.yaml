@@ -176,11 +176,11 @@ method_settings:
   # ==================== Sparsity Loss配置 ====================
   # ATP-LLaVA: λ_target=0.2, λ_ATP=0.01-0.1 (相对于L_ntp=1)
   sparsity_loss_only_on_excess: false
-  sparsity_warmup_enable: false
+  sparsity_warmup_enable: true
   sparsity_weight: 2.0  # 提高以增加剪枝量
-  sparsity_weight_max: 2.0
-  sparsity_warmup_ratio: 0.0
-  atp_loss_weight: 0.7  # 使用原始层索引(5,15,25)作为权重，降低以避免过度惩罚
+  sparsity_weight_max: 4.0
+  sparsity_warmup_ratio: 0.5
+  atp_loss_weight: 1.5  # 使用原始层索引(5,15,25)作为权重，降低以避免过度惩罚
   balance_loss_weight: 2.5  # 新增：惩罚各层保留率差异过大
 
   # ==================== Temperature配置 ====================
