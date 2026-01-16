@@ -374,11 +374,16 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         layer_pruners_losses["sparsity_loss"] = sparsity_constraint_loss
 
         # L_ATP: 层深度加权惩罚项（鼓励早期剪枝）
-        # 使用相对索引 (1, 2, 3, ...) 而不是原始层索引，使各层权重更均衡
+        # 使用相对位置 (1, 2, 3) 作为权重，使深层剪枝的惩罚更重
         atp_loss = torch.tensor(0.0, device=device)
-        for i, (layer_idx, mask) in enumerate(zip(pruning_layers, pruning_masks)):
-            atp_loss = atp_loss + mask.mean().to(device) * (i + 1)
+        for relative_idx, mask in enumerate(pruning_masks, start=1):
+            atp_loss = atp_loss + mask.mean().to(device) * relative_idx
         layer_pruners_losses["atp_loss"] = atp_loss
+
+        # Layer Balance Loss: 惩罚各层保留率差异过大
+        layer_keep_ratios = torch.stack([mask.mean().to(device) for mask in pruning_masks])
+        balance_loss = layer_keep_ratios.std()
+        layer_pruners_losses["balance_loss"] = balance_loss
 
         # 统计信息
         for idx, mask in enumerate(pruning_masks):
@@ -391,7 +396,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
         # 立即清理sparsity计算的中间变量
         del kept_ratios, avg_kept_ratio, cumulative_mask, final_kept_ratio, cumulative_ratios
-        del sparsity_constraint_loss, atp_loss
+        del sparsity_constraint_loss, atp_loss, balance_loss, layer_keep_ratios
         if sparsity_loss_only_on_excess:
             del excess
 
@@ -463,6 +468,7 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
 
     sparsity_weight = get_current_sparsity_weight(config, current_step, total_steps)
     atp_weight = config['method_settings'].get('atp_loss_weight', 1.0)
+    balance_weight = config['method_settings'].get('balance_loss_weight', 0.1)
 
     stats["current_task_weight"] = float(task_weight)
     stats["current_adv_weight"] = float(adv_weight)
@@ -475,6 +481,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         stats["raw_sparsity_loss"] = layer_pruners_losses["sparsity_loss"].item()
     if "atp_loss" in layer_pruners_losses:
         stats["raw_atp_loss"] = layer_pruners_losses["atp_loss"].item()
+    if "balance_loss" in layer_pruners_losses:
+        stats["raw_balance_loss"] = layer_pruners_losses["balance_loss"].item()
 
     # 应用权重
     layer_pruners_losses["adv_loss"] = layer_pruners_losses["adv_loss"] * adv_weight
@@ -483,6 +491,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         layer_pruners_losses["sparsity_loss"] = layer_pruners_losses["sparsity_loss"] * sparsity_weight
     if "atp_loss" in layer_pruners_losses:
         layer_pruners_losses["atp_loss"] = layer_pruners_losses["atp_loss"] * atp_weight
+    if "balance_loss" in layer_pruners_losses:
+        layer_pruners_losses["balance_loss"] = layer_pruners_losses["balance_loss"] * balance_weight
 
     # 确保tensor在正确设备上
     target_device = next(layer_pruners.parameters()).device

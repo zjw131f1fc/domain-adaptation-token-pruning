@@ -177,10 +177,11 @@ method_settings:
   # ATP-LLaVA: λ_target=0.2, λ_ATP=0.01-0.1 (相对于L_ntp=1)
   sparsity_loss_only_on_excess: false
   sparsity_warmup_enable: false
-  sparsity_weight: 4.0  # 提高以增加剪枝量
-  sparsity_weight_max: 4.0
+  sparsity_weight: 2.0  # 提高以增加剪枝量
+  sparsity_weight_max: 2.0
   sparsity_warmup_ratio: 0.0
-  atp_loss_weight: 1.0  # 提高以鼓励早期剪枝
+  atp_loss_weight: 0.7  # 使用原始层索引(5,15,25)作为权重，降低以避免过度惩罚
+  balance_loss_weight: 2.5  # 新增：惩罚各层保留率差异过大
 
   # ==================== Temperature配置 ====================
   temperature: 1.5  # Gumbel-Softmax 适用
@@ -194,7 +195,7 @@ method_settings:
   disc_num_layers: 3
   disc_d_d: 512
   disc_dropout: 0.2
-  disc_target_layers: [8, 18, 28]
+  disc_target_layers: [7, 17, 27]  # 上提一层，更接近剪枝层[5,15,25]
   disc_reinit_prob: 0.1  # 防止D过强
   disc_use_spectral_norm: false
 
