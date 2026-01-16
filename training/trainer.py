@@ -10,6 +10,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import EvalLoopOutput
 from typing import Dict, Any, Optional, List, Union, Tuple
@@ -65,6 +66,13 @@ class PruningTrainer(Trainer):
         if hasattr(self.model, "module"):
             return self.model.module.backbone
         return self.model.backbone
+
+    @property
+    def backbone_model(self):
+        """获取 backbone_model（用于 FSDP summon_full_params）"""
+        if hasattr(self.model, "module"):
+            return self.model.module.backbone_model
+        return self.model.backbone_model
 
     @property
     def layer_pruners(self):
@@ -201,8 +209,12 @@ class PruningTrainer(Trainer):
             "persistent_state": {},
         }
 
-        # 调用原有的 train_step
-        outputs = train_step(inputs, device, info)
+        # 调用原有的 train_step（在 FSDP 环境下 summon 整个模型的参数）
+        if isinstance(self.model, FSDP):
+            with FSDP.summon_full_params(self.model, writeback=False):
+                outputs = train_step(inputs, device, info)
+        else:
+            outputs = train_step(inputs, device, info)
 
         # === 处理 Discriminator 的 backward 和 step ===
         # Discriminator 使用独立优化器，不走 Trainer 的自动 backward

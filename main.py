@@ -121,7 +121,7 @@ def main():
         save_total_limit=3,
         remove_unused_columns=False,
         dataloader_num_workers=0,
-        fp16=torch.cuda.is_available() and trainer_cfg.get("fp16", True),
+        fp16=False,  # 使用 fp32 训练
         bf16=trainer_cfg.get("bf16", False),
         gradient_accumulation_steps=trainer_cfg.get("gradient_accumulation_steps", 1),
         max_grad_norm=trainer_cfg.get("grad_clip_max_norm", 1.0),
