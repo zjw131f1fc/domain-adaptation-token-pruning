@@ -2,3 +2,4 @@ __pycache__
 outputs
 *.pyc
 .history
+.history_basic_trainer
