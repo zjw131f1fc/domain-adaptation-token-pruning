@@ -376,8 +376,8 @@ def train_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> 
         # L_ATP: 层深度加权惩罚项（鼓励早期剪枝）
         # 使用相对位置 (1, 2, 3) 作为权重，使深层剪枝的惩罚更重
         atp_loss = torch.tensor(0.0, device=device)
-        weights = [1, 1.25, 1.5]
-        for relative_idx, mask in enumerate(pruning_masks, start=1):
+        weights = [1, 1.5, 2]
+        for relative_idx, mask in enumerate(pruning_masks):
             atp_loss = atp_loss + mask.mean().to(device) * weights[relative_idx]
         layer_pruners_losses["atp_loss"] = atp_loss
 
