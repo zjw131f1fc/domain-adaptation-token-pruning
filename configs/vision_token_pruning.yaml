@@ -177,15 +177,15 @@ method_settings:
   # ATP-LLaVA: λ_target=0.2, λ_ATP=0.01-0.1 (相对于L_ntp=1)
   sparsity_loss_only_on_excess: false
   sparsity_warmup_enable: true
-  sparsity_weight: 20.0  # 提高以增加剪枝量
-  sparsity_weight_max: 30.0
+  sparsity_weight: 15.0  # 适当降低，避免过度剪枝
+  sparsity_weight_max: 20.0
   sparsity_warmup_ratio: 0.5
   atp_loss_weight: 8.0  # 使用原始层索引(5,15,25)作为权重，降低以避免过度惩罚
-  balance_loss_weight: 2.5  # 新增：惩罚各层保留率差异过大
+  balance_loss_weight: 4.0  # 提高以强制各层剪枝更均匀
 
   # ==================== Temperature配置 ====================
-  temperature: 2.0  # Gumbel-Softmax 适用
-  temperature_min: 0.5
+  temperature: 1.0  # 降低初始温度，让早期决策更稳定
+  temperature_min: 0.3
   temperature_anneal_rate: 0.7
 
   # ==================== Hard Pruning配置 ====================
@@ -195,7 +195,7 @@ method_settings:
   disc_num_layers: 3
   disc_d_d: 512
   disc_dropout: 0.2
-  disc_target_layers: [8, 18, 28]  # 上提一层，更接近剪枝层[5,15,25]
+  disc_target_layers: [6, 16, 26]  # 剪枝层+2，过滤噪声同时保持信号强度
   disc_reinit_prob: 0.1  # 防止D过强
   disc_use_spectral_norm: false
 

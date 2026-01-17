@@ -698,11 +698,17 @@ def register_hard_pruning_at_model_level(
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # 判断是否是 decode 模式：
+        # - prefill 阶段：past_key_values 为空或长度为 0
+        # - decode 阶段：past_key_values 有内容，且当前输入只有 1 个 token
         seq_len = inputs_embeds.shape[1]
-        if seq_len < 50:
-            context.set_decode_mode(True)
-        else:
-            context.set_decode_mode(False)
+        is_decode = (
+            past_key_values is not None and
+            len(past_key_values.layers) > 0 and
+            past_key_values.get_seq_length() > 0 and
+            seq_len == 1
+        )
+        context.set_decode_mode(is_decode)
 
         causal_mask = create_causal_mask(
             config=self.config,
@@ -739,20 +745,36 @@ def register_hard_pruning_at_model_level(
                 new_seq_len = hidden_states.shape[1]
 
                 if new_seq_len != old_seq_len and kept_position_indices is not None:
-                    past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-                    original_position_ids = position_ids[0]
+                    # === 关键修复：同步更新之前所有层的 KV cache ===
+                    # 剪枝后，需要保持所有层的 KV cache 长度一致
+                    # 否则 decode 时 position_ids 会错乱
+                    if past_key_values is not None and len(past_key_values.layers) > 0:
+                        # kept_position_indices 是保留的全局位置索引
+                        # 需要转换为 KV cache 中的序列索引
+                        kv_seq_indices = kept_position_indices.to(past_key_values.layers[0].keys.device)
 
-                    if kept_position_indices.device != original_position_ids.device:
-                        kept_position_indices = kept_position_indices.to(original_position_ids.device)
+                        # 更新 layer 0 到 layer_idx（包含）的 KV cache
+                        for prev_layer_idx in range(layer_idx + 1):
+                            if prev_layer_idx < len(past_key_values.layers):
+                                layer_cache = past_key_values.layers[prev_layer_idx]
+                                # KV shape: (batch, num_heads, seq_len, head_dim)
+                                # 选择保留的 token（在 seq 维度）
+                                layer_cache.keys = layer_cache.keys[:, :, kv_seq_indices, :]
+                                layer_cache.values = layer_cache.values[:, :, kv_seq_indices, :]
 
-                    kept_position_ids = original_position_ids[kept_position_indices]
-                    position_ids = kept_position_ids.unsqueeze(0)
-                    cache_position = kept_position_ids
+                    # 更新 position_ids：使用连续的新位置（从 0 开始）
+                    # 因为 KV cache 已经被裁剪，位置应该重新从 0 计数
+                    position_ids = torch.arange(
+                        0, new_seq_len, device=hidden_states.device
+                    ).unsqueeze(0)
+                    cache_position = position_ids[0]
                     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
                     if attention_mask is not None:
-                        new_attention_mask = attention_mask[:, kept_position_indices]
-                        attention_mask = new_attention_mask
+                        # attention_mask 也需要更新
+                        attention_mask = torch.ones(
+                            1, new_seq_len, device=hidden_states.device, dtype=attention_mask.dtype
+                        )
 
                     temp_inputs_embeds = torch.zeros(1, new_seq_len, hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype)
 

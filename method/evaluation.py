@@ -80,6 +80,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                 pred_baseline = backbone.generate(
                     sample["image"], sample["question"], max_new_tokens=20
                 )
+                print(f"[BASELINE] pred: {pred_baseline[:50]}... | ref: {str(ref_answer)[:50]}...")
                 judge_result = judge_fn(pred_baseline, ref_answer, sample)
                 results["accuracy_baseline"] += judge_result["accuracy"]
 
@@ -203,6 +204,7 @@ def eval_step(batch: List[Any], device: torch.device, info: Dict[str, Any]) -> D
                             attention_mask=new_attention_mask.clone(),
                             max_new_tokens=20
                         )
+                    print(f"[HARD] pred: {pred_hard[:50]}... | ref: {str(ref_answer)[:50]}...")
                     judge_result = judge_fn(pred_hard, ref_answer, sample)
                     results["accuracy_hard"] += judge_result["accuracy"]
 
