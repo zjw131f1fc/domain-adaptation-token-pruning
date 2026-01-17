@@ -39,7 +39,7 @@ trainer_settings:
         type: "adam"
         lr: 1.0e-04  # 参考ATP-LLaVA的ATP Module学习率
     print_loss_every_batches: 50
-    eval_every_batches: 800
+    eval_every_batches: 500
     eval_max_samples: 500
     save_every_batches: 3000
     save_every_epochs: 1
@@ -161,7 +161,7 @@ method_settings:
   pruner_d_internal: 512
   pruner_num_heads: 4
   pruner_type: "cross_attention"
-  pruner_dropout: 0.1
+  pruner_dropout: 0.2
 
   # Attention Residual配置
   use_attn_residual: false
@@ -178,7 +178,7 @@ method_settings:
   sparsity_loss_only_on_excess: false
   sparsity_warmup_enable: true
   sparsity_weight: 20.0  # 提高以增加剪枝量
-  sparsity_weight_max: 25.0
+  sparsity_weight_max: 30.0
   sparsity_warmup_ratio: 0.5
   atp_loss_weight: 8.0  # 使用原始层索引(5,15,25)作为权重，降低以避免过度惩罚
   balance_loss_weight: 2.5  # 新增：惩罚各层保留率差异过大
@@ -206,8 +206,8 @@ method_settings:
   # - adv_loss是GAN信号，确保剪枝后表示质量
   # - 两者需要平衡：task_loss太大会忽略GAN，adv_loss太大会忽略任务
 
-  task_loss_weight_start: 3.0
-  task_loss_weight: 2  # 提高以优先保证任务性能
+  task_loss_weight_start: 4.0
+  task_loss_weight: 3.0  # 提高以优先保证任务性能
 
   adv_loss_weight_start: 0.7
   adv_loss_weight: 1.7  # 比task_loss小，优先保证任务性能
