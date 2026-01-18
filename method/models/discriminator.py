@@ -54,10 +54,15 @@ class Discriminator(nn.Module):
         self.fusion_linear1 = maybe_spectral_norm(nn.Linear(d_d * num_layers, d_d))
         self.fusion_linear2 = maybe_spectral_norm(nn.Linear(d_d, d_d))
         self.fusion_linear3 = maybe_spectral_norm(nn.Linear(d_d, 1))
-        
+
         # Optional input normalization - 每层独立的 LayerNorm（与 pruner 保持一致）
         if use_layer_norm:
             self.input_norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
+
+        # 中间层归一化 - 防止梯度爆炸
+        self.mid_norms = nn.ModuleList([nn.LayerNorm(d_d) for _ in range(num_layers)])
+        self.fusion_norm1 = nn.LayerNorm(d_d)
+        self.fusion_norm2 = nn.LayerNorm(d_d)
 
         # Register linear layers as ModuleList
         self.first_linears = nn.ModuleList(self.first_linears)
@@ -129,6 +134,7 @@ class Discriminator(nn.Module):
 
             # First linear layer with GELU
             h = self.first_linears[i](h)       # (N, d_d)
+            h = self.mid_norms[i](h)           # 归一化防止梯度爆炸
             h = F.gelu(h)                      # (N, d_d)
             h = self.dropout(h)                # (N, d_d)
 
@@ -137,14 +143,16 @@ class Discriminator(nn.Module):
             h = h + h_res                      # residual connection
 
             layer_outputs.append(h)
-        
+
         # Concatenate all layer outputs
         h_fused = torch.cat(layer_outputs, dim=-1)  # (N, d_d * num_layers)
-        
+
         # Fusion layer
         h_fused = self.fusion_linear1(h_fused)  # (N, d_d)
+        h_fused = self.fusion_norm1(h_fused)    # 归一化
         h_fused = F.gelu(h_fused)
         h_fused = self.fusion_linear2(h_fused)  # (N, d_d)
+        h_fused = self.fusion_norm2(h_fused)    # 归一化
         h_fused = F.gelu(h_fused)
         logits = self.fusion_linear3(h_fused)  # (N, 1)
         logits = logits.squeeze(-1)  # (N,)
@@ -196,6 +204,7 @@ class Discriminator(nn.Module):
 
             # First linear layer with GELU
             h = self.first_linears[i](h)
+            h = self.mid_norms[i](h)           # 归一化防止梯度爆炸
             h = F.gelu(h)
             h = self.dropout(h)
 
@@ -205,12 +214,18 @@ class Discriminator(nn.Module):
             h = F.gelu(h)
 
             layer_outputs.append(h)
-        
+
         # Concatenate all layer outputs
         h_fused = torch.cat(layer_outputs, dim=-1)
-        
+
         # Fusion layer
-        logits = self.fusion_linear(h_fused)  # (N, 1)
+        h_fused = self.fusion_linear1(h_fused)  # (N, d_d)
+        h_fused = self.fusion_norm1(h_fused)    # 归一化
+        h_fused = F.gelu(h_fused)
+        h_fused = self.fusion_linear2(h_fused)  # (N, d_d)
+        h_fused = self.fusion_norm2(h_fused)    # 归一化
+        h_fused = F.gelu(h_fused)
+        logits = self.fusion_linear3(h_fused)  # (N, 1)
         logits = logits.squeeze(-1)  # (N,)
         
         if reshape_needed:

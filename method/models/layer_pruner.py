@@ -135,6 +135,7 @@ class VisionPrunerHead(nn.Module):
         # 输入: cross-attention后的vision features
         # 输出: 每个token的keep/drop logit
         self.mask_fc1 = nn.Linear(d_internal, d_internal // 2)
+        self.mask_norm = nn.LayerNorm(d_internal // 2)  # 防止梯度爆炸
         self.mask_act = nn.GELU()
         self.mask_dropout = nn.Dropout(0.1)
         self.mask_fc2 = nn.Linear(d_internal // 2, 1)
@@ -208,6 +209,7 @@ class VisionPrunerHead(nn.Module):
 
         # === Step 5: 预测keep/drop logits ===
         mask_hidden = self.mask_fc1(attended_V)
+        mask_hidden = self.mask_norm(mask_hidden)  # 归一化防止梯度爆炸
         mask_hidden = self.mask_act(mask_hidden)
         mask_hidden = self.mask_dropout(mask_hidden)
         keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
