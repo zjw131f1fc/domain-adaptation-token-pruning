@@ -1,0 +1,307 @@
+"""Attention Consistency Pruning - Layer Discriminator
+
+判别单个 answer token 的 attention 聚合结果是 real 还是 fake。
+
+设计理念：
+- 每个 answer token 独立判别（粒度更细，信号更强）
+- 输入是 attention 聚合后的结果 h = Σ attn[i] * V[i]
+- 不是判别 hidden states，而是判别 attention 聚合结果
+- 轻量级网络，避免判别器过强
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
+
+
+class LayerDiscriminator(nn.Module):
+    """单层 Attention 聚合结果判别器
+
+    判别单个 answer token 从前面 positions 聚合的 h 是 real 还是 fake。
+
+    参数:
+        num_heads: attention 头数
+        head_dim: 每个头的维度
+        d_hidden: MLP 隐藏层维度
+        dropout: Dropout 比例
+        use_spectral_norm: 是否使用谱归一化（提高训练稳定性）
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        d_hidden: int = 256,
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.input_dim = num_heads * head_dim
+
+        # 构建网络层
+        layers = []
+
+        # Layer 1
+        linear1 = nn.Linear(self.input_dim, d_hidden)
+        if use_spectral_norm:
+            linear1 = nn.utils.spectral_norm(linear1)
+        layers.extend([
+            linear1,
+            nn.LayerNorm(d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        ])
+
+        # Layer 2
+        linear2 = nn.Linear(d_hidden, d_hidden)
+        if use_spectral_norm:
+            linear2 = nn.utils.spectral_norm(linear2)
+        layers.extend([
+            linear2,
+            nn.LayerNorm(d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        ])
+
+        # Output layer
+        linear3 = nn.Linear(d_hidden, 1)
+        if use_spectral_norm:
+            linear3 = nn.utils.spectral_norm(linear3)
+        layers.append(linear3)
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """判别 attention 聚合结果
+
+        参数:
+            h: (batch, heads, head_dim) - 单个 answer token 的聚合结果
+               或 (batch, heads, n_ans, head_dim) - 多个 answer tokens
+
+        返回:
+            logit: (batch,) 或 (batch, n_ans) - real/fake 判断的 logit
+        """
+        if h.dim() == 3:
+            # 单个 answer token: (batch, heads, head_dim)
+            h_flat = h.view(h.shape[0], -1)  # (batch, heads * head_dim)
+            return self.net(h_flat).squeeze(-1)  # (batch,)
+        elif h.dim() == 4:
+            # 多个 answer tokens: (batch, heads, n_ans, head_dim)
+            batch, heads, n_ans, head_dim = h.shape
+            # Reshape: (batch, heads, n_ans, head_dim) -> (batch, n_ans, heads, head_dim)
+            h = h.permute(0, 2, 1, 3)
+            # Flatten: (batch, n_ans, heads * head_dim)
+            h_flat = h.reshape(batch, n_ans, -1)
+            # 对每个 answer token 判别: (batch, n_ans, 1) -> (batch, n_ans)
+            return self.net(h_flat).squeeze(-1)
+        else:
+            raise ValueError(f"Expected 3D or 4D tensor, got {h.dim()}D")
+
+    def forward_batch_answers(
+        self,
+        h: torch.Tensor,
+        reduce: str = 'mean'
+    ) -> torch.Tensor:
+        """对多个 answer tokens 的聚合结果进行判别
+
+        参数:
+            h: (batch, heads, n_ans, head_dim) - 多个 answer tokens 的聚合结果
+            reduce: 如何聚合多个 answer tokens 的判别结果
+                   'mean': 平均
+                   'sum': 求和
+                   'none': 不聚合
+
+        返回:
+            logit: (batch,) 或 (batch, n_ans) - 判别结果
+        """
+        logits = self.forward(h)  # (batch, n_ans)
+
+        if reduce == 'mean':
+            return logits.mean(dim=-1)  # (batch,)
+        elif reduce == 'sum':
+            return logits.sum(dim=-1)  # (batch,)
+        elif reduce == 'none':
+            return logits  # (batch, n_ans)
+        else:
+            raise ValueError(f"Unknown reduce mode: {reduce}")
+
+
+class LayerDiscriminatorManager(nn.Module):
+    """多层判别器管理器
+
+    管理多个层的 LayerDiscriminator，提供统一接口。
+
+    参数:
+        layer_indices: 要判别的层索引列表（与 pruning_layers 相同）
+        num_heads: attention 头数
+        head_dim: 每个头的维度
+        d_hidden: MLP 隐藏层维度
+        dropout: Dropout 比例
+        use_spectral_norm: 是否使用谱归一化
+    """
+
+    def __init__(
+        self,
+        layer_indices: list,
+        num_heads: int,
+        head_dim: int,
+        d_hidden: int = 256,
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False
+    ):
+        super().__init__()
+        self.layer_indices = layer_indices
+
+        # 为每层创建独立的判别器
+        self.discriminators = nn.ModuleDict({
+            str(idx): LayerDiscriminator(
+                num_heads=num_heads,
+                head_dim=head_dim,
+                d_hidden=d_hidden,
+                dropout=dropout,
+                use_spectral_norm=use_spectral_norm
+            )
+            for idx in layer_indices
+        })
+
+    def get_discriminator(self, layer_idx: int) -> LayerDiscriminator:
+        """获取指定层的判别器"""
+        key = str(layer_idx)
+        if key not in self.discriminators:
+            raise ValueError(f"No discriminator for layer {layer_idx}. Available: {self.layer_indices}")
+        return self.discriminators[key]
+
+    def compute_disc_loss(
+        self,
+        h_real_dict: dict,
+        h_fake_dict: dict,
+        reduce: str = 'mean'
+    ) -> torch.Tensor:
+        """计算所有层的判别器损失
+
+        参数:
+            h_real_dict: {layer_idx: h_real} - 每层的真实聚合结果
+            h_fake_dict: {layer_idx: h_fake} - 每层的剪枝后聚合结果
+            reduce: 如何聚合 answer tokens 的判别结果
+
+        返回:
+            disc_loss: 判别器总损失
+        """
+        total_loss = 0
+        for layer_idx in self.layer_indices:
+            key = str(layer_idx)
+            h_real = h_real_dict[layer_idx]
+            h_fake = h_fake_dict[layer_idx]
+
+            disc = self.discriminators[key]
+
+            # 真实样本应该被判为 1
+            real_pred = disc.forward_batch_answers(h_real, reduce=reduce)
+            real_loss = F.binary_cross_entropy_with_logits(
+                real_pred, torch.ones_like(real_pred)
+            )
+
+            # 假样本应该被判为 0（注意：h_fake 要 detach）
+            fake_pred = disc.forward_batch_answers(h_fake.detach(), reduce=reduce)
+            fake_loss = F.binary_cross_entropy_with_logits(
+                fake_pred, torch.zeros_like(fake_pred)
+            )
+
+            total_loss = total_loss + real_loss + fake_loss
+
+        return total_loss
+
+    def compute_adv_loss(
+        self,
+        h_fake_dict: dict,
+        reduce: str = 'mean'
+    ) -> torch.Tensor:
+        """计算所有层的对抗损失（用于训练 Pruner）
+
+        参数:
+            h_fake_dict: {layer_idx: h_fake} - 每层的剪枝后聚合结果
+            reduce: 如何聚合 answer tokens 的判别结果
+
+        返回:
+            adv_loss: 对抗损失
+        """
+        total_loss = 0
+        for layer_idx in self.layer_indices:
+            key = str(layer_idx)
+            h_fake = h_fake_dict[layer_idx]
+
+            disc = self.discriminators[key]
+
+            # Pruner 的目标：让 fake 被判为 real (1)
+            fake_pred = disc.forward_batch_answers(h_fake, reduce=reduce)
+            adv_loss = F.binary_cross_entropy_with_logits(
+                fake_pred, torch.ones_like(fake_pred)
+            )
+
+            total_loss = total_loss + adv_loss
+
+        return total_loss
+
+    def compute_accuracy(
+        self,
+        h_real_dict: dict,
+        h_fake_dict: dict,
+        reduce: str = 'mean'
+    ) -> dict:
+        """计算判别器准确率（用于监控）
+
+        返回:
+            accuracy_dict: {
+                'overall': float,
+                'real_acc': float,
+                'fake_acc': float,
+                'per_layer': {layer_idx: (real_acc, fake_acc)}
+            }
+        """
+        all_real_correct = 0
+        all_fake_correct = 0
+        all_real_total = 0
+        all_fake_total = 0
+
+        per_layer = {}
+
+        with torch.no_grad():
+            for layer_idx in self.layer_indices:
+                key = str(layer_idx)
+                h_real = h_real_dict[layer_idx]
+                h_fake = h_fake_dict[layer_idx]
+
+                disc = self.discriminators[key]
+
+                real_pred = disc.forward_batch_answers(h_real, reduce=reduce)
+                fake_pred = disc.forward_batch_answers(h_fake, reduce=reduce)
+
+                real_correct = (real_pred > 0).sum().item()
+                fake_correct = (fake_pred < 0).sum().item()
+                real_total = real_pred.numel()
+                fake_total = fake_pred.numel()
+
+                per_layer[layer_idx] = (
+                    real_correct / real_total if real_total > 0 else 0,
+                    fake_correct / fake_total if fake_total > 0 else 0
+                )
+
+                all_real_correct += real_correct
+                all_fake_correct += fake_correct
+                all_real_total += real_total
+                all_fake_total += fake_total
+
+        real_acc = all_real_correct / all_real_total if all_real_total > 0 else 0
+        fake_acc = all_fake_correct / all_fake_total if all_fake_total > 0 else 0
+        overall = (all_real_correct + all_fake_correct) / (all_real_total + all_fake_total) \
+            if (all_real_total + all_fake_total) > 0 else 0
+
+        return {
+            'overall': overall,
+            'real_acc': real_acc,
+            'fake_acc': fake_acc,
+            'per_layer': per_layer
+        }
