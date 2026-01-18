@@ -40,6 +40,11 @@ class Config:
     method_settings: Dict[str, Any]
     evaluation_settings: Dict[str, Any]
     logger: Any = None
+    _raw: Dict[str, Any] = None  # 保留原始 dict 用于 loader
+
+    def __getitem__(self, key):
+        """支持 dict-like 访问，用于兼容 loader"""
+        return getattr(self, key)
 
     @classmethod
     def from_yaml(cls, path: str) -> 'Config':
@@ -52,6 +57,7 @@ class Config:
             backbone_settings=data.get('backbone_settings', {}),
             method_settings=data.get('method_settings', {}),
             evaluation_settings=data.get('evaluation_settings', {}),
+            _raw=data,
         )
 
 
@@ -534,14 +540,15 @@ def train(config: Config):
 
     # 加载数据
     print("Loading dataset...")
-    from engine.datas.impl.vqa_v2 import VQAV2Preparer
-    data_preparer = VQAV2Preparer(config)
-    data_bundle = data_preparer.get()
+    from engine.datas.loader import load_dataset
+    data_bundle = load_dataset(config)
 
     train_dataset = data_bundle['splits']['train']
     test_dataset = data_bundle['splits'].get('test', None)
     judge = data_bundle['judge']
 
+    dataset_name = config.dataset_settings.get('name', 'unknown')
+    print(f"Dataset: {dataset_name}")
     print(f"Train samples: {len(train_dataset)}")
     if test_dataset:
         print(f"Test samples: {len(test_dataset)}")
