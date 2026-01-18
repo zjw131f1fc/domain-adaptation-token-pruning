@@ -305,15 +305,13 @@ def create_layer_pruning_modifier(
                 attention_storage['attn_weights'] = None
 
         # === Step 3: 调用pruner生成soft_mask ===
-        # 将question_mask转换为key_padding_mask格式（True表示要mask掉的位置）
-        key_padding_mask = None
-        if question_mask is not None:
-            key_padding_mask = ~question_mask  # 反转：False变True（padding位置要mask）
+        # 注意：新架构中 Question→Vision，vision 通常没有 padding，传 None
+        # question_mask 不再需要，因为 question 现在是 query 而不是 key
 
         with torch.enable_grad():
             soft_mask = pruner(vision_hidden, question_embeddings,
                              text_to_vision_attn=text_to_vision_attn,
-                             key_padding_mask=key_padding_mask)
+                             key_padding_mask=None)  # vision 没有 padding
 
         # === Step 4: 收集mask ===
         if mask_collector is not None:

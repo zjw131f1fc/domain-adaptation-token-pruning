@@ -77,20 +77,22 @@ class LayerSpecificPruner(nn.Module):
 class VisionPrunerHead(nn.Module):
     """单层Vision Token剪枝头
 
-    架构：Cross-Attention + MLP + 多层LayerNorm
-    - Vision tokens关注question embeddings（cross-attention）
-    - 基于融合后的表示预测每个vision token的保留/丢弃决策
-    - 多层归一化保证训练稳定性
-    - **可选**: 残差连接text→vision attention作为额外信号
+    架构：Question→Vision Cross-Attention + MLP微调
+
+    核心思想：
+    - Question tokens 作为 Query，Vision tokens 作为 Key/Value
+    - Attention weights 直接表示 "question 关注哪些 vision tokens"
+    - 这是天然的重要性指标，比间接学习更有效
+    - MLP 只做微调，主要依赖 attention weights
 
     参数:
         d_vision: vision token的hidden state维度
         d_text: text embedding维度
         d_internal: 内部处理维度
         num_heads: cross-attention头数
-        use_attn_residual: 是否使用attention residual（默认False）
-        attn_residual_weight: residual权重（可以是固定值或可学习参数）
-        learnable_attn_weight: residual weight是否可学习
+        use_attn_residual: 是否使用LLM内部的attention作为额外信号
+        attn_residual_weight: LLM attention的权重
+        learnable_attn_weight: 权重是否可学习
     """
 
     def __init__(
@@ -105,6 +107,7 @@ class VisionPrunerHead(nn.Module):
     ):
         super().__init__()
         self.d_internal = d_internal
+        self.num_heads = num_heads
         self.use_attn_residual = use_attn_residual
 
         # === 1. 输入归一化层 ===
@@ -119,8 +122,9 @@ class VisionPrunerHead(nn.Module):
         self.vision_proj_norm = nn.LayerNorm(d_internal)
         self.text_proj_norm = nn.LayerNorm(d_internal)
 
-        # === 4. Cross-Attention: vision tokens关注question ===
-        # 这使得剪枝决策能够基于问题内容
+        # === 4. Cross-Attention: Question → Vision ===
+        # Query = Question, Key/Value = Vision
+        # Attention weights 直接表示每个 vision token 的重要性
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_internal,
             num_heads=num_heads,
@@ -128,31 +132,31 @@ class VisionPrunerHead(nn.Module):
             batch_first=True
         )
 
-        # === 5. Attention后归一化 ===
-        self.post_attn_norm = nn.LayerNorm(d_internal)
+        # === 5. 重要性微调 MLP ===
+        # 输入: attention-based importance (1维)
+        # 输出: 微调后的 keep logit
+        self.importance_norm = nn.LayerNorm(1)
+        self.refine_mlp = nn.Sequential(
+            nn.Linear(1, d_internal // 4),
+            nn.LayerNorm(d_internal // 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_internal // 4, 1)
+        )
 
-        # === 6. Mask预测头 ===
-        # 输入: cross-attention后的vision features
-        # 输出: 每个token的keep/drop logit
-        self.mask_fc1 = nn.Linear(d_internal, d_internal // 2)
-        self.mask_norm = nn.LayerNorm(d_internal // 2)  # 防止梯度爆炸
-        self.mask_act = nn.GELU()
-        self.mask_dropout = nn.Dropout(0.1)
-        self.mask_fc2 = nn.Linear(d_internal // 2, 1)
+        # 可学习的 attention 权重（控制 attention importance 的贡献）
+        self.attn_importance_weight = nn.Parameter(torch.tensor(1.0))
 
-        # 使用标准初始化，不引入偏置
-        # 让模型从中性状态开始学习（sigmoid(0) = 0.5）
-        nn.init.xavier_uniform_(self.mask_fc2.weight)
-        nn.init.zeros_(self.mask_fc2.bias)
+        # 初始化：让 MLP 输出接近 0，主要依赖 attention
+        nn.init.zeros_(self.refine_mlp[-1].weight)
+        nn.init.zeros_(self.refine_mlp[-1].bias)
 
-        # === 7. Attention Residual配置（可选） ===
+        # === 6. LLM Attention Residual配置（可选） ===
         if self.use_attn_residual:
             if learnable_attn_weight:
-                # 可学习的residual weight
-                self.attn_residual_weight = nn.Parameter(torch.tensor(attn_residual_weight))
+                self.llm_attn_weight = nn.Parameter(torch.tensor(attn_residual_weight))
             else:
-                # 固定的residual weight（注册为buffer，不参与优化）
-                self.register_buffer('attn_residual_weight', torch.tensor(attn_residual_weight))
+                self.register_buffer('llm_attn_weight', torch.tensor(attn_residual_weight))
 
         # Temperature（外部动态更新）
         self.temperature = 1.0
@@ -171,8 +175,9 @@ class VisionPrunerHead(nn.Module):
             vision_hidden: (batch, n_vision, d_vision) - 当前层的vision token hidden states
             question_embeddings: (batch, n_text, d_text) - question embeddings
             use_gumbel: bool - 是否使用Gumbel-Softmax（训练时True）
-            text_to_vision_attn: (batch, n_vision) - 可选的text→vision attention平均值
-            key_padding_mask: (batch, n_text) - True表示要mask掉的位置（padding）
+            text_to_vision_attn: (batch, n_vision) - 可选的LLM内部text→vision attention
+            key_padding_mask: (batch, n_vision) - True表示要mask掉的位置（padding）
+                             注意：现在是 vision 的 padding mask，因为 vision 是 Key
 
         返回:
             soft_mask: (batch, n_vision) - 每个token的保留概率，范围[0, 1]
@@ -194,35 +199,44 @@ class VisionPrunerHead(nn.Module):
         Q = self.text_proj(text_normed)  # (batch, n_text, d_internal)
         Q = self.text_proj_norm(Q)
 
-        # === Step 3: Cross-Attention - vision关注question ===
-        # query=V (vision tokens), key=Q, value=Q (question)
-        attended_V, attn_weights = self.cross_attn(
-            query=V,
-            key=Q,
-            value=Q,
-            key_padding_mask=key_padding_mask,
-            need_weights=False
-        )  # (batch, n_vision, d_internal)
+        # === Step 3: Cross-Attention - Question → Vision ===
+        # Query = Q (question), Key = V, Value = V (vision)
+        # attn_weights: (batch, n_text, n_vision) - 每个 question token 对每个 vision token 的注意力
+        _, attn_weights = self.cross_attn(
+            query=Q,      # question tokens 作为 query
+            key=V,        # vision tokens 作为 key
+            value=V,      # vision tokens 作为 value
+            key_padding_mask=key_padding_mask,  # vision 的 padding mask
+            need_weights=True,
+            average_attn_weights=True  # 返回 head 平均后的权重
+        )  # attn_weights: (batch, n_text, n_vision)
 
-        # === Step 4: Post-Attention归一化 + 残差连接 ===
-        attended_V = self.post_attn_norm(V + attended_V)  # 残差 + 归一化
+        # === Step 4: 计算每个 vision token 的重要性 ===
+        # 对所有 question tokens 求平均，得到每个 vision token 被关注的程度
+        importance = attn_weights.mean(dim=1)  # (batch, n_vision)
 
-        # === Step 5: 预测keep/drop logits ===
-        mask_hidden = self.mask_fc1(attended_V)
-        mask_hidden = self.mask_norm(mask_hidden)  # 归一化防止梯度爆炸
-        mask_hidden = self.mask_act(mask_hidden)
-        mask_hidden = self.mask_dropout(mask_hidden)
-        keep_logits = self.mask_fc2(mask_hidden).squeeze(-1)  # (batch, n_vision)
+        # === Step 5: MLP 微调 ===
+        importance_input = importance.unsqueeze(-1)  # (batch, n_vision, 1)
+        importance_input = self.importance_norm(importance_input)
+        mlp_adjustment = self.refine_mlp(importance_input).squeeze(-1)  # (batch, n_vision)
 
-        # === Step 5.5: Attention Residual（可选） ===
+        # 组合：attention importance + MLP adjustment
+        # importance 范围是 [0, 1]（softmax 输出），需要转换到 logit 空间
+        # 使用 log-odds 转换：logit = log(p / (1-p))，但需要避免数值问题
+        importance_clamped = torch.clamp(importance, min=1e-6, max=1-1e-6)
+        importance_logit = torch.log(importance_clamped / (1 - importance_clamped))
+
+        keep_logits = self.attn_importance_weight * importance_logit + mlp_adjustment
+
+        # === Step 5.5: LLM Attention Residual（可选） ===
         if self.use_attn_residual and text_to_vision_attn is not None:
-            # 确保attention在正确的设备和dtype上
             text_to_vision_attn = text_to_vision_attn.to(device=keep_logits.device, dtype=keep_logits.dtype)
-            # 残差连接：keep_logits += weight * attention
-            keep_logits = keep_logits + self.attn_residual_weight * text_to_vision_attn
+            # LLM attention 也转换到 logit 空间
+            llm_attn_clamped = torch.clamp(text_to_vision_attn, min=1e-6, max=1-1e-6)
+            llm_attn_logit = torch.log(llm_attn_clamped / (1 - llm_attn_clamped))
+            keep_logits = keep_logits + self.llm_attn_weight * llm_attn_logit
 
         # === Step 6: Gumbel-Softmax ===
-        # 将 keep_logits 转换为 [drop, keep] 的二分类 logits
         keep_logits = torch.clamp(keep_logits, min=-10.0, max=10.0)
         stacked_logits = torch.stack([
             torch.zeros_like(keep_logits),  # drop logit = 0
@@ -230,11 +244,9 @@ class VisionPrunerHead(nn.Module):
         ], dim=-1)  # (batch, n_vision, 2)
 
         if use_gumbel and self.training:
-            # 使用 PyTorch 原生 Gumbel-Softmax，hard=True 实现 STE
             y = F.gumbel_softmax(stacked_logits, tau=self.temperature, hard=True, dim=-1)
-            soft_mask = y[..., 1]  # 取 keep 的概率
+            soft_mask = y[..., 1]
         else:
-            # 推理模式：确定性 argmax
             probs = F.softmax(stacked_logits / self.temperature, dim=-1)
             soft_mask = (probs[..., 1] > 0.5).float()
 
