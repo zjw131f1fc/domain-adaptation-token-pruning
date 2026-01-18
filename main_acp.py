@@ -12,6 +12,15 @@
 
 import os
 import sys
+
+# ============================================================
+# 环境变量设置（在任何其他 import 之前）
+# ============================================================
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import yaml
 import torch
 import torch.nn.functional as F
@@ -720,13 +729,6 @@ def main():
 
     # 加载配置
     config = Config.from_yaml(args.config)
-
-    # 设置环境
-    if config.global_settings.get('pytorch_cuda_alloc_conf'):
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = config.global_settings['pytorch_cuda_alloc_conf']
-    if config.global_settings.get('hf_cache_dir'):
-        os.environ['HF_HOME'] = config.global_settings['hf_cache_dir']
-        os.environ['TRANSFORMERS_CACHE'] = config.global_settings['hf_cache_dir']
 
     # 训练
     train(config)
