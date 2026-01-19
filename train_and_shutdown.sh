@@ -2,8 +2,7 @@
 # 大规模训练脚本 - 训练完成后自动关机
 
 echo "=========================================="
-echo "开始大规模训练"
-echo "配置: 2 epochs, 50000 训练样本"
+echo "开始 Attention Consistency Pruning 训练"
 echo "=========================================="
 
 cd /projects/domain-adaptation-token-pruning
@@ -13,7 +12,7 @@ START_TIME=$(date +%s)
 echo "开始时间: $(date)"
 
 # 运行训练（无论成功失败都继续执行）
-python main.py 2>&1 | tee outputs/logs/train_$(date +%Y%m%d_%H%M%S).log
+python main_acp.py 2>&1 | tee outputs/logs/train_$(date +%Y%m%d_%H%M%S).log
 TRAIN_EXIT_CODE=${PIPESTATUS[0]}
 
 # 记录结束时间

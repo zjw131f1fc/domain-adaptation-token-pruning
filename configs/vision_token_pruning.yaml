@@ -4,7 +4,7 @@
 global_settings:
   seed: 42
   device: "cuda"
-  dtype: "float16"
+  dtype: "float32"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
   dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
   hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
@@ -13,15 +13,15 @@ global_settings:
 
 trainer_settings:
   dl_settings:
-    epochs: 1
-    batch_size: 4
+    epochs: 2
+    batch_size: 13
     optimizers:
       layer_pruners:
         type: "adam"
-        lr: 1.0e-04
+        lr: 5.0e-04  # 提高学习率，让 pruner 更快学习
       discriminator:
         type: "adam"
-        lr: 1.5e-04
+        lr: 2.0e-04
     print_loss_every_batches: 50
     eval_every_batches: 1000
     eval_max_samples: 500
@@ -44,8 +44,9 @@ method_settings:
   pruning_layers: [4, 14, 24]
 
   # ==================== Pruner 配置 ====================
-  # Pruner 接收 LLM 的 question→vision attention，输出残差调整
-  pruner_d_internal: 128
+  # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
+  pruner_d_internal: 128   # 内部特征维度
+  pruner_n_heads: 4        # Cross-attention 头数
   pruner_dropout: 0.1
 
   # ==================== Discriminator 配置 ====================
@@ -70,17 +71,17 @@ method_settings:
 
   task_loss_weight: 1.0
   adv_loss_weight: 0.5
-  sparsity_weight: 0.2
+  sparsity_weight: 5.0  # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
   task_loss_weight_start: 1.0
   adv_loss_weight_start: 0.5
 
-  # Sparsity warmup (可选)
-  sparsity_warmup_enable: false
-  sparsity_warmup_ratio: 0.2
-  sparsity_weight_max: 0.5
+  # Sparsity warmup - 启用，逐渐增加 sparsity 约束
+  sparsity_warmup_enable: true
+  sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
+  sparsity_weight_max: 10.0   # warmup 结束后达到 10.0
 
 evaluation_settings:
   eval_mode: ["origin", "hard"]

@@ -7,7 +7,7 @@
 1. 直接继承 LlavaForConditionalGeneration，不使用 hook
 2. 在剪枝层计算 h_real 和 h_fake
 3. 每个 answer token 独立判别
-4. 使用你的数据加载器和 judge 功能
+4. 使用统一的数据加载器和配置系统
 """
 
 import os
@@ -19,14 +19,12 @@ import sys
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, Any, List
 from collections import defaultdict
 from tqdm import tqdm
 
@@ -34,56 +32,26 @@ from tqdm import tqdm
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-
-# ============================================================
-# 配置加载
-# ============================================================
-
-@dataclass
-class Config:
-    """配置容器"""
-    global_settings: Dict[str, Any]
-    trainer_settings: Dict[str, Any]
-    dataset_settings: Dict[str, Any]
-    backbone_settings: Dict[str, Any]
-    method_settings: Dict[str, Any]
-    evaluation_settings: Dict[str, Any]
-    logger: Any = None
-    _raw: Dict[str, Any] = None  # 保留原始 dict 用于 loader
-
-    def __getitem__(self, key):
-        """支持 dict-like 访问，用于兼容 loader"""
-        return getattr(self, key)
-
-    @classmethod
-    def from_yaml(cls, path: str) -> 'Config':
-        with open(path, 'r') as f:
-            data = yaml.safe_load(f)
-        return cls(
-            global_settings=data.get('global_settings', {}),
-            trainer_settings=data.get('trainer_settings', {}),
-            dataset_settings=data.get('dataset_settings', {}),
-            backbone_settings=data.get('backbone_settings', {}),
-            method_settings=data.get('method_settings', {}),
-            evaluation_settings=data.get('evaluation_settings', {}),
-            _raw=data,
-        )
+# 导入配置加载器
+from engine.configs.loader import load_config
 
 
 # ============================================================
 # 模型加载与预处理
 # ============================================================
 
-def load_model(config: Config, device: torch.device):
+def load_model(config, device: torch.device):
     """加载可剪枝的 LLaVA 模型"""
     from transformers import LlavaForConditionalGeneration, AutoProcessor
 
+    logger = config.logger
     method_cfg = config.method_settings
     backbone_cfg = config.backbone_settings
 
     # 获取剪枝层配置
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
     pruner_d_internal = method_cfg.get('pruner_d_internal', 128)
+    pruner_n_heads = method_cfg.get('pruner_n_heads', 4)
     disc_d_hidden = method_cfg.get('disc_d_d', 256)
     temperature = method_cfg.get('temperature', 1.0)
     dropout = method_cfg.get('pruner_dropout', 0.1)
@@ -97,19 +65,16 @@ def load_model(config: Config, device: torch.device):
     }
     model_path = model_mapping.get(model_name, model_name)
 
-    # 缓存目录
-    cache_dir = config.global_settings.get('hf_cache_dir', None)
+    logger.info(f"Loading base model from {model_path}...")
 
-    print(f"Loading base model from {model_path}...")
-
-    # 加载基础模型和处理器
+    # 加载基础模型和处理器（使用 HF_HOME 环境变量作为缓存目录）
+    # 使用 float32 避免精度问题
     base_model = LlavaForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map='auto',
-        cache_dir=cache_dir,
     )
-    processor = AutoProcessor.from_pretrained(model_path, cache_dir=cache_dir)
+    processor = AutoProcessor.from_pretrained(model_path)
 
     # 设置 padding side 为 right（参考 TRAINING_NOTES）
     processor.tokenizer.padding_side = "right"
@@ -124,6 +89,7 @@ def load_model(config: Config, device: torch.device):
         base_model=base_model,
         pruning_layers=pruning_layers,
         pruner_d_internal=pruner_d_internal,
+        pruner_n_heads=pruner_n_heads,
         disc_d_hidden=disc_d_hidden,
         temperature=temperature,
         dropout=dropout,
@@ -133,10 +99,8 @@ def load_model(config: Config, device: torch.device):
     # 冻结基础模型
     model.freeze_base_model()
 
-    print(f"Model loaded. Pruning layers: {pruning_layers}")
-    print(f"Trainable parameters:")
-    print(f"  - Pruners: {sum(p.numel() for p in model.get_pruner_parameters()):,}")
-    print(f"  - Discriminators: {sum(p.numel() for p in model.get_discriminator_parameters()):,}")
+    logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
+    logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
 
     return model, processor
 
@@ -145,7 +109,7 @@ def preprocess_batch(
     batch: List[Dict[str, Any]],
     processor,
     device: torch.device,
-    max_length: int = 512
+    max_length: int = 1024
 ) -> Dict[str, Any]:
     """预处理一个 batch 的数据
 
@@ -153,7 +117,7 @@ def preprocess_batch(
         batch: 数据列表，每个元素包含 image, question, answer
         processor: LLaVA processor
         device: 设备
-        max_length: 最大序列长度
+        max_length: 最大序列长度（需要 > 576 vision tokens + 问题 + 答案）
 
     返回:
         预处理后的输入字典
@@ -162,21 +126,19 @@ def preprocess_batch(
     questions = [sample['question'] for sample in batch]
     answers = [sample['answer'] for sample in batch]
 
-    # 构建 prompt
+    # 构建 prompt（训练时需要包含 answer）
     prompts = []
-    for q in questions:
-        # LLaVA 格式的 prompt
-        prompt = f"USER: <image>\n{q}\nASSISTANT:"
+    for q, a in zip(questions, answers):
+        # LLaVA 格式的 prompt，包含 answer 用于训练
+        prompt = f"USER: <image>\n{q}\nASSISTANT: {a}"
         prompts.append(prompt)
 
-    # 使用 processor 处理
+    # 使用 processor 处理（不截断，避免破坏 image tokens）
     inputs = processor(
         text=prompts,
         images=images,
         return_tensors="pt",
         padding=True,
-        truncation=True,
-        max_length=max_length,
     ).to(device)
 
     # 找到各个区域的位置
@@ -205,8 +167,14 @@ def preprocess_batch(
 
     # Question 位置：从 vision_end 到 ASSISTANT: 之前
     # Answer 位置：从 ASSISTANT: 之后开始
-    assistant_token = "ASSISTANT:"
-    assistant_ids = processor.tokenizer.encode(assistant_token, add_special_tokens=False)
+    # 注意：LLaMA tokenizer 会在编码时添加前导空格 token (29871)
+    # 实际序列中 "\nASSISTANT:" 编码为 [13, 22933, 9047, 13566, 29901]
+    # 但 encode("\nASSISTANT:") 返回 [29871, 13, 22933, ...]
+    # 需要跳过开头的空格 token
+    assistant_ids = processor.tokenizer.encode("\nASSISTANT:", add_special_tokens=False)
+    # 跳过 SentencePiece 自动添加的前导空格 token (29871 = ▁)
+    if assistant_ids[0] == 29871:
+        assistant_ids = assistant_ids[1:]
 
     answer_starts = []
     for i in range(batch_size):
@@ -218,12 +186,29 @@ def preprocess_batch(
                 found = True
                 break
         if not found:
-            answer_starts.append(vision_end + 20)  # 默认值
+            raise ValueError(f"Cannot find ASSISTANT: in sample {i}. assistant_ids={assistant_ids}, ids[-30:]={ids[-30:]}")
 
-    question_start = vision_end
-    question_end = min(answer_starts)
-    answer_start = min(answer_starts)
-    answer_end = seq_len
+    # 找到每个样本的实际 answer 结束位置（排除 padding）
+    pad_token_id = processor.tokenizer.pad_token_id
+    answer_ends = []
+    for i in range(batch_size):
+        ids = input_ids[i].tolist()
+        # 从 answer_start 开始找第一个 pad token
+        end_pos = seq_len
+        for j in range(answer_starts[i], seq_len):
+            if ids[j] == pad_token_id:
+                end_pos = j
+                break
+        answer_ends.append(end_pos)
+
+    # 确保 answer 区域非空
+    for i in range(batch_size):
+        if answer_ends[i] <= answer_starts[i]:
+            raise ValueError(f"Empty answer region in sample {i}. answer_start={answer_starts[i]}, answer_end={answer_ends[i]}, answer='{answers[i]}'")
+
+    # question 区域：从 vision_end 到各自的 answer_start
+    question_starts = [vision_end] * batch_size
+    question_ends = answer_starts  # 每个样本的 question 结束位置就是 answer 开始位置
 
     return {
         'inputs': inputs,
@@ -232,11 +217,10 @@ def preprocess_batch(
         'answers': answers,
         'vision_start': vision_start,
         'vision_end': vision_end,
-        'question_start': question_start,
-        'question_end': question_end,
-        'answer_start': answer_start,
-        'answer_end': answer_end,
-        'answer_starts': answer_starts,  # 每个样本的 answer 开始位置
+        'question_starts': question_starts,
+        'question_ends': question_ends,
+        'answer_starts': answer_starts,
+        'answer_ends': answer_ends,
         'n_vision': n_vision_tokens,
     }
 
@@ -302,7 +286,7 @@ def train_step(
     batch: List[Dict[str, Any]],
     model,
     processor,
-    config: Config,
+    config,
     current_step: int,
     total_steps: int,
     device: torch.device
@@ -340,10 +324,10 @@ def train_step(
         attention_mask=inputs['attention_mask'],
         vision_start=prep['vision_start'],
         vision_end=prep['vision_end'],
-        question_start=prep['question_start'],
-        question_end=prep['question_end'],
-        answer_start=prep['answer_start'],
-        answer_end=prep['answer_end'],
+        question_starts=prep['question_starts'],
+        question_ends=prep['question_ends'],
+        answer_starts=prep['answer_starts'],
+        answer_ends=prep['answer_ends'],
         return_pruning_info=True,
     )
 
@@ -383,26 +367,50 @@ def train_step(
         stats['disc_real_acc'] = acc_info['real_acc']
         stats['disc_fake_acc'] = acc_info['fake_acc']
 
-        # Sparsity Loss
+        # Sparsity Loss - 约束 LLM 平均每层的保留比例
+        # 每个剪枝层的 mask 影响该层及之后的所有层
         target_token_num = method_cfg.get('target_token_num', 144)
         n_vision = prep['n_vision']
         target_ratio = target_token_num / n_vision
 
-        sparsity_loss = torch.tensor(0.0, device=device)
-        total_kept_ratio = 0
+        # 获取 LLM 总层数和剪枝层索引
+        total_layers = len(model.base_model.language_model.layers)
+        pruning_layers = sorted(output.pruning_infos.keys())
 
-        for layer_idx, info in output.pruning_infos.items():
-            hard_mask = info['hard_mask']
+        # 计算每个剪枝层的 mask 影响多少层
+        # 层 0 到第一个剪枝层之前：100% 保留
+        # 每个剪枝层到下一个剪枝层之前：该剪枝层的保留率
+        weighted_kept = torch.tensor(0.0, device=device)
+
+        for i, layer_idx in enumerate(pruning_layers):
+            # 剪枝层之前的层数（100% 保留）
+            if i == 0:
+                n_layers_before = layer_idx  # 层 0 到 layer_idx-1
+                weighted_kept = weighted_kept + n_layers_before * 1.0
+
+            # 该剪枝层影响的层数
+            if i < len(pruning_layers) - 1:
+                n_affected = pruning_layers[i + 1] - layer_idx  # 到下一个剪枝层
+            else:
+                n_affected = total_layers - layer_idx  # 到最后一层
+
+            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
             kept_ratio = hard_mask.mean()
-            total_kept_ratio += kept_ratio.item()
-            sparsity_loss = sparsity_loss + torch.abs(kept_ratio - target_ratio)
+            weighted_kept = weighted_kept + n_affected * kept_ratio
             stats[f'L{layer_idx}_kept'] = kept_ratio.item()
+            stats[f'L{layer_idx}_affected'] = n_affected
 
-        sparsity_loss = sparsity_loss / len(output.pruning_infos)
+        # LLM 平均每层的保留比例
+        avg_kept_ratio_tensor = weighted_kept / total_layers
+
+        # sparsity_loss = |平均保留比例 - 目标比例|
+        sparsity_loss = torch.abs(avg_kept_ratio_tensor - target_ratio)
+
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
-        stats['avg_kept_ratio'] = total_kept_ratio / len(output.pruning_infos)
+        stats['avg_kept_ratio'] = avg_kept_ratio_tensor.item()
         stats['target_kept_ratio'] = target_ratio
+        stats['total_layers'] = total_layers
 
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
@@ -448,6 +456,7 @@ def train_step(
     return {
         'losses': weighted_losses,
         'stats': stats,
+        'pruning_infos': {idx: info for idx, info in output.pruning_infos.items()} if output.pruning_infos else None,
     }
 
 
@@ -461,10 +470,10 @@ def evaluate(
     processor,
     dataset,
     judge,
-    config: Config,
+    config,
     device: torch.device,
     max_samples: int = 500,
-    batch_size: int = 1,
+    mode: str = "origin",  # "origin" 或 "hard"
 ) -> Dict[str, float]:
     """评估模型
 
@@ -476,7 +485,9 @@ def evaluate(
         config: 配置
         device: 设备
         max_samples: 最大评估样本数
-        batch_size: batch 大小（生成时通常为 1）
+        mode: 评估模式
+            - "origin": 不剪枝（baseline）
+            - "hard": 使用剪枝
 
     返回:
         评估结果字典
@@ -486,8 +497,11 @@ def evaluate(
     n_samples = min(len(dataset), max_samples)
     predictions = []
     references = []
+    kept_ratios = []
 
-    for i in tqdm(range(n_samples), desc="Evaluating"):
+    desc = f"Evaluating ({mode})"
+
+    for i in tqdm(range(n_samples), desc=desc):
         sample = dataset[i]
 
         # 构建输入
@@ -498,8 +512,27 @@ def evaluate(
             return_tensors="pt",
         ).to(device)
 
-        # 生成
-        with torch.no_grad():
+        # 根据模式选择生成方式
+        if mode == "hard":
+            # 带剪枝的生成
+            output_ids = model.generate_with_pruning(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                attention_mask=inputs.get('attention_mask'),
+                max_new_tokens=32,
+                do_sample=False,
+            )
+
+            # 计算保留率（可选）
+            masks = model.compute_pruning_masks(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+            )
+            stats = model.get_kept_ratio_from_masks(masks)
+            if 'avg_kept_ratio' in stats:
+                kept_ratios.append(stats['avg_kept_ratio'])
+        else:
+            # 不剪枝的生成（baseline）
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=32,
@@ -526,19 +559,31 @@ def evaluate(
     # 使用 judge 评估
     result = judge(predictions, references)
 
-    return {
+    eval_result = {
         'accuracy': result['accuracy'],
         'correct': result['correct'],
         'total': result['total'],
+        'mode': mode,
     }
+
+    # 添加平均保留率
+    if kept_ratios:
+        eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)
+
+    return eval_result
 
 
 # ============================================================
 # 主训练循环
 # ============================================================
 
-def train(config: Config):
+def train(config):
     """主训练函数"""
+    logger = config.logger
+
+    # 启用 anomaly detection 来定位 inplace 操作
+    torch.autograd.set_detect_anomaly(True)
+
     # 设置
     device = torch.device(config.global_settings.get('device', 'cuda'))
     seed = config.global_settings.get('seed', 42)
@@ -548,7 +593,7 @@ def train(config: Config):
     model, processor = load_model(config, device)
 
     # 加载数据
-    print("Loading dataset...")
+    logger.info("Loading dataset...")
     from engine.datas.loader import load_dataset
     data_bundle = load_dataset(config)
 
@@ -557,10 +602,10 @@ def train(config: Config):
     judge = data_bundle['judge']
 
     dataset_name = config.dataset_settings.get('name', 'unknown')
-    print(f"Dataset: {dataset_name}")
-    print(f"Train samples: {len(train_dataset)}")
+    logger.info(f"Dataset: {dataset_name}")
+    logger.info(f"Train samples: {len(train_dataset)}")
     if test_dataset:
-        print(f"Test samples: {len(test_dataset)}")
+        logger.info(f"Test samples: {len(test_dataset)}")
 
     # 创建优化器
     trainer_cfg = config.trainer_settings.get('dl_settings', {})
@@ -585,13 +630,8 @@ def train(config: Config):
     total_batches = (len(train_dataset) + batch_size - 1) // batch_size
     total_steps = epochs * total_batches
 
-    print(f"\nTraining config:")
-    print(f"  Epochs: {epochs}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Total batches: {total_batches}")
-    print(f"  Total steps: {total_steps}")
-    print(f"  Pruner LR: {pruner_lr}")
-    print(f"  Discriminator LR: {disc_lr}")
+    logger.info(f"Training config: epochs={epochs}, batch_size={batch_size}, total_batches={total_batches}")
+    logger.info(f"Total steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
 
     # 保存目录
     save_dir = Path(config.global_settings.get('save_dir', './outputs/checkpoints'))
@@ -601,9 +641,9 @@ def train(config: Config):
     global_step = 0
 
     for epoch in range(epochs):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{epochs}")
-        print(f"{'='*60}")
+        logger.info(f"{'='*60}")
+        logger.info(f"Epoch {epoch + 1}/{epochs}")
+        logger.info(f"{'='*60}")
 
         # 打乱数据
         indices = torch.randperm(len(train_dataset)).tolist()
@@ -630,22 +670,41 @@ def train(config: Config):
             losses = result['losses']
             stats = result['stats']
 
-            # === 更新 Discriminator ===
+            # === 先 backward 所有 loss，再 step ===
+            # （因为 adv_loss 需要通过 discriminator 计算梯度，
+            #  如果先 step discriminator 会导致计算图不一致）
+
+            # 1. Discriminator backward
             disc_optimizer.zero_grad()
-            if 'disc_loss' in losses and losses['disc_loss'].requires_grad:
+            disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
+            if disc_has_grad:
                 losses['disc_loss'].backward(retain_graph=True)
+
+            # 2. Pruner backward
+            pruner_optimizer.zero_grad()
+            pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
+            pruner_has_grad = pruner_total.requires_grad
+            if pruner_has_grad:
+                pruner_total.backward()
+
+            # 3. Clip gradients and step
+            if disc_has_grad:
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.get_discriminator_parameters(), grad_clip)
                 disc_optimizer.step()
 
-            # === 更新 Pruners ===
-            pruner_optimizer.zero_grad()
-            pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
-            if pruner_total.requires_grad:
-                pruner_total.backward()
+            if pruner_has_grad:
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
                 pruner_optimizer.step()
+
+            # 4. 判别器过强时重新初始化
+            disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
+            if 'disc_accuracy' in stats and stats['disc_accuracy'] > disc_reinit_threshold:
+                model.disc_manager.reinit_all()
+                # 重新初始化 optimizer 状态
+                disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
+                logger.info(f"  [REINIT] Discriminator reinited (acc={stats['disc_accuracy']:.2%} > {disc_reinit_threshold:.0%})")
 
             # 累计统计
             for k, v in losses.items():
@@ -660,21 +719,29 @@ def train(config: Config):
                 avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
                 avg_stats = {k: v / n_batches for k, v in epoch_stats.items()}
 
-                print(f"\nStep {global_step}:")
-                print(f"  Losses: " + ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items()))
+                loss_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
+                logger.info(f"Step {global_step}: {loss_str}")
                 if 'avg_kept_ratio' in avg_stats:
-                    print(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%})")
+                    logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%})")
                 if 'disc_accuracy' in avg_stats:
-                    print(f"  Disc acc: {avg_stats['disc_accuracy']:.2%}")
+                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%}")
 
             # 评估
             if test_dataset and global_step % eval_every == 0:
-                print(f"\nEvaluating at step {global_step}...")
-                eval_result = evaluate(
-                    model, processor, test_dataset, judge, config, device,
-                    max_samples=eval_max_samples
-                )
-                print(f"  Accuracy: {eval_result['accuracy']:.2%}")
+                logger.info(f"Evaluating at step {global_step}...")
+
+                # 评估两种模式
+                eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
+                for eval_mode in eval_modes:
+                    eval_result = evaluate(
+                        model, processor, test_dataset, judge, config, device,
+                        max_samples=eval_max_samples,
+                        mode=eval_mode
+                    )
+                    logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                    if 'avg_kept_ratio' in eval_result:
+                        logger.info(f"  [{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+
                 model.train()
 
             # 保存
@@ -687,10 +754,10 @@ def train(config: Config):
                     'pruner_optimizer': pruner_optimizer.state_dict(),
                     'disc_optimizer': disc_optimizer.state_dict(),
                 }, ckpt_path)
-                print(f"\nSaved checkpoint to {ckpt_path}")
+                logger.info(f"Saved checkpoint to {ckpt_path}")
 
         # Epoch 结束
-        print(f"\nEpoch {epoch + 1} completed.")
+        logger.info(f"Epoch {epoch + 1} completed.")
 
     # 最终保存
     final_path = save_dir / "checkpoint_final.pt"
@@ -699,16 +766,21 @@ def train(config: Config):
         'pruner_state_dict': model.pruner_manager.state_dict(),
         'disc_state_dict': model.disc_manager.state_dict(),
     }, final_path)
-    print(f"\nTraining completed. Final checkpoint saved to {final_path}")
+    logger.info(f"Training completed. Final checkpoint saved to {final_path}")
 
     # 最终评估
     if test_dataset:
-        print("\nFinal evaluation...")
-        eval_result = evaluate(
-            model, processor, test_dataset, judge, config, device,
-            max_samples=eval_max_samples
-        )
-        print(f"Final accuracy: {eval_result['accuracy']:.2%}")
+        logger.info("Final evaluation...")
+        eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
+        for eval_mode in eval_modes:
+            eval_result = evaluate(
+                model, processor, test_dataset, judge, config, device,
+                max_samples=eval_max_samples,
+                mode=eval_mode
+            )
+            logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
+            if 'avg_kept_ratio' in eval_result:
+                logger.info(f"[{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%}")
 
 
 # ============================================================
@@ -727,8 +799,12 @@ def main():
     print("Attention Consistency Pruning - Training")
     print("=" * 60)
 
-    # 加载配置
-    config = Config.from_yaml(args.config)
+    # 加载配置（使用统一的配置加载器）
+    config = load_config(override_file=args.config)
+
+    # 日志记录
+    logger = config.logger
+    logger.info("Starting Attention Consistency Pruning training...")
 
     # 训练
     train(config)

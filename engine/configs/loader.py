@@ -4,10 +4,6 @@ import sys
 # 自动检测工作目录：从当前文件位置向上找到项目根目录
 CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_DIR = os.path.abspath(os.path.join(CURRENT_FILE_DIR, '../..'))
-HF_HOME = "/root/autodl-tmp/huggingface_cache"
-HF_ENDPOINT = "https://hf-mirror.com"
-os.environ["HF_HOME"] = HF_HOME
-os.environ["HF_ENDPOINT"] = HF_ENDPOINT
 sys.path.insert(0, WORKSPACE_DIR)
 import sys
 import logging
@@ -57,91 +53,36 @@ class AttrDict(dict):
             raise AttributeError(f"'AttrDict' object has no attribute '{key}'")
 
 # ==================== 全局默认配置 ====================
+# 最小化默认配置，具体参数由 YAML 配置文件覆盖
 DEFAULT_CONFIG = {
     "global_settings": {
         "seed": 42,
         "device": "cuda",
-        "dtype": "float",  # 训练数据类型: "half" (float16) 或 "float" (float32)
+        "dtype": "float16",
         "pytorch_cuda_alloc_conf": "expandable_segments:True",
         "dataset_cache_dir": "/root/autodl-tmp/dataset_cache",
-        "hf_cache_dir": "/root/autodl-tmp/huggingface_cache",
         "save_dir": "./outputs/checkpoints",
         "log_dir": "./outputs/logs",
-        "study_name": ""  # 可选的研究名称，为空则不使用
+        "study_name": ""
     },
     "trainer_settings": {
-        "type": "deep-learning",
-        "name": "basic-pytorch",
         "dl_settings": {
-            "epochs": 3,
+            "epochs": 1,
             "batch_size": 4,
             "optimizers": {
-                "generator": {
-                    "type": "adam",
-                    "lr": 2e-05
-                },
-                "discriminator": {
-                    "type": "adam",
-                    "lr": 3.2e-04
-                },
-                "token_merger": {
-                    "type": "adam",
-                    "lr": 1e-05
-                },
-                "layer_pruners": {
-                    "type": "adam",
-                    "lr": 1.7e-05
-                }
+                "layer_pruners": {"type": "adam", "lr": 1e-4},
+                "discriminator": {"type": "adam", "lr": 1.5e-4}
             },
-            "print_loss_every_batches": 100,
-            "eval_every_batches": 2000,
-            "eval_max_samples": 2000,
-            "save_every_batches": 2000,
-            "save_every_epochs": 1,
-            "optuna_eval_interval_batches": 40,
+            "print_loss_every_batches": 50,
+            "eval_every_batches": 1000,
+            "eval_max_samples": 500,
+            "save_every_batches": 3000,
             "grad_clip_max_norm": 1.0,
         }
     },
-    "manager_settings": {
-        "name": "basic",
-        "gpus_per_subtask": 1,
-        "available_gpus": [0],
-        "poll_interval": 5.0,
-        "mode": "direct",  # null=单任务模式, "optuna"=超参数搜索, "batch_configs"=批量配置, "direct"=直接运行
-        "num_subtasks": 1,
-        "batch_configs_dir": None,
-    },
-    "search_settings": {
-        "enable": False,
-        "type": "optuna",
-        "n_trials": 100,
-        "study_name": "gan_hp_search",
-        "pruner": {
-            "type": "successive_halving",
-            "min_resource": 1,
-            "reduction_factor": 3,
-            "min_early_stopping_rate": 0
-        },
-        "sampler": {
-            "type": "tpe",
-            "n_startup_trials": 10,
-            "multivariate": True
-        },
-        "params": {}
-    },
     "dataset_settings": {
         "name": "vqa-vqav2",
-        "split": {
-            "train": 500,
-            "test": 500,
-        },
-        "category_priority": {
-            "enable": False,
-            "values": [
-                {"train": "mean"},
-                {"test": "mean"},
-            ]
-        },
+        "split": {"train": 1000, "test": 500},
         "fast_load_no_random": False
     },
     "config_settings": {
@@ -150,86 +91,37 @@ DEFAULT_CONFIG = {
         "log_config_on_load": True
     },
     "backbone_settings": {
-        "type": "mllm",
         "name": "llava-1.5-7b",
-        "mllm_settings": {
-            "device_map": "auto",
-            "max_text_tokens": 128,
-            "max_vision_tokens": 576,
-            "hidden_dim": 4096,
-            "vision_dim": 1024,
-            "image_max_size": 336,
-        }
     },
     "method_settings": {
-        # Token Merger配置
-        "enable_token_merger": False,
-        "merger_type": "fixed_pooling",
-        "merge_ratio": 1.0,
-        "merger_dropout": 0.1,
-        "merger_d_internal": 512,
-
-        # Layer-wise Pruner配置
-        "pruning_layers": [5, 15, 25],
-        "pruner_d_internal": 512,
-        "pruner_num_heads": 4,
-        "pruner_type": "cross_attention",
+        # 剪枝层配置
+        "pruning_layers": [4, 14, 24],
+        # Pruner 配置 (CrossAttentionPruner)
+        "pruner_d_internal": 128,
+        "pruner_n_heads": 4,
         "pruner_dropout": 0.1,
-
-        # Attention Residual配置
-        "use_attn_residual": False,
-        "attn_residual_weight": 0.5,
-        "learnable_attn_weight": False,
-
-        # 剪枝目标配置
-        "use_token_num_target": True,
-        "target_token_num": 200,
-        "target_sparsity": 0.3,
-
-        # Sparsity Loss配置
-        "sparsity_loss_only_on_excess": True,
-        "sparsity_warmup_enable": True,
-        "sparsity_weight": 10.0,
-        "sparsity_weight_max": 40.0,
-        "sparsity_warmup_ratio": 0.4,
-        "token_count_loss_weight": 0.04,
-        "binarization_loss_weight": 0.81,
-
-        # Temperature Annealing
-        "temperature": 0.8,
-        "temperature_min": 0.2,
-        "temperature_anneal_rate": 0.4,
-
-        # Hard Pruning配置
-        "hard_pruning_threshold": 0.5,
-
-        # Generator配置（遗留）
-        "gen_num_layers": 2,
-        "gen_num_heads": 2,
-        "gen_d_ff": 2048,
-        "gen_use_pos_encoding": False,
-        "gen_enable_token_bias": True,
-        "gen_use_gumbel": True,
-        "gen_temperature": 0.906,
-        "gen_temperature_anneal": True,
-        "gen_temperature_min": 0.237,
-        "gen_temperature_anneal_rate": 0.543,
-
-        # Discriminator配置
-        "disc_num_layers": 3,
-        "disc_d_d": 512,
-        "disc_dropout": 0.15,
-        "disc_target_layers": [-1, -3, -5],
-        "disc_reinit_prob": 0.15,
+        # Discriminator 配置
+        "disc_d_d": 256,
+        "disc_dropout": 0.1,
         "disc_use_spectral_norm": False,
-
-        # 损失权重（动态调度）
-        "task_loss_weight_start": 150.0,
-        "task_loss_weight": 120.0,
-        "adv_loss_weight_start": 10.0,
-        "adv_loss_weight": 80.0,
-        "entropy_weight": 12.0,
-        "loss_weight_warmup_ratio": 0.3,
+        # 剪枝目标
+        "target_token_num": 144,
+        # Temperature 配置
+        "temperature": 1.0,
+        "temperature_min": 0.5,
+        "temperature_anneal_rate": 0.4,
+        # 损失权重
+        "task_loss_weight": 1.0,
+        "adv_loss_weight": 0.5,
+        "sparsity_weight": 0.2,
+        # 动态权重调度
+        "loss_weight_warmup_ratio": 0.0,
+        "task_loss_weight_start": 1.0,
+        "adv_loss_weight_start": 0.5,
+        # Sparsity warmup
+        "sparsity_warmup_enable": False,
+        "sparsity_warmup_ratio": 0.2,
+        "sparsity_weight_max": 0.5,
     },
     "evaluation_settings": {
         "eval_mode": ["origin", "hard"],
@@ -535,8 +427,9 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     if backbone_name not in BACKBONE_DIM_MAP:
         raise ValueError(f"未知的 backbone 名称: {backbone_name}，支持的模型: {list(BACKBONE_DIM_MAP.keys())}")
     dim_config = BACKBONE_DIM_MAP[backbone_name]
-    config["backbone_settings"]["mllm_settings"]["hidden_dim"] = dim_config["hidden_dim"]
-    config["backbone_settings"]["mllm_settings"]["vision_dim"] = dim_config["vision_dim"]
+    # 将维度信息直接存到 backbone_settings
+    config["backbone_settings"]["hidden_dim"] = dim_config["hidden_dim"]
+    config["backbone_settings"]["vision_dim"] = dim_config["vision_dim"]
     
     # 6. 生成 experiment_tag 和路径（如果不跳过）
     if not skip_auto_paths:

@@ -1,118 +1,180 @@
-"""Attention Consistency Pruning - Layer Pruner
+"""Attention Consistency Pruning - Cross-Attention Layer Pruner
 
-轻量级剪枝网络，输出对 LLM attention 的残差调整。
+基于 Cross-Attention 的剪枝器设计。
 
 设计理念：
-- 输入是 LLM 自己的 question→vision attention（已经是很好的 baseline）
-- 输出是残差调整（可正可负）
-- 初始化为零，初始时完全依赖 LLM attention
-- Gumbel-Softmax 实现可微的 0/1 决策
+- 使用可学习的 "pruning queries" 来评估每个 vision token 的重要性
+- Cross-attention 让模型学习哪些 token 对回答问题最重要
+- 全局上下文：每个 token 的决策考虑其他 token 的信息
+- 可学习偏置：初始化为负值以鼓励剪枝
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 
-class LayerPruner(nn.Module):
-    """单层 Vision Token 剪枝器
+class CrossAttentionPruner(nn.Module):
+    """基于 Cross-Attention 的 Vision Token 剪枝器
 
-    输入 LLM 的 question→vision attention，输出对其的残差调整，
-    然后通过 Gumbel-Softmax 生成 0/1 hard mask。
+    使用可学习的 pruning queries 通过 cross-attention 评估 vision tokens 重要性。
 
     参数:
-        d_internal: MLP 内部维度
+        d_model: 输入 hidden states 的维度
+        d_internal: 内部特征维度
+        n_heads: Cross-attention 头数
         temperature: Gumbel-Softmax 温度
         dropout: Dropout 比例
     """
 
     def __init__(
         self,
+        d_model: int,
         d_internal: int = 128,
+        n_heads: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1
     ):
         super().__init__()
+        self.d_model = d_model
         self.d_internal = d_internal
+        self.n_heads = n_heads
         self.temperature = temperature
 
-        # MLP: 输入 attention 值，输出残差
-        # 输入维度为 1（单个 attention 值）
-        self.mlp = nn.Sequential(
-            nn.Linear(1, d_internal),
+        # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
+        self.n_queries = 4
+        self.pruning_queries = nn.Parameter(torch.randn(1, self.n_queries, d_internal) * 0.02)
+
+        # Vision token projection
+        self.vision_proj = nn.Linear(d_model, d_internal)
+
+        # Cross-attention: pruning queries attend to vision tokens
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_internal,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Per-token scoring head (补充 attention-based 分数)
+        self.token_scorer = nn.Sequential(
+            nn.Linear(d_internal, d_internal),
             nn.LayerNorm(d_internal),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_internal, 1)
         )
 
-        # 初始化最后一层为零，初始时输出残差为 0
-        # 这样初始行为完全由 LLM 的 attention 决定
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        # Query aggregation: 将多个 query 的注意力聚合为单一分数
+        self.query_aggregator = nn.Linear(self.n_queries, 1)
+
+        # 可学习偏置，初始化为 0 使初始保留率接近 50%
+        # sigmoid(0) = 0.5，softmax([0, 0])[1] = 0.5
+        self.keep_bias = nn.Parameter(torch.tensor(0.0))
+
+        # 初始化
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重"""
+        # Vision projection: 小权重初始化
+        nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
+        nn.init.zeros_(self.vision_proj.bias)
+
+        # Token scorer 最后一层零初始化，让初始输出接近 0
+        nn.init.zeros_(self.token_scorer[-1].weight)
+        nn.init.zeros_(self.token_scorer[-1].bias)
+
+        # Query aggregator 初始化为均匀聚合
+        nn.init.constant_(self.query_aggregator.weight, 1.0 / self.n_queries)
+        nn.init.zeros_(self.query_aggregator.bias)
 
     def forward(
         self,
-        q2v_attn: torch.Tensor,
+        vision_hidden: torch.Tensor,
+        q2v_attn: Optional[torch.Tensor] = None,
         return_components: bool = False
     ) -> torch.Tensor:
-        """计算残差调整
+        """计算 keep logits
+
+        残差设计：以 q2v_attn 作为 baseline，pruner 学习 delta
+        keep_logits = baseline + delta + bias
 
         参数:
-            q2v_attn: (batch, n_vision) - LLM 的 question→vision attention（归一化后）
+            vision_hidden: (batch, n_vision, d_model) - vision token hidden states
+            q2v_attn: (batch, n_vision) - LLM 的 question→vision attention 权重（作为 baseline）
             return_components: 是否返回中间结果
 
         返回:
-            residual: (batch, n_vision) - 残差调整
-            或 (residual, components_dict) 如果 return_components=True
+            keep_logits: (batch, n_vision) - 保留 logits（越大越倾向保留）
         """
-        # (batch, n_vision) -> (batch, n_vision, 1)
-        x = q2v_attn.unsqueeze(-1)
+        batch_size, n_vision, _ = vision_hidden.shape
 
-        # MLP
-        residual = self.mlp(x).squeeze(-1)  # (batch, n_vision)
+        # === Baseline: 基于 LLM attention 的初始分数 ===
+        if q2v_attn is not None:
+            # 将 attention 转换为 logit 空间（log 变换 + 中心化）
+            baseline = torch.log(q2v_attn.clamp(min=1e-6))
+            baseline = baseline - baseline.mean(dim=-1, keepdim=True)
+        else:
+            baseline = torch.zeros(batch_size, n_vision, device=vision_hidden.device)
+
+        # === Delta: Pruner 学习的修正量 ===
+        # 1. Project vision tokens
+        v = self.vision_proj(vision_hidden)  # (batch, n_vision, d_internal)
+
+        # 2. Expand pruning queries
+        queries = self.pruning_queries.expand(batch_size, -1, -1)  # (batch, n_queries, d_internal)
+
+        # 3. Cross-attention: queries attend to vision tokens
+        # attn_weights: (batch, n_queries, n_vision)
+        _, attn_weights = self.cross_attn(
+            query=queries,
+            key=v,
+            value=v,
+            need_weights=True,
+            average_attn_weights=True  # 对 heads 取平均
+        )
+
+        # 4. Aggregate attention weights from multiple queries
+        # (batch, n_queries, n_vision) -> (batch, n_vision, n_queries) -> (batch, n_vision, 1)
+        attn_weights_t = attn_weights.transpose(1, 2)  # (batch, n_vision, n_queries)
+        attn_score = self.query_aggregator(attn_weights_t).squeeze(-1)  # (batch, n_vision)
+
+        # 5. Per-token score
+        token_score = self.token_scorer(v).squeeze(-1)  # (batch, n_vision)
+
+        # 6. Delta = attn_score + token_score
+        # - attn_score: 基于 cross-attention 的全局重要性修正
+        # - token_score: 基于 token 自身特征的重要性修正
+        delta = attn_score + token_score
+
+        # === 残差连接: keep_logits = baseline + delta + bias ===
+        keep_logits = baseline + delta + self.keep_bias
 
         if return_components:
-            return residual, {'input_attn': q2v_attn, 'residual': residual}
-        return residual
-
-    def compute_importance(
-        self,
-        q2v_attn: torch.Tensor,
-        return_components: bool = False
-    ):
-        """计算最终的重要性分数
-
-        参数:
-            q2v_attn: (batch, n_vision) - LLM 的 question→vision attention
-            return_components: 是否返回中间结果
-
-        返回:
-            importance: (batch, n_vision) - 最终重要性分数
-        """
-        residual = self.forward(q2v_attn)
-        importance = q2v_attn + residual
-
-        if return_components:
-            return importance, {
-                'q2v_attn': q2v_attn,
-                'residual': residual,
-                'importance': importance
+            return keep_logits, {
+                'baseline': baseline,
+                'delta': delta,
+                'attn_score': attn_score,
+                'token_score': token_score,
+                'attn_weights': attn_weights,
+                'keep_logits': keep_logits
             }
-        return importance
+
+        return keep_logits
 
     def gumbel_softmax_mask(
         self,
-        importance: torch.Tensor,
+        keep_logits: torch.Tensor,
         temperature: Optional[float] = None
     ) -> torch.Tensor:
-        """将 importance score 转换为 0/1 hard mask
+        """将 keep logits 转换为 0/1 hard mask
 
         使用 Gumbel-Softmax with hard=True 实现可微的离散决策。
 
         参数:
-            importance: (batch, n_vision) - 重要性分数
+            keep_logits: (batch, n_vision) - 保留 logits
             temperature: 可选的温度覆盖
 
         返回:
@@ -120,48 +182,44 @@ class LayerPruner(nn.Module):
         """
         temp = temperature if temperature is not None else self.temperature
 
-        # 转换为二分类 logits: [drop_logit, keep_logit]
-        # drop_logit 固定为 0，keep_logit 为 importance
-        stacked = torch.stack([
-            torch.zeros_like(importance),  # drop logit = 0
-            importance                      # keep logit
-        ], dim=-1)  # (batch, n_vision, 2)
+        # 构建二分类 logits: [drop_logit, keep_logit]
+        drop_logits = torch.zeros_like(keep_logits)
+        stacked = torch.stack([drop_logits, keep_logits], dim=-1)  # (batch, n_vision, 2)
 
         if self.training:
             # 训练模式：Gumbel-Softmax with hard=True
-            # hard=True: 前向传播用 one-hot，反向传播用软梯度
             y = F.gumbel_softmax(stacked, tau=temp, hard=True, dim=-1)
-            hard_mask = y[..., 1]  # 取 keep 的概率/决策
+            hard_mask = y[..., 1]  # 取 keep 的决策
         else:
-            # 推理模式：直接 argmax（importance > 0 则保留）
-            hard_mask = (importance > 0).float()
+            # 推理模式：简单阈值判断
+            # keep_logits > 0 等价于 softmax([0, x])[1] > 0.5
+            hard_mask = (keep_logits > 0).float()
 
         return hard_mask
 
     def forward_full(
         self,
-        q2v_attn: torch.Tensor,
+        vision_hidden: torch.Tensor,
+        q2v_attn: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None
-    ):
-        """完整的前向传播：从 attention 到 hard mask
+    ) -> Tuple[torch.Tensor, Dict]:
+        """完整的前向传播：从 hidden states 到 hard mask
 
         参数:
-            q2v_attn: (batch, n_vision) - LLM 的 question→vision attention
+            vision_hidden: (batch, n_vision, d_model) - vision token hidden states
+            q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
             temperature: 可选的温度覆盖
 
         返回:
             hard_mask: (batch, n_vision) - 0/1 mask
             info: dict - 中间结果
         """
-        residual = self.forward(q2v_attn)
-        importance = q2v_attn + residual
-        hard_mask = self.gumbel_softmax_mask(importance, temperature)
+        keep_logits, components = self.forward(vision_hidden, q2v_attn, return_components=True)
+        hard_mask = self.gumbel_softmax_mask(keep_logits, temperature)
 
         return hard_mask, {
-            'q2v_attn': q2v_attn,
-            'residual': residual,
-            'importance': importance,
-            'hard_mask': hard_mask
+            **components,
+            'hard_mask': hard_mask,
         }
 
     def set_temperature(self, temperature: float):
@@ -172,36 +230,43 @@ class LayerPruner(nn.Module):
 class LayerPrunerManager(nn.Module):
     """多层剪枝器管理器
 
-    管理多个层的 LayerPruner，提供统一接口。
+    管理多个层的 CrossAttentionPruner，提供统一接口。
 
     参数:
         layer_indices: 要剪枝的层索引列表
-        d_internal: MLP 内部维度
+        d_model: 输入 hidden states 的维度
+        d_internal: 内部特征维度
+        n_heads: Cross-attention 头数
         temperature: 初始温度
         dropout: Dropout 比例
     """
 
     def __init__(
         self,
-        layer_indices: list = [4, 14, 24],
+        layer_indices: list,
+        d_model: int,
         d_internal: int = 128,
+        n_heads: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1
     ):
         super().__init__()
         self.layer_indices = layer_indices
+        self.d_model = d_model
 
         # 为每层创建独立的 pruner
         self.pruners = nn.ModuleDict({
-            str(idx): LayerPruner(
+            str(idx): CrossAttentionPruner(
+                d_model=d_model,
                 d_internal=d_internal,
+                n_heads=n_heads,
                 temperature=temperature,
                 dropout=dropout
             )
             for idx in layer_indices
         })
 
-    def get_pruner(self, layer_idx: int) -> LayerPruner:
+    def get_pruner(self, layer_idx: int) -> CrossAttentionPruner:
         """获取指定层的剪枝器"""
         key = str(layer_idx)
         if key not in self.pruners:
@@ -216,3 +281,7 @@ class LayerPrunerManager(nn.Module):
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""
         return self.layer_indices
+
+
+# 保持向后兼容的别名
+LayerPruner = CrossAttentionPruner
