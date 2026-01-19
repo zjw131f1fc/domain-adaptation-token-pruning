@@ -396,6 +396,7 @@ def train_step(
         stats['disc_accuracy'] = acc_info['overall']
         stats['disc_real_acc'] = acc_info['real_acc']
         stats['disc_fake_acc'] = acc_info['fake_acc']
+        stats['disc_per_layer'] = acc_info['per_layer']  # {layer_idx: (real_acc, fake_acc)}
 
         # Sparsity Loss - 约束 LLM 平均每层的保留比例
         # 剪枝是累积的：L4 剪枝后，L14 在剩余 tokens 上再剪枝
@@ -771,26 +772,43 @@ def train(config):
                     torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
                 pruner_optimizer.step()
 
-            # 4. 判别器过强时重新初始化
+            # 4. 判别器过强时重新初始化（每层单独检查）
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
-            if 'disc_accuracy' in stats and stats['disc_accuracy'] > disc_reinit_threshold:
-                model.disc_manager.reinit_all()
-                # 重新初始化 optimizer 状态
-                disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
-                logger.info(f"  [REINIT] Discriminator reinited (acc={stats['disc_accuracy']:.2%} > {disc_reinit_threshold:.0%})")
+            if 'disc_per_layer' in stats:
+                for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
+                    layer_acc = (real_acc + fake_acc) / 2
+                    if layer_acc > disc_reinit_threshold:
+                        model.disc_manager.reinit_layer(layer_idx)
+                        logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited (acc={layer_acc:.2%} > {disc_reinit_threshold:.0%})")
 
             # 累计统计
             for k, v in losses.items():
                 epoch_losses[k] += v.item()
             for k, v in stats.items():
-                epoch_stats[k] += v
+                if k == 'disc_per_layer':
+                    # 特殊处理 per_layer 字典
+                    if k not in epoch_stats:
+                        epoch_stats[k] = {}
+                    for layer_idx, (real_acc, fake_acc) in v.items():
+                        if layer_idx not in epoch_stats[k]:
+                            epoch_stats[k][layer_idx] = [0, 0]
+                        epoch_stats[k][layer_idx][0] += real_acc
+                        epoch_stats[k][layer_idx][1] += fake_acc
+                else:
+                    epoch_stats[k] += v
             n_batches += 1
             global_step += 1
 
             # 打印
             if global_step % print_every == 0:
                 avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
-                avg_stats = {k: v / n_batches for k, v in epoch_stats.items()}
+                avg_stats = {}
+                for k, v in epoch_stats.items():
+                    if k == 'disc_per_layer':
+                        avg_stats[k] = {layer_idx: (accs[0] / n_batches, accs[1] / n_batches)
+                                        for layer_idx, accs in v.items()}
+                    else:
+                        avg_stats[k] = v / n_batches
 
                 loss_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
                 logger.info(f"Step {global_step}: {loss_str}")
@@ -807,8 +825,14 @@ def train(config):
                             layer_ratios.append(f"L{layer_idx}={avg_stats[kept_key]:.2%}")
                     layer_str = ", ".join(layer_ratios)
                     logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%}) [{layer_str}]")
-                if 'disc_accuracy' in avg_stats:
-                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%}")
+                if 'disc_per_layer' in avg_stats:
+                    # 打印每层判别器的准确率
+                    per_layer_strs = []
+                    for layer_idx in sorted(avg_stats['disc_per_layer'].keys()):
+                        real_acc, fake_acc = avg_stats['disc_per_layer'][layer_idx]
+                        layer_acc = (real_acc + fake_acc) / 2
+                        per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}")
+                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
 
                 # 打印梯度统计
                 pruner_grad_norms = []

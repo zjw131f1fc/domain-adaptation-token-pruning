@@ -190,6 +190,12 @@ class LayerDiscriminatorManager(nn.Module):
         for disc in self.discriminators.values():
             disc.reset_parameters()
 
+    def reinit_layer(self, layer_idx: int):
+        """重新初始化指定层的判别器参数"""
+        key = str(layer_idx)
+        if key in self.discriminators:
+            self.discriminators[key].reset_parameters()
+
     def compute_disc_loss(
         self,
         h_real_dict: dict,
