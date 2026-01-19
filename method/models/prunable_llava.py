@@ -698,11 +698,20 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
         return output_ids
 
-    def get_kept_ratio_from_masks(self, masks: Dict[int, torch.Tensor]) -> Dict[str, float]:
-        """从 masks 计算保留率统计（使用加权平均，与训练时一致）
+    def get_kept_ratio_from_masks(
+        self,
+        masks: Dict[int, torch.Tensor],
+        original_n_vision: int = 576
+    ) -> Dict[str, float]:
+        """从 masks 计算保留率统计（使用累积公式，与训练时一致）
+
+        剪枝是累积的：L4 剪枝后，L14 在剩余 tokens 上再剪枝。
+        所有 kept ratio 都以原始 vision token 数量为分母。
 
         参数:
-            masks: {layer_idx: hard_mask} 字典
+            masks: {layer_idx: (hard_mask, n_kept_absolute)} 字典
+                   hard_mask 用于计算相对比例，n_kept_absolute 是绝对保留数量
+            original_n_vision: 原始 vision token 数量（默认 576）
 
         返回:
             stats: 包含各层和平均保留率的字典
@@ -716,14 +725,34 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         total_layers = len(self.base_model.model.language_model.layers)
         pruning_layers = sorted(masks.keys())
 
-        # 加权平均：每个剪枝层的 mask 影响该层及之后的所有层
+        # 累积计算
         weighted_kept = 0.0
+        cumulative_kept = original_n_vision  # 当前累积保留的 token 数量
 
         for i, layer_idx in enumerate(pruning_layers):
-            # 剪枝层之前的层数（100% 保留）
+            # 剪枝层之前的层数
             if i == 0:
                 n_layers_before = layer_idx
-                weighted_kept += n_layers_before * 1.0
+                weighted_kept += n_layers_before * 1.0  # 第一个剪枝层之前是 100%
+
+            # 获取该层的 mask 信息
+            mask_info = masks[layer_idx]
+            if isinstance(mask_info, tuple):
+                hard_mask, n_kept_absolute = mask_info
+            else:
+                # 兼容旧格式：只有 hard_mask
+                hard_mask = mask_info
+                n_kept_absolute = hard_mask.sum().int().item()
+                # 计算绝对保留数量
+                n_kept_absolute = int(cumulative_kept * hard_mask.float().mean().item())
+
+            # 更新累积保留数量
+            cumulative_kept = n_kept_absolute
+
+            # 计算相对于原始 token 数量的保留率
+            absolute_ratio = n_kept_absolute / original_n_vision
+            stats[f'L{layer_idx}_kept'] = absolute_ratio
+            stats[f'L{layer_idx}_n_kept'] = n_kept_absolute
 
             # 该剪枝层影响的层数
             if i < len(pruning_layers) - 1:
@@ -731,12 +760,12 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             else:
                 n_affected = total_layers - layer_idx
 
-            ratio = masks[layer_idx].float().mean().item()
-            weighted_kept += n_affected * ratio
-            stats[f'L{layer_idx}_kept'] = ratio
+            weighted_kept += n_affected * absolute_ratio
 
         # LLM 平均每层的保留比例
         stats['avg_kept_ratio'] = weighted_kept / total_layers
+        stats['original_n_vision'] = original_n_vision
+        stats['final_n_kept'] = cumulative_kept
 
         return stats
 
@@ -861,6 +890,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # LayerNorm + Q/K/V 投影
             hidden_normed = original_layer.input_layernorm(hidden_states)
+
+            # 保存 hidden_normed 用于后续 pruning（在 attention 计算之前）
+            hidden_normed_for_pruning = hidden_normed
+
             query_states = attn.q_proj(hidden_normed)
             key_states = attn.k_proj(hidden_normed)
             value_states = attn.v_proj(hidden_normed)
@@ -941,16 +974,17 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
                 q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)  # (batch, current_n_vision)
 
-                # 提取当前的 vision hidden（用 layer 之前的 hidden_normed）
-                # 注意：这里用的是本层输出后的 hidden_states，需要重新 norm
-                vision_hidden = original_layer.input_layernorm(hidden_states)[:, current_vision_start:current_vision_end, :]
+                # 提取当前的 vision hidden（使用 attention 计算之前的 hidden_normed）
+                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
 
                 # 调用 pruner 计算 mask
                 pruner = self.pruner_manager.get_pruner(layer_idx)
                 with torch.no_grad():
                     hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
 
-                masks[layer_idx] = hard_mask  # (batch, current_n_vision)
+                # 记录绝对保留数量（相对于原始 576 tokens）
+                n_kept_absolute = hard_mask[0].sum().int().item()
+                masks[layer_idx] = (hard_mask, n_kept_absolute)
 
                 # === 物理删除被剪掉的 vision tokens ===
                 # 对于每个样本，根据 hard_mask 选择要保留的 tokens
@@ -1003,8 +1037,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 position_ids = padded_position_ids
                 kept_indices = new_kept_indices_list
 
-                # 更新 vision 位置
-                n_kept = hard_mask[0].sum().int().item()  # 假设 batch 内保留数量相同
+                # 更新 vision 位置（batch_size=1，直接用第一个样本）
+                n_kept = hard_mask[0].sum().int().item()
                 current_vision_end = current_vision_start + n_kept
 
                 # 更新 KV cache（删除被剪掉的 tokens）
@@ -1053,8 +1087,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # Final LayerNorm
         hidden_states = llm.norm(hidden_states)
 
-        # 计算保留率统计
-        kept_stats = self.get_kept_ratio_from_masks(masks)
+        # 计算保留率统计（使用原始 vision token 数量作为分母）
+        kept_stats = self.get_kept_ratio_from_masks(masks, original_n_vision=n_vision)
 
         # === Decode 阶段 ===
         # 获取最后一个 token 的 logits

@@ -22,17 +22,17 @@ trainer_settings:
       discriminator:
         type: "adam"
         lr: 2.0e-04
-    print_loss_every_batches: 5
-    eval_every_batches: 5
-    eval_max_samples: 500
-    save_every_batches: 3000
+    print_loss_every_batches: 190
+    eval_every_batches: 700
+    eval_max_samples: 1000
+    save_every_batches: 700
     grad_clip_max_norm: null
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 40000
-    test: 500
+    train: 'all'
+    test: 1000
   fast_load_no_random: false
 
 backbone_settings:
@@ -82,7 +82,7 @@ method_settings:
   # Sparsity warmup - 启用，逐渐增加 sparsity 约束
   sparsity_warmup_enable: true
   sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
-  sparsity_weight_max: 10.0   # warmup 结束后达到 10.0
+  sparsity_weight_max: 8.0   # warmup 结束后达到 10.0
 
 evaluation_settings:
   eval_mode: ["origin", "hard"]

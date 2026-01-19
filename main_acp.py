@@ -398,7 +398,7 @@ def train_step(
         stats['disc_fake_acc'] = acc_info['fake_acc']
 
         # Sparsity Loss - 约束 LLM 平均每层的保留比例
-        # 每个剪枝层的 mask 影响该层及之后的所有层
+        # 剪枝是累积的：L4 剪枝后，L14 在剩余 tokens 上再剪枝
         target_token_num = method_cfg.get('target_token_num', 144)
         n_vision = prep['n_vision']
         target_ratio = target_token_num / n_vision
@@ -407,16 +407,25 @@ def train_step(
         total_layers = len(model.base_model.language_model.layers)
         pruning_layers = sorted(output.pruning_infos.keys())
 
-        # 计算每个剪枝层的 mask 影响多少层
+        # 计算累积保留率
         # 层 0 到第一个剪枝层之前：100% 保留
-        # 每个剪枝层到下一个剪枝层之前：该剪枝层的保留率
+        # 每个剪枝层到下一个剪枝层之前：累积保留率
         weighted_kept = torch.tensor(0.0, device=device)
+        cumulative_ratio = torch.tensor(1.0, device=device)  # 累积保留率
 
         for i, layer_idx in enumerate(pruning_layers):
-            # 剪枝层之前的层数（100% 保留）
+            # 剪枝层之前的层数（使用之前的累积保留率）
             if i == 0:
                 n_layers_before = layer_idx  # 层 0 到 layer_idx-1
-                weighted_kept = weighted_kept + n_layers_before * 1.0
+                weighted_kept = weighted_kept + n_layers_before * 1.0  # 第一个剪枝层之前是 100%
+
+            # 该剪枝层的保留率（相对于当前剩余 tokens）
+            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
+            layer_kept_ratio = hard_mask.mean()
+            stats[f'L{layer_idx}_kept'] = layer_kept_ratio.item()
+
+            # 更新累积保留率
+            cumulative_ratio = cumulative_ratio * layer_kept_ratio
 
             # 该剪枝层影响的层数
             if i < len(pruning_layers) - 1:
@@ -424,10 +433,8 @@ def train_step(
             else:
                 n_affected = total_layers - layer_idx  # 到最后一层
 
-            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            kept_ratio = hard_mask.mean()
-            weighted_kept = weighted_kept + n_affected * kept_ratio
-            stats[f'L{layer_idx}_kept'] = kept_ratio.item()
+            weighted_kept = weighted_kept + n_affected * cumulative_ratio
+            stats[f'L{layer_idx}_cumulative'] = cumulative_ratio.item()
             stats[f'L{layer_idx}_affected'] = n_affected
 
         # LLM 平均每层的保留比例
@@ -561,13 +568,20 @@ def evaluate(
             # 收集保留率统计
             if 'avg_kept_ratio' in stats:
                 kept_ratios.append(stats['avg_kept_ratio'])
-            # 收集每层的保留率
+            # 收集每层的保留率和 n_kept
             for key, value in stats.items():
-                if key.startswith('L') and key.endswith('_kept'):
+                if key.startswith('L') and '_kept' in key:
                     layer_idx = int(key[1:].split('_')[0])
-                    if layer_idx not in layer_kept_ratios:
-                        layer_kept_ratios[layer_idx] = []
-                    layer_kept_ratios[layer_idx].append(value)
+                    if key.endswith('_n_kept'):
+                        # 绝对保留数量
+                        if f'{layer_idx}_n_kept' not in layer_kept_ratios:
+                            layer_kept_ratios[f'{layer_idx}_n_kept'] = []
+                        layer_kept_ratios[f'{layer_idx}_n_kept'].append(value)
+                    elif key == f'L{layer_idx}_kept':
+                        # 保留率（排除 _n_kept）
+                        if layer_idx not in layer_kept_ratios:
+                            layer_kept_ratios[layer_idx] = []
+                        layer_kept_ratios[layer_idx].append(value)
         else:
             # 不剪枝的生成（baseline）
             prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
@@ -614,9 +628,15 @@ def evaluate(
     if kept_ratios:
         eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)
 
-    # 添加每层的平均保留率
-    for layer_idx, ratios in layer_kept_ratios.items():
-        eval_result[f'L{layer_idx}_kept'] = sum(ratios) / len(ratios)
+    # 添加每层的平均保留率和 n_kept
+    for key, values in layer_kept_ratios.items():
+        if isinstance(key, int):
+            # 保留率
+            eval_result[f'L{key}_kept'] = sum(values) / len(values)
+        elif isinstance(key, str) and key.endswith('_n_kept'):
+            # 绝对保留数量
+            layer_idx = key.split('_')[0]
+            eval_result[f'L{layer_idx}_n_kept'] = sum(values) / len(values)
 
     return eval_result
 
@@ -691,6 +711,7 @@ def train(config):
 
     # 训练循环
     global_step = 0
+    cached_origin_result = None  # 缓存 origin 评估结果（只计算一次）
 
     for epoch in range(epochs):
         logger.info(f"{'='*60}")
@@ -774,12 +795,16 @@ def train(config):
                 loss_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
                 logger.info(f"Step {global_step}: {loss_str}")
                 if 'avg_kept_ratio' in avg_stats:
-                    # 打印每层保留率
+                    # 打印每层的累积保留率（相对于原始 576 tokens）
                     layer_ratios = []
                     for layer_idx in pruning_layers:
-                        key = f'L{layer_idx}_kept'
-                        if key in avg_stats:
-                            layer_ratios.append(f"L{layer_idx}={avg_stats[key]:.2%}")
+                        cumulative_key = f'L{layer_idx}_cumulative'
+                        kept_key = f'L{layer_idx}_kept'
+                        if cumulative_key in avg_stats:
+                            # 显示累积保留率
+                            layer_ratios.append(f"L{layer_idx}={avg_stats[cumulative_key]:.2%}")
+                        elif kept_key in avg_stats:
+                            layer_ratios.append(f"L{layer_idx}={avg_stats[kept_key]:.2%}")
                     layer_str = ", ".join(layer_ratios)
                     logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%}) [{layer_str}]")
                 if 'disc_accuracy' in avg_stats:
@@ -809,21 +834,38 @@ def train(config):
                 # 评估两种模式
                 eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
                 for eval_mode in eval_modes:
-                    eval_result = evaluate(
-                        model, processor, test_dataset, judge, config, device,
-                        max_samples=eval_max_samples,
-                        mode=eval_mode
-                    )
-                    logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
-                    if 'avg_kept_ratio' in eval_result:
-                        # 打印每层保留率
-                        layer_ratios = []
-                        for layer_idx in pruning_layers:
-                            key = f'L{layer_idx}_kept'
-                            if key in eval_result:
-                                layer_ratios.append(f"L{layer_idx}={eval_result[key]:.2%}")
-                        layer_str = ", ".join(layer_ratios)
-                        logger.info(f"  [{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+                    if eval_mode == 'origin':
+                        # origin 只计算一次，后续使用缓存
+                        if cached_origin_result is None:
+                            eval_result = evaluate(
+                                model, processor, test_dataset, judge, config, device,
+                                max_samples=eval_max_samples,
+                                mode=eval_mode
+                            )
+                            cached_origin_result = eval_result
+                        else:
+                            eval_result = cached_origin_result
+                        logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
+                    else:
+                        eval_result = evaluate(
+                            model, processor, test_dataset, judge, config, device,
+                            max_samples=eval_max_samples,
+                            mode=eval_mode
+                        )
+                        logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                        if 'avg_kept_ratio' in eval_result:
+                            # 打印每层保留率（相对于原始 576 tokens）
+                            layer_ratios = []
+                            for layer_idx in pruning_layers:
+                                kept_key = f'L{layer_idx}_kept'
+                                n_kept_key = f'L{layer_idx}_n_kept'
+                                if kept_key in eval_result:
+                                    if n_kept_key in eval_result:
+                                        layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}({int(eval_result[n_kept_key])})")
+                                    else:
+                                        layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                            layer_str = ", ".join(layer_ratios)
+                            logger.info(f"  [{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
                 model.train()
 
@@ -856,21 +898,30 @@ def train(config):
         logger.info("Final evaluation...")
         eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
         for eval_mode in eval_modes:
-            eval_result = evaluate(
-                model, processor, test_dataset, judge, config, device,
-                max_samples=eval_max_samples,
-                mode=eval_mode
-            )
-            logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
-            if 'avg_kept_ratio' in eval_result:
-                # 打印每层保留率
-                layer_ratios = []
-                for layer_idx in pruning_layers:
-                    key = f'L{layer_idx}_kept'
-                    if key in eval_result:
-                        layer_ratios.append(f"L{layer_idx}={eval_result[key]:.2%}")
-                layer_str = ", ".join(layer_ratios)
-                logger.info(f"[{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+            if eval_mode == 'origin' and cached_origin_result is not None:
+                # 使用缓存的 origin 结果
+                eval_result = cached_origin_result
+                logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
+            else:
+                eval_result = evaluate(
+                    model, processor, test_dataset, judge, config, device,
+                    max_samples=eval_max_samples,
+                    mode=eval_mode
+                )
+                logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
+                if 'avg_kept_ratio' in eval_result:
+                    # 打印每层保留率（相对于原始 576 tokens）
+                    layer_ratios = []
+                    for layer_idx in pruning_layers:
+                        kept_key = f'L{layer_idx}_kept'
+                        n_kept_key = f'L{layer_idx}_n_kept'
+                        if kept_key in eval_result:
+                            if n_kept_key in eval_result:
+                                layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}({int(eval_result[n_kept_key])})")
+                            else:
+                                layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                    layer_str = ", ".join(layer_ratios)
+                    logger.info(f"[{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
 
 # ============================================================
