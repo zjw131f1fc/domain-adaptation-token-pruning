@@ -39,38 +39,37 @@ class LayerDiscriminator(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.input_dim = num_heads * head_dim
+        self.input_dim = num_heads * head_dim  # 32 * 128 = 4096
 
-        # 构建网络层
+        # 构建网络层 - 更平缓的降维
+        # 4096 -> 1024 -> 512 -> 256 -> 1
         layers = []
 
-        # Layer 1
-        linear1 = nn.Linear(self.input_dim, d_hidden)
-        if use_spectral_norm:
-            linear1 = nn.utils.spectral_norm(linear1)
-        layers.extend([
-            linear1,
-            nn.LayerNorm(d_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        ])
+        def make_layer(in_dim, out_dim):
+            linear = nn.Linear(in_dim, out_dim)
+            if use_spectral_norm:
+                linear = nn.utils.spectral_norm(linear)
+            return [
+                linear,
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            ]
 
-        # Layer 2
-        linear2 = nn.Linear(d_hidden, d_hidden)
-        if use_spectral_norm:
-            linear2 = nn.utils.spectral_norm(linear2)
-        layers.extend([
-            linear2,
-            nn.LayerNorm(d_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        ])
+        # Layer 1: 4096 -> 1024
+        layers.extend(make_layer(self.input_dim, 1024))
 
-        # Output layer
-        linear3 = nn.Linear(d_hidden, 1)
+        # Layer 2: 1024 -> 512
+        layers.extend(make_layer(1024, 512))
+
+        # Layer 3: 512 -> 256
+        layers.extend(make_layer(512, d_hidden))
+
+        # Output layer: 256 -> 1
+        linear_out = nn.Linear(d_hidden, 1)
         if use_spectral_norm:
-            linear3 = nn.utils.spectral_norm(linear3)
-        layers.append(linear3)
+            linear_out = nn.utils.spectral_norm(linear_out)
+        layers.append(linear_out)
 
         self.net = nn.Sequential(*layers)
 

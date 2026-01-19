@@ -867,9 +867,10 @@ def train(config):
                                 mode=eval_mode
                             )
                             cached_origin_result = eval_result
+                            logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
                         else:
                             eval_result = cached_origin_result
-                        logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
+                            logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
                     else:
                         eval_result = evaluate(
                             model, processor, test_dataset, judge, config, device,
