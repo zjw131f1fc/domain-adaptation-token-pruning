@@ -122,29 +122,38 @@ def preprocess_batch(
     batch: List[Dict[str, Any]],
     processor,
     device: torch.device,
-    max_length: int = 1024
+    max_length: int = 1024,
+    mode: str = "train"  # "train" 或 "inference"
 ) -> Dict[str, Any]:
     """预处理一个 batch 的数据
 
     参数:
-        batch: 数据列表，每个元素包含 image, question, answer
+        batch: 数据列表，每个元素包含 image, question, (answer)
         processor: LLaVA processor
         device: 设备
         max_length: 最大序列长度（需要 > 576 vision tokens + 问题 + 答案）
+        mode: "train" 训练模式（包含 answer），"inference" 推理模式（不包含 answer）
 
     返回:
         预处理后的输入字典
     """
     images = [sample['image'] for sample in batch]
     questions = [sample['question'] for sample in batch]
-    answers = [sample['answer'] for sample in batch]
 
-    # 构建 prompt（训练时需要包含 answer）
-    prompts = []
-    for q, a in zip(questions, answers):
-        # LLaVA 格式的 prompt，包含 answer 用于训练
-        prompt = f"USER: <image>\n{q}\nASSISTANT: {a}"
-        prompts.append(prompt)
+    if mode == "train":
+        answers = [sample['answer'] for sample in batch]
+        # 构建 prompt（训练时需要包含 answer）
+        prompts = []
+        for q, a in zip(questions, answers):
+            prompt = f"USER: <image>\n{q}\nASSISTANT: {a}"
+            prompts.append(prompt)
+    else:
+        # 推理模式：不包含 answer
+        answers = None
+        prompts = []
+        for q in questions:
+            prompt = f"USER: <image>\n{q}\nASSISTANT:"
+            prompts.append(prompt)
 
     # 使用 processor 处理（不截断，避免破坏 image tokens）
     inputs = processor(
@@ -189,53 +198,61 @@ def preprocess_batch(
     if assistant_ids[0] == 29871:
         assistant_ids = assistant_ids[1:]
 
-    answer_starts = []
+    # 找到 ASSISTANT: 的位置（对于推理和训练都需要）
+    assistant_positions = []
     for i in range(batch_size):
         ids = input_ids[i].tolist()
         found = False
         for j in range(len(ids) - len(assistant_ids) + 1):
             if ids[j:j+len(assistant_ids)] == assistant_ids:
-                answer_starts.append(j + len(assistant_ids))
+                assistant_positions.append(j + len(assistant_ids))
                 found = True
                 break
         if not found:
             raise ValueError(f"Cannot find ASSISTANT: in sample {i}. assistant_ids={assistant_ids}, ids[-30:]={ids[-30:]}")
 
-    # 找到每个样本的实际 answer 结束位置（排除 padding）
-    pad_token_id = processor.tokenizer.pad_token_id
-    answer_ends = []
-    for i in range(batch_size):
-        ids = input_ids[i].tolist()
-        # 从 answer_start 开始找第一个 pad token
-        end_pos = seq_len
-        for j in range(answer_starts[i], seq_len):
-            if ids[j] == pad_token_id:
-                end_pos = j
-                break
-        answer_ends.append(end_pos)
-
-    # 确保 answer 区域非空
-    for i in range(batch_size):
-        if answer_ends[i] <= answer_starts[i]:
-            raise ValueError(f"Empty answer region in sample {i}. answer_start={answer_starts[i]}, answer_end={answer_ends[i]}, answer='{answers[i]}'")
-
-    # question 区域：从 vision_end 到各自的 answer_start
+    # question 区域：从 vision_end 到 ASSISTANT: 之前
     question_starts = [vision_end] * batch_size
-    question_ends = answer_starts  # 每个样本的 question 结束位置就是 answer 开始位置
+    question_ends = assistant_positions  # 每个样本的 question 结束位置
 
-    return {
+    result = {
         'inputs': inputs,
         'images': images,
         'questions': questions,
-        'answers': answers,
         'vision_start': vision_start,
         'vision_end': vision_end,
         'question_starts': question_starts,
         'question_ends': question_ends,
-        'answer_starts': answer_starts,
-        'answer_ends': answer_ends,
         'n_vision': n_vision_tokens,
     }
+
+    if mode == "train":
+        # 训练模式：需要 answer 位置
+        answer_starts = assistant_positions
+
+        # 找到每个样本的实际 answer 结束位置（排除 padding）
+        pad_token_id = processor.tokenizer.pad_token_id
+        answer_ends = []
+        for i in range(batch_size):
+            ids = input_ids[i].tolist()
+            # 从 answer_start 开始找第一个 pad token
+            end_pos = seq_len
+            for j in range(answer_starts[i], seq_len):
+                if ids[j] == pad_token_id:
+                    end_pos = j
+                    break
+            answer_ends.append(end_pos)
+
+        # 确保 answer 区域非空
+        for i in range(batch_size):
+            if answer_ends[i] <= answer_starts[i]:
+                raise ValueError(f"Empty answer region in sample {i}. answer_start={answer_starts[i]}, answer_end={answer_ends[i]}, answer='{answers[i]}'")
+
+        result['answers'] = answers
+        result['answer_starts'] = answer_starts
+        result['answer_ends'] = answer_ends
+
+    return result
 
 
 # ============================================================
@@ -511,41 +528,55 @@ def evaluate(
     predictions = []
     references = []
     kept_ratios = []
+    layer_kept_ratios = {}  # {layer_idx: [ratios]}
 
     desc = f"Evaluating ({mode})"
 
     for i in tqdm(range(n_samples), desc=desc):
         sample = dataset[i]
 
-        # 构建输入
-        prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
-        inputs = processor(
-            text=prompt,
-            images=sample['image'],
-            return_tensors="pt",
-        ).to(device)
-
         # 根据模式选择生成方式
         if mode == "hard":
-            # 带剪枝的生成
-            output_ids = model.generate_with_pruning(
+            # 使用 preprocess_batch 获取 question 位置（推理模式，不含 answer）
+            preprocessed = preprocess_batch(
+                batch=[sample],
+                processor=processor,
+                device=device,
+                mode="inference"
+            )
+            inputs = preprocessed['inputs']
+
+            # 带硬剪枝的生成（物理删除 tokens，减少 FLOPS）
+            output_ids, stats = model.generate_with_hard_pruning(
                 input_ids=inputs['input_ids'],
                 pixel_values=inputs['pixel_values'],
                 attention_mask=inputs.get('attention_mask'),
+                vision_start=preprocessed['vision_start'],
+                vision_end=preprocessed['vision_end'],
+                question_starts=preprocessed['question_starts'],
+                question_ends=preprocessed['question_ends'],
                 max_new_tokens=32,
-                do_sample=False,
             )
 
-            # 计算保留率（可选）
-            masks = model.compute_pruning_masks(
-                input_ids=inputs['input_ids'],
-                pixel_values=inputs['pixel_values'],
-            )
-            stats = model.get_kept_ratio_from_masks(masks)
+            # 收集保留率统计
             if 'avg_kept_ratio' in stats:
                 kept_ratios.append(stats['avg_kept_ratio'])
+            # 收集每层的保留率
+            for key, value in stats.items():
+                if key.startswith('L') and key.endswith('_kept'):
+                    layer_idx = int(key[1:].split('_')[0])
+                    if layer_idx not in layer_kept_ratios:
+                        layer_kept_ratios[layer_idx] = []
+                    layer_kept_ratios[layer_idx].append(value)
         else:
             # 不剪枝的生成（baseline）
+            prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
+            inputs = processor(
+                text=prompt,
+                images=sample['image'],
+                return_tensors="pt",
+            ).to(device)
+
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=32,
@@ -583,6 +614,10 @@ def evaluate(
     if kept_ratios:
         eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)
 
+    # 添加每层的平均保留率
+    for layer_idx, ratios in layer_kept_ratios.items():
+        eval_result[f'L{layer_idx}_kept'] = sum(ratios) / len(ratios)
+
     return eval_result
 
 
@@ -593,6 +628,10 @@ def evaluate(
 def train(config):
     """主训练函数"""
     logger = config.logger
+    method_cfg = config.method_settings
+
+    # 获取剪枝层配置
+    pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
 
     # 启用 anomaly detection 来定位 inplace 操作
     torch.autograd.set_detect_anomaly(True)
@@ -735,9 +774,33 @@ def train(config):
                 loss_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
                 logger.info(f"Step {global_step}: {loss_str}")
                 if 'avg_kept_ratio' in avg_stats:
-                    logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%})")
+                    # 打印每层保留率
+                    layer_ratios = []
+                    for layer_idx in pruning_layers:
+                        key = f'L{layer_idx}_kept'
+                        if key in avg_stats:
+                            layer_ratios.append(f"L{layer_idx}={avg_stats[key]:.2%}")
+                    layer_str = ", ".join(layer_ratios)
+                    logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%}) [{layer_str}]")
                 if 'disc_accuracy' in avg_stats:
                     logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%}")
+
+                # 打印梯度统计
+                pruner_grad_norms = []
+                disc_grad_norms = []
+                for p in model.get_pruner_parameters():
+                    if p.grad is not None:
+                        pruner_grad_norms.append(p.grad.norm().item())
+                for p in model.get_discriminator_parameters():
+                    if p.grad is not None:
+                        disc_grad_norms.append(p.grad.norm().item())
+
+                if pruner_grad_norms:
+                    logger.info(f"  Pruner grad: mean={sum(pruner_grad_norms)/len(pruner_grad_norms):.6f}, "
+                               f"max={max(pruner_grad_norms):.6f}, min={min(pruner_grad_norms):.6f}")
+                if disc_grad_norms:
+                    logger.info(f"  Disc grad: mean={sum(disc_grad_norms)/len(disc_grad_norms):.6f}, "
+                               f"max={max(disc_grad_norms):.6f}, min={min(disc_grad_norms):.6f}")
 
             # 评估
             if test_dataset and global_step % eval_every == 0:
@@ -753,7 +816,14 @@ def train(config):
                     )
                     logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
                     if 'avg_kept_ratio' in eval_result:
-                        logger.info(f"  [{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+                        # 打印每层保留率
+                        layer_ratios = []
+                        for layer_idx in pruning_layers:
+                            key = f'L{layer_idx}_kept'
+                            if key in eval_result:
+                                layer_ratios.append(f"L{layer_idx}={eval_result[key]:.2%}")
+                        layer_str = ", ".join(layer_ratios)
+                        logger.info(f"  [{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
                 model.train()
 
@@ -793,7 +863,14 @@ def train(config):
             )
             logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
             if 'avg_kept_ratio' in eval_result:
-                logger.info(f"[{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+                # 打印每层保留率
+                layer_ratios = []
+                for layer_idx in pruning_layers:
+                    key = f'L{layer_idx}_kept'
+                    if key in eval_result:
+                        layer_ratios.append(f"L{layer_idx}={eval_result[key]:.2%}")
+                layer_str = ", ".join(layer_ratios)
+                logger.info(f"[{eval_mode}] Avg kept ratio: {eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
 
 # ============================================================
