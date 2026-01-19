@@ -47,6 +47,20 @@ def load_model(config, device: torch.device):
     logger = config.logger
     method_cfg = config.method_settings
     backbone_cfg = config.backbone_settings
+    global_cfg = config.global_settings
+
+    # 获取数据类型配置
+    dtype_str = global_cfg.get('dtype', 'float32')
+    dtype_mapping = {
+        'float16': torch.float16,
+        'fp16': torch.float16,
+        'float32': torch.float32,
+        'fp32': torch.float32,
+        'bfloat16': torch.bfloat16,
+        'bf16': torch.bfloat16,
+    }
+    torch_dtype = dtype_mapping.get(dtype_str, torch.float32)
+    logger.info(f"Using dtype: {dtype_str} -> {torch_dtype}")
 
     # 获取剪枝层配置
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
@@ -67,11 +81,10 @@ def load_model(config, device: torch.device):
 
     logger.info(f"Loading base model from {model_path}...")
 
-    # 加载基础模型和处理器（使用 HF_HOME 环境变量作为缓存目录）
-    # 使用 float32 避免精度问题
+    # 加载基础模型和处理器
     base_model = LlavaForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float32,
+        torch_dtype=torch_dtype,
         device_map='auto',
     )
     processor = AutoProcessor.from_pretrained(model_path)
