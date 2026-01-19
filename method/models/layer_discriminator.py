@@ -2,105 +2,81 @@
 
 判别单个 answer token 的 attention 聚合结果是 real 还是 fake。
 
-设计理念 v2：
-- 保留 head 结构信息，不直接 flatten
-- Per-head 特征提取 + head 间交互 + 加权聚合
-- 每个 answer token 独立判别
+设计理念：
+- 每个 answer token 独立判别（粒度更细，信号更强）
+- 输入是 attention 聚合后的结果 h = Σ attn[i] * V[i]
+- 不是判别 hidden states，而是判别 attention 聚合结果
+- 轻量级网络，避免判别器过强
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-import math
 
 
 class LayerDiscriminator(nn.Module):
-    """单层 Attention 聚合结果判别器 (v3: 保留 head 结构 + concat)
+    """单层 Attention 聚合结果判别器
 
     判别单个 answer token 从前面 positions 聚合的 h 是 real 还是 fake。
-
-    结构：
-    1. Per-head projection: (heads, head_dim) -> (heads, d_head)
-    2. Head interaction: self-attention 学习 head 间关系
-    3. Concat: 拼接所有 head 的特征（保留完整信息）
-    4. Output MLP: 最终判别
 
     参数:
         num_heads: attention 头数
         head_dim: 每个头的维度
-        d_head: per-head 投影后的维度
-        d_hidden: 输出 MLP 的隐藏层维度
+        d_hidden: MLP 隐藏层维度
         dropout: Dropout 比例
+        use_spectral_norm: 是否使用谱归一化（提高训练稳定性）
     """
 
     def __init__(
         self,
         num_heads: int,
         head_dim: int,
-        d_head: int = 64,
-        d_hidden: int = 128,
+        d_hidden: int = 256,
         dropout: float = 0.1,
-        use_spectral_norm: bool = False  # 保留参数兼容性
+        use_spectral_norm: bool = False
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.d_head = d_head
+        self.input_dim = num_heads * head_dim
 
-        # 1. Per-head projection (参数共享)
-        self.head_proj = nn.Sequential(
-            nn.Linear(head_dim, d_head),
-            nn.LayerNorm(d_head),
+        # 构建网络层
+        layers = []
+
+        # Layer 1
+        linear1 = nn.Linear(self.input_dim, d_hidden)
+        if use_spectral_norm:
+            linear1 = nn.utils.spectral_norm(linear1)
+        layers.extend([
+            linear1,
+            nn.LayerNorm(d_hidden),
             nn.GELU(),
             nn.Dropout(dropout)
-        )
+        ])
 
-        # 2. Head interaction: 简单的 self-attention
-        self.head_attn = nn.MultiheadAttention(
-            embed_dim=d_head,
-            num_heads=4,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.head_norm = nn.LayerNorm(d_head)
-
-        # 3. Output MLP (输入是 concat 后的 num_heads * d_head 维)
-        concat_dim = num_heads * d_head
-        self.output_mlp = nn.Sequential(
-            nn.Linear(concat_dim, d_hidden),
+        # Layer 2
+        linear2 = nn.Linear(d_hidden, d_hidden)
+        if use_spectral_norm:
+            linear2 = nn.utils.spectral_norm(linear2)
+        layers.extend([
+            linear2,
             nn.LayerNorm(d_hidden),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_hidden),
-            nn.LayerNorm(d_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, 1)
-        )
+            nn.Dropout(dropout)
+        ])
+
+        # Output layer
+        linear3 = nn.Linear(d_hidden, 1)
+        if use_spectral_norm:
+            linear3 = nn.utils.spectral_norm(linear3)
+        layers.append(linear3)
+
+        self.net = nn.Sequential(*layers)
 
     def reset_parameters(self):
-        """重新初始化网络参数"""
-        # Reset head projection
-        for module in self.head_proj.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
-
-        # Reset head attention
-        nn.init.xavier_uniform_(self.head_attn.in_proj_weight)
-        nn.init.xavier_uniform_(self.head_attn.out_proj.weight)
-        nn.init.zeros_(self.head_attn.in_proj_bias)
-        nn.init.zeros_(self.head_attn.out_proj.bias)
-        nn.init.ones_(self.head_norm.weight)
-        nn.init.zeros_(self.head_norm.bias)
-
-        # Reset output MLP
-        for module in self.output_mlp.modules():
+        """重新初始化网络参数（当判别器过强时调用）"""
+        for module in self.net.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -121,43 +97,19 @@ class LayerDiscriminator(nn.Module):
         """
         if h.dim() == 3:
             # 单个 answer token: (batch, heads, head_dim)
-            return self._forward_single(h)
+            h_flat = h.view(h.shape[0], -1)  # (batch, heads * head_dim)
+            return self.net(h_flat).squeeze(-1)  # (batch,)
         elif h.dim() == 4:
             # 多个 answer tokens: (batch, heads, n_ans, head_dim)
             batch, heads, n_ans, head_dim = h.shape
-            # 转换为 (batch * n_ans, heads, head_dim)
-            h_reshaped = h.permute(0, 2, 1, 3).reshape(batch * n_ans, heads, head_dim)
-            logits = self._forward_single(h_reshaped)  # (batch * n_ans,)
-            return logits.view(batch, n_ans)  # (batch, n_ans)
+            # Reshape: (batch, heads, n_ans, head_dim) -> (batch, n_ans, heads, head_dim)
+            h = h.permute(0, 2, 1, 3)
+            # Flatten: (batch, n_ans, heads * head_dim)
+            h_flat = h.reshape(batch, n_ans, -1)
+            # 对每个 answer token 判别: (batch, n_ans, 1) -> (batch, n_ans)
+            return self.net(h_flat).squeeze(-1)
         else:
             raise ValueError(f"Expected 3D or 4D tensor, got {h.dim()}D")
-
-    def _forward_single(self, h: torch.Tensor) -> torch.Tensor:
-        """处理单个 answer token
-
-        参数:
-            h: (batch, heads, head_dim)
-
-        返回:
-            logit: (batch,)
-        """
-        batch_size = h.shape[0]
-
-        # 1. Per-head projection: (batch, heads, head_dim) -> (batch, heads, d_head)
-        h_proj = self.head_proj(h)
-
-        # 2. Head interaction: self-attention
-        # (batch, heads, d_head) as sequence of heads
-        h_attn, _ = self.head_attn(h_proj, h_proj, h_proj)
-        h_attn = self.head_norm(h_attn + h_proj)  # residual connection
-
-        # 3. Concat all heads: (batch, heads, d_head) -> (batch, heads * d_head)
-        h_concat = h_attn.flatten(1)
-
-        # 4. Output MLP
-        logit = self.output_mlp(h_concat).squeeze(-1)  # (batch,)
-
-        return logit
 
     def forward_batch_answers(
         self,
@@ -197,9 +149,9 @@ class LayerDiscriminatorManager(nn.Module):
         layer_indices: 要判别的层索引列表（与 pruning_layers 相同）
         num_heads: attention 头数
         head_dim: 每个头的维度
-        d_head: per-head 投影后的维度
-        d_hidden: 输出 MLP 的隐藏层维度
+        d_hidden: MLP 隐藏层维度
         dropout: Dropout 比例
+        use_spectral_norm: 是否使用谱归一化
     """
 
     def __init__(
@@ -207,10 +159,9 @@ class LayerDiscriminatorManager(nn.Module):
         layer_indices: list,
         num_heads: int,
         head_dim: int,
-        d_head: int = 64,
-        d_hidden: int = 128,
+        d_hidden: int = 256,
         dropout: float = 0.1,
-        use_spectral_norm: bool = False  # 保留参数兼容性
+        use_spectral_norm: bool = False
     ):
         super().__init__()
         self.layer_indices = layer_indices
@@ -220,9 +171,9 @@ class LayerDiscriminatorManager(nn.Module):
             str(idx): LayerDiscriminator(
                 num_heads=num_heads,
                 head_dim=head_dim,
-                d_head=d_head,
                 d_hidden=d_hidden,
-                dropout=dropout
+                dropout=dropout,
+                use_spectral_norm=use_spectral_norm
             )
             for idx in layer_indices
         })
@@ -235,15 +186,9 @@ class LayerDiscriminatorManager(nn.Module):
         return self.discriminators[key]
 
     def reinit_all(self):
-        """重新初始化所有判别器的参数"""
+        """重新初始化所有判别器的参数（当判别器过强时调用）"""
         for disc in self.discriminators.values():
             disc.reset_parameters()
-
-    def reinit_layer(self, layer_idx: int):
-        """重新初始化指定层的判别器参数"""
-        key = str(layer_idx)
-        if key in self.discriminators:
-            self.discriminators[key].reset_parameters()
 
     def compute_disc_loss(
         self,

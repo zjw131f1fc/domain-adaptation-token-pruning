@@ -312,18 +312,13 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
-        # 逐样本提取生成 answer tokens 的位置的 h_real 和 h_fake
-        # 注意：autoregressive LLM 中，位置 i 的 hidden state 预测位置 i+1 的 token
-        # 所以生成 answer[ans_start:ans_end] 需要 hidden[ans_start-1:ans_end-1]
+        # 逐样本提取 answer 区域的 h_real 和 h_fake（每个样本的 answer 位置不同）
         h_real_list = []
         h_fake_list = []
         for i in range(batch_size):
             ans_start, ans_end = answer_starts[i], answer_ends[i]
-            # 生成 answer tokens 的位置：ans_start-1 到 ans_end-2（inclusive）
-            gen_start = ans_start - 1
-            gen_end = ans_end - 1  # exclusive，即到 ans_end-2
-            h_real_list.append(attn_output_real[i, :, gen_start:gen_end, :])  # (heads, n_ans_i, head_dim)
-            h_fake_list.append(attn_output_fake[i, :, gen_start:gen_end, :])  # (heads, n_ans_i, head_dim)
+            h_real_list.append(attn_output_real[i, :, ans_start:ans_end, :])  # (heads, n_ans_i, head_dim)
+            h_fake_list.append(attn_output_fake[i, :, ans_start:ans_end, :])  # (heads, n_ans_i, head_dim)
 
         # 返回 list，因为每个样本的 answer 长度不同
         h_real = h_real_list  # List[(heads, n_ans_i, head_dim)]

@@ -66,8 +66,7 @@ def load_model(config, device: torch.device):
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
     pruner_d_internal = method_cfg.get('pruner_d_internal', 128)
     pruner_n_heads = method_cfg.get('pruner_n_heads', 4)
-    disc_d_head = method_cfg.get('disc_d_head', 64)
-    disc_d_hidden = method_cfg.get('disc_d_d', 128)
+    disc_d_hidden = method_cfg.get('disc_d_d', 256)
     temperature = method_cfg.get('temperature', 1.0)
     dropout = method_cfg.get('pruner_dropout', 0.1)
     disc_spectral_norm = method_cfg.get('disc_use_spectral_norm', False)
@@ -104,10 +103,10 @@ def load_model(config, device: torch.device):
         pruning_layers=pruning_layers,
         pruner_d_internal=pruner_d_internal,
         pruner_n_heads=pruner_n_heads,
-        disc_d_head=disc_d_head,
         disc_d_hidden=disc_d_hidden,
         temperature=temperature,
         dropout=dropout,
+        disc_use_spectral_norm=disc_spectral_norm,
     )
 
     # 冻结基础模型
@@ -397,11 +396,6 @@ def train_step(
         stats['disc_accuracy'] = acc_info['overall']
         stats['disc_real_acc'] = acc_info['real_acc']
         stats['disc_fake_acc'] = acc_info['fake_acc']
-        # 每层判别器的准确率
-        for layer_idx, (real_acc, fake_acc) in acc_info['per_layer'].items():
-            stats[f'disc_L{layer_idx}_real_acc'] = real_acc
-            stats[f'disc_L{layer_idx}_fake_acc'] = fake_acc
-            stats[f'disc_L{layer_idx}_acc'] = (real_acc + fake_acc) / 2
 
         # Sparsity Loss - 约束 LLM 平均每层的保留比例
         # 剪枝是累积的：L4 剪枝后，L14 在剩余 tokens 上再剪枝
@@ -777,18 +771,13 @@ def train(config):
                     torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
                 pruner_optimizer.step()
 
-            # 4. 判别器过强时重新初始化（每层单独判断）
+            # 4. 判别器过强时重新初始化
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
-            reinited_layers = []
-            for layer_idx in pruning_layers:
-                acc_key = f'disc_L{layer_idx}_acc'
-                if acc_key in stats and stats[acc_key] > disc_reinit_threshold:
-                    model.disc_manager.reinit_layer(layer_idx)
-                    reinited_layers.append(f"L{layer_idx}({stats[acc_key]:.2%})")
-            if reinited_layers:
+            if 'disc_accuracy' in stats and stats['disc_accuracy'] > disc_reinit_threshold:
+                model.disc_manager.reinit_all()
                 # 重新初始化 optimizer 状态
                 disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
-                logger.info(f"  [REINIT] Discriminators reinited: {', '.join(reinited_layers)} (threshold: {disc_reinit_threshold:.0%})")
+                logger.info(f"  [REINIT] Discriminator reinited (acc={stats['disc_accuracy']:.2%} > {disc_reinit_threshold:.0%})")
 
             # 累计统计
             for k, v in losses.items():
@@ -819,14 +808,7 @@ def train(config):
                     layer_str = ", ".join(layer_ratios)
                     logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%}) [{layer_str}]")
                 if 'disc_accuracy' in avg_stats:
-                    # 打印每层判别器准确率
-                    disc_layer_accs = []
-                    for layer_idx in pruning_layers:
-                        acc_key = f'disc_L{layer_idx}_acc'
-                        if acc_key in avg_stats:
-                            disc_layer_accs.append(f"L{layer_idx}={avg_stats[acc_key]:.2%}")
-                    disc_str = ", ".join(disc_layer_accs)
-                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%} [{disc_str}]")
+                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%}")
 
                 # 打印梯度统计
                 pruner_grad_norms = []

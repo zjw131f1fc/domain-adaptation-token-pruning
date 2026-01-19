@@ -46,8 +46,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         base_model: 基础的 LlavaForConditionalGeneration 模型
         pruning_layers: 要剪枝的层索引列表
         pruner_d_internal: Pruner 内部维度
-        disc_d_head: Discriminator per-head 投影维度
-        disc_d_hidden: Discriminator 输出 MLP 隐藏层维度
+        disc_d_hidden: Discriminator 隐藏层维度
         temperature: 初始 Gumbel-Softmax 温度
         dropout: Dropout 比例
     """
@@ -58,11 +57,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruning_layers: List[int] = [4, 14, 24],
         pruner_d_internal: int = 128,
         pruner_n_heads: int = 4,
-        disc_d_head: int = 64,
-        disc_d_hidden: int = 128,
+        disc_d_hidden: int = 256,
         temperature: float = 1.0,
         dropout: float = 0.1,
-        disc_use_spectral_norm: bool = False  # 保留兼容性
+        disc_use_spectral_norm: bool = False
     ):
         super().__init__()
 
@@ -87,14 +85,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             dropout=dropout
         )
 
-        # 创建 Discriminators (v2: 保留 head 结构)
+        # 创建 Discriminators
         self.disc_manager = LayerDiscriminatorManager(
             layer_indices=pruning_layers,
             num_heads=self.num_heads,
             head_dim=self.head_dim,
-            d_head=disc_d_head,
             d_hidden=disc_d_hidden,
-            dropout=dropout
+            dropout=dropout,
+            use_spectral_norm=disc_use_spectral_norm
         )
 
         # 替换剪枝层
