@@ -54,6 +54,7 @@ method_settings:
   disc_d_d: 256
   disc_dropout: 0.1
   disc_use_spectral_norm: false
+  disc_reinit_threshold: 0.85  # 判别器准确率超过此阈值时重新初始化
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
@@ -70,8 +71,8 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.0
-  adv_loss_weight: 0.5
-  sparsity_weight: 5.0  # 提高到 5.0，让 sparsity loss 有足够影响力
+  adv_loss_weight: 1.0   # 增加到 1.0，让 pruner 更努力骗过判别器
+  sparsity_weight: 5.0   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
