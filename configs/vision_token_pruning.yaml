@@ -4,7 +4,7 @@
 global_settings:
   seed: 42
   device: "cuda"
-  dtype: "float32"
+  dtype: "bfloat16"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
   dataset_cache_dir: "/root/autodl-tmp/dataset_cache"
   hf_cache_dir: "/root/autodl-tmp/huggingface_cache"
@@ -18,10 +18,10 @@ trainer_settings:
     optimizers:
       layer_pruners:
         type: "adam"
-        lr: 5.0e-05  # 提高学习率，让 pruner 更快学习
+        lr: 5.0e-04  # 提高学习率，让 pruner 更快学习
       discriminator:
         type: "adam"
-        lr: 2.0e-04
+        lr: 2.0e-01
     print_loss_every_batches: 10
     eval_every_batches: 700
     eval_max_samples: 500
@@ -70,7 +70,7 @@ method_settings:
   # adv_loss: 让 fake 被判为 real
   # sparsity_loss: 约束保留率到目标值
 
-  task_loss_weight: 1.0
+  task_loss_weight: 1.5
   adv_loss_weight: 0.7   # 增加到 1.0，让 pruner 更努力骗过判别器
   sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
 

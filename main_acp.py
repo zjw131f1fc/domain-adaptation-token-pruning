@@ -799,40 +799,33 @@ def train(config):
             n_batches += 1
             global_step += 1
 
-            # 打印
+            # 打印（使用当前 batch 的数据）
             if global_step % print_every == 0:
-                avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
-                avg_stats = {}
-                for k, v in epoch_stats.items():
-                    if k == 'disc_per_layer':
-                        avg_stats[k] = {layer_idx: (accs[0] / n_batches, accs[1] / n_batches)
-                                        for layer_idx, accs in v.items()}
-                    else:
-                        avg_stats[k] = v / n_batches
-
-                loss_str = ", ".join(f"{k}={v:.4f}" for k, v in avg_losses.items())
+                # 当前 batch 的 loss
+                loss_str = ", ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 logger.info(f"Step {global_step}: {loss_str}")
-                if 'avg_kept_ratio' in avg_stats:
-                    # 打印每层的累积保留率（相对于原始 576 tokens）
+
+                # 当前 batch 的 kept ratio
+                if 'avg_kept_ratio' in stats:
                     layer_ratios = []
                     for layer_idx in pruning_layers:
                         cumulative_key = f'L{layer_idx}_cumulative'
                         kept_key = f'L{layer_idx}_kept'
-                        if cumulative_key in avg_stats:
-                            # 显示累积保留率
-                            layer_ratios.append(f"L{layer_idx}={avg_stats[cumulative_key]:.2%}")
-                        elif kept_key in avg_stats:
-                            layer_ratios.append(f"L{layer_idx}={avg_stats[kept_key]:.2%}")
+                        if cumulative_key in stats:
+                            layer_ratios.append(f"L{layer_idx}={stats[cumulative_key]:.2%}")
+                        elif kept_key in stats:
+                            layer_ratios.append(f"L{layer_idx}={stats[kept_key]:.2%}")
                     layer_str = ", ".join(layer_ratios)
-                    logger.info(f"  Kept ratio: {avg_stats['avg_kept_ratio']:.2%} (target: {avg_stats['target_kept_ratio']:.2%}) [{layer_str}]")
-                if 'disc_per_layer' in avg_stats:
-                    # 打印每层判别器的准确率
+                    logger.info(f"  Kept ratio: {stats['avg_kept_ratio']:.2%} (target: {stats['target_kept_ratio']:.2%}) [{layer_str}]")
+
+                # 当前 batch 的判别器准确率
+                if 'disc_per_layer' in stats:
                     per_layer_strs = []
-                    for layer_idx in sorted(avg_stats['disc_per_layer'].keys()):
-                        real_acc, fake_acc = avg_stats['disc_per_layer'][layer_idx]
+                    for layer_idx in sorted(stats['disc_per_layer'].keys()):
+                        real_acc, fake_acc = stats['disc_per_layer'][layer_idx]
                         layer_acc = (real_acc + fake_acc) / 2
-                        per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}")
-                    logger.info(f"  Disc acc: {avg_stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
+                        per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
+                    logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
 
                 # 打印梯度统计
                 pruner_grad_norms = []
