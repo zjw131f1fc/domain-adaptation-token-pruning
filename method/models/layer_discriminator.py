@@ -189,12 +189,16 @@ class LayerDiscriminatorManager(nn.Module):
         self,
         h_real_dict: dict,
         h_fake_dict: dict,
+        loss_type: str = 'bce',
+        gp_weight: float = 10.0,
     ) -> torch.Tensor:
         """计算所有层的判别器损失
 
         参数:
             h_real_dict: {layer_idx: List[(heads, n_ans_i, head_dim)]} - 每层每个样本的真实聚合结果
             h_fake_dict: {layer_idx: List[(heads, n_ans_i, head_dim)]} - 每层每个样本的剪枝后聚合结果
+            loss_type: 损失类型 ('bce', 'wgan', 'hinge')
+            gp_weight: WGAN-GP 梯度惩罚权重
 
         返回:
             disc_loss: 判别器总损失
@@ -211,35 +215,88 @@ class LayerDiscriminatorManager(nn.Module):
             for h_real, h_fake in zip(h_real_list, h_fake_list):
                 # h_real/h_fake: (heads, n_ans, head_dim) -> (1, heads, n_ans, head_dim)
                 h_real = h_real.unsqueeze(0)
-                h_fake = h_fake.unsqueeze(0)
+                h_fake = h_fake.unsqueeze(0).detach()
 
-                # 真实样本应该被判为 1
                 real_pred = disc.forward_batch_answers(h_real, reduce='mean')
-                real_loss = F.binary_cross_entropy_with_logits(
-                    real_pred, torch.ones_like(real_pred)
-                )
+                fake_pred = disc.forward_batch_answers(h_fake, reduce='mean')
 
-                # 假样本应该被判为 0（注意：h_fake 要 detach）
-                fake_pred = disc.forward_batch_answers(h_fake.detach(), reduce='mean')
-                fake_loss = F.binary_cross_entropy_with_logits(
-                    fake_pred, torch.zeros_like(fake_pred)
-                )
-
-                total_loss = total_loss + real_loss + fake_loss
+                if loss_type == 'wgan':
+                    # WGAN loss: max E[D(real)] - E[D(fake)]
+                    wgan_loss = -real_pred.mean() + fake_pred.mean()
+                    gp = self._gradient_penalty(disc, h_real, h_fake)
+                    total_loss = total_loss + wgan_loss + gp_weight * gp
+                elif loss_type == 'hinge':
+                    # Hinge loss: E[max(0, 1-D(real))] + E[max(0, 1+D(fake))]
+                    real_loss = F.relu(1.0 - real_pred).mean()
+                    fake_loss = F.relu(1.0 + fake_pred).mean()
+                    total_loss = total_loss + real_loss + fake_loss
+                else:
+                    # 标准 GAN loss (BCE)
+                    real_loss = F.binary_cross_entropy_with_logits(
+                        real_pred, torch.ones_like(real_pred)
+                    )
+                    fake_loss = F.binary_cross_entropy_with_logits(
+                        fake_pred, torch.zeros_like(fake_pred)
+                    )
+                    total_loss = total_loss + real_loss + fake_loss
 
         # 除以样本数和层数
         n_samples = len(h_real_list)
         n_layers = len(self.layer_indices)
         return total_loss / (n_samples * n_layers)
 
+    def _gradient_penalty(
+        self,
+        disc: LayerDiscriminator,
+        h_real: torch.Tensor,
+        h_fake: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算 WGAN-GP 的梯度惩罚
+
+        参数:
+            disc: 判别器
+            h_real: (1, heads, n_ans, head_dim) - 真实样本
+            h_fake: (1, heads, n_ans, head_dim) - 假样本
+
+        返回:
+            gradient_penalty: 梯度惩罚值
+        """
+        batch_size = h_real.size(0)
+        # 随机插值系数
+        alpha = torch.rand(batch_size, 1, 1, 1, device=h_real.device, dtype=h_real.dtype)
+        # 插值样本
+        interpolated = alpha * h_real + (1 - alpha) * h_fake
+        interpolated.requires_grad_(True)
+
+        # 判别器输出
+        d_interpolated = disc.forward_batch_answers(interpolated, reduce='mean')
+
+        # 计算梯度
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated,
+            inputs=interpolated,
+            grad_outputs=torch.ones_like(d_interpolated),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        # 梯度范数
+        gradients = gradients.view(batch_size, -1)
+        gradient_norm = gradients.norm(2, dim=1)
+        # 惩罚项: (||grad|| - 1)^2
+        gradient_penalty = ((gradient_norm - 1) ** 2).mean()
+        return gradient_penalty
+
     def compute_adv_loss(
         self,
         h_fake_dict: dict,
+        loss_type: str = 'bce',
     ) -> torch.Tensor:
         """计算所有层的对抗损失（用于训练 Pruner）
 
         参数:
             h_fake_dict: {layer_idx: List[(heads, n_ans_i, head_dim)]} - 每层每个样本的剪枝后聚合结果
+            loss_type: 损失类型 ('bce', 'wgan', 'hinge')
 
         返回:
             adv_loss: 对抗损失
@@ -257,11 +314,15 @@ class LayerDiscriminatorManager(nn.Module):
                 # h_fake: (heads, n_ans, head_dim) -> (1, heads, n_ans, head_dim)
                 h_fake = h_fake.unsqueeze(0)
 
-                # Pruner 的目标：让 fake 被判为 real (1)
                 fake_pred = disc.forward_batch_answers(h_fake, reduce='mean')
-                adv_loss = F.binary_cross_entropy_with_logits(
-                    fake_pred, torch.ones_like(fake_pred)
-                )
+                if loss_type in ('wgan', 'hinge'):
+                    # WGAN/Hinge: Pruner 的目标是最大化 D(fake)，即最小化 -D(fake)
+                    adv_loss = -fake_pred.mean()
+                else:
+                    # 标准 GAN: Pruner 的目标是让 fake 被判为 real (1)
+                    adv_loss = F.binary_cross_entropy_with_logits(
+                        fake_pred, torch.ones_like(fake_pred)
+                    )
 
                 total_loss = total_loss + adv_loss
 

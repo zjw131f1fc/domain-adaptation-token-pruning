@@ -381,13 +381,17 @@ def train_step(
         h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
         h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
 
+        # GAN 配置
+        loss_type = method_cfg.get('disc_loss_type', 'bce')
+        gp_weight = method_cfg.get('disc_gp_weight', 10.0)
+
         # Adversarial Loss
-        adv_loss = model.disc_manager.compute_adv_loss(h_fake_dict)
+        adv_loss = model.disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
         losses['adv_loss'] = adv_loss
         stats['raw_adv_loss'] = adv_loss.item()
 
         # Discriminator Loss
-        disc_loss = model.disc_manager.compute_disc_loss(h_real_dict, h_fake_dict)
+        disc_loss = model.disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
         losses['disc_loss'] = disc_loss
         stats['raw_disc_loss'] = disc_loss.item()
 
@@ -776,8 +780,9 @@ def train(config):
                 pruner_optimizer.step()
 
             # 4. 判别器过强时重新初始化（每层单独检查）
+            disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
-            if 'disc_per_layer' in stats:
+            if disc_reinit_enable and 'disc_per_layer' in stats:
                 for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
                     layer_acc = (real_acc + fake_acc) / 2
                     if layer_acc > disc_reinit_threshold:

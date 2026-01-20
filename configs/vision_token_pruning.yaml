@@ -51,10 +51,13 @@ method_settings:
 
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
-  disc_d_d: 256
+  disc_d_d: 512
   disc_dropout: 0.1
-  disc_use_spectral_norm: false
-  disc_reinit_threshold: 0.95  # 判别器准确率超过此阈值时重新初始化
+  disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
+  disc_loss_type: hinge            # 损失类型: bce, wgan, hinge
+  disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
+  disc_reinit_enable: false       # 是否启用判别器重新初始化
+  disc_reinit_threshold: 0.95    # 判别器准确率超过此阈值时重新初始化
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
@@ -82,7 +85,7 @@ method_settings:
   # Sparsity warmup - 启用，逐渐增加 sparsity 约束
   sparsity_warmup_enable: true
   sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
-  sparsity_weight_max: 1.0   # warmup 结束后达到 10.0
+  sparsity_weight_max: 0.7   # warmup 结束后达到 10.0
 
 evaluation_settings:
   eval_mode: ["hard"]
