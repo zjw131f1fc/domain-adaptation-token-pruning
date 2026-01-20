@@ -409,7 +409,7 @@ def train_step(
         stats['disc_per_layer'] = acc_info['per_layer']  # {layer_idx: (real_acc, fake_acc)}
 
         # Sparsity Loss - 约束 LLM 平均每层的保留比例
-        # 剪枝是累积的：L4 剪枝后，L14 在剩余 tokens 上再剪枝
+        # 使用 mask 交集计算实际剩余 tokens
         target_token_num = method_cfg.get('target_token_num', 144)
         n_vision = prep['n_vision']
         target_ratio = target_token_num / n_vision
@@ -418,35 +418,38 @@ def train_step(
         total_layers = len(model.base_model.language_model.layers)
         pruning_layers = sorted(output.pruning_infos.keys())
 
-        # 计算累积保留率
-        # 层 0 到第一个剪枝层之前：100% 保留
-        # 每个剪枝层到下一个剪枝层之前：累积保留率
+        # 用 mask 交集计算累积保留的 tokens
         weighted_kept = torch.tensor(0.0, device=device)
-        cumulative_ratio = torch.tensor(1.0, device=device)  # 累积保留率
+        cumulative_mask = None  # 累积 mask（交集）
 
         for i, layer_idx in enumerate(pruning_layers):
-            # 剪枝层之前的层数（使用之前的累积保留率）
+            # 剪枝层之前的层数
             if i == 0:
-                n_layers_before = layer_idx  # 层 0 到 layer_idx-1
+                n_layers_before = layer_idx
                 weighted_kept = weighted_kept + n_layers_before * 1.0  # 第一个剪枝层之前是 100%
 
-            # 该剪枝层的保留率（相对于当前剩余 tokens）
-            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            layer_kept_ratio = hard_mask.mean()
-            stats[f'L{layer_idx}_kept'] = layer_kept_ratio.item()
+            # 该剪枝层的 mask
+            hard_mask = output.pruning_infos[layer_idx]['hard_mask']  # (batch, n_vision)
+            # 取 batch 平均（或第一个样本）
+            layer_mask = hard_mask.float().mean(dim=0)  # (n_vision,)
 
-            # 更新累积保留率
-            cumulative_ratio = cumulative_ratio * layer_kept_ratio
+            # 更新累积 mask（交集）
+            if cumulative_mask is None:
+                cumulative_mask = layer_mask
+            else:
+                cumulative_mask = cumulative_mask * layer_mask
+
+            # 实际剩余比例 = 累积 mask 的均值
+            cumulative_ratio = cumulative_mask.mean()
+            stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
 
             # 该剪枝层影响的层数
             if i < len(pruning_layers) - 1:
-                n_affected = pruning_layers[i + 1] - layer_idx  # 到下一个剪枝层
+                n_affected = pruning_layers[i + 1] - layer_idx
             else:
-                n_affected = total_layers - layer_idx  # 到最后一层
+                n_affected = total_layers - layer_idx
 
             weighted_kept = weighted_kept + n_affected * cumulative_ratio
-            stats[f'L{layer_idx}_cumulative'] = cumulative_ratio.item()
-            stats[f'L{layer_idx}_affected'] = n_affected
 
         # LLM 平均每层的保留比例
         avg_kept_ratio_tensor = weighted_kept / total_layers
