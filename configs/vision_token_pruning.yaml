@@ -22,8 +22,8 @@ trainer_settings:
       discriminator:
         type: "adam"
         lr: 2.0e-04
-    print_loss_every_batches: 10
-    eval_every_batches: 400
+    print_loss_every_batches: 50
+    eval_every_batches: 700
     eval_max_samples: 500
     save_every_batches: 700
     grad_clip_max_norm: null
