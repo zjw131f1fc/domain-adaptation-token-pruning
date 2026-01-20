@@ -385,14 +385,20 @@ def train_step(
         loss_type = method_cfg.get('disc_loss_type', 'bce')
         gp_weight = method_cfg.get('disc_gp_weight', 10.0)
 
+        # Warmup: 前 X% 步数不做对抗训练（通过乘 0 实现，保持计算图正常释放）
+        warmup_ratio = method_cfg.get('pruner_warmup_ratio', 0.0)
+        in_warmup = current_step < total_steps * warmup_ratio
+        gan_weight = 0.0 if in_warmup else 1.0
+        stats['in_warmup'] = in_warmup
+
         # Adversarial Loss
         adv_loss = model.disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
-        losses['adv_loss'] = adv_loss
+        losses['adv_loss'] = adv_loss * gan_weight
         stats['raw_adv_loss'] = adv_loss.item()
 
         # Discriminator Loss
         disc_loss = model.disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
-        losses['disc_loss'] = disc_loss
+        losses['disc_loss'] = disc_loss * gan_weight
         stats['raw_disc_loss'] = disc_loss.item()
 
         # Discriminator Accuracy
