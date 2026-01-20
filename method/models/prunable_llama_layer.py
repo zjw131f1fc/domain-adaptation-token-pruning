@@ -33,6 +33,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         layer_idx: 层索引
         pruner: LayerPruner 实例（None 表示非剪枝层）
         discriminator: LayerDiscriminator 实例（None 表示非剪枝层）
+        adapter: PruningAdapter 实例（None 表示非剪枝层）
     """
 
     def __init__(
@@ -40,13 +41,15 @@ class PrunableLlamaDecoderLayer(nn.Module):
         original_layer: nn.Module,
         layer_idx: int,
         pruner: Optional[nn.Module] = None,
-        discriminator: Optional[nn.Module] = None
+        discriminator: Optional[nn.Module] = None,
+        adapter: Optional[nn.Module] = None
     ):
         super().__init__()
         self.original_layer = original_layer
         self.layer_idx = layer_idx
         self.pruner = pruner
         self.discriminator = discriminator
+        self.adapter = adapter
         self.is_pruning_layer = pruner is not None
 
         # 从原始层获取配置
@@ -312,7 +315,21 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
-        # 逐样本提取生成 answer tokens 的位置的 h_real 和 h_fake
+        # === Step 4.5: Adapter 修正 ===
+        # 将 attn_output_fake 通过 adapter 修正
+        if self.adapter is not None:
+            # attn_output_fake: (batch, heads, seq, head_dim) -> (batch, seq, heads, head_dim)
+            attn_output_fake_perm = attn_output_fake.permute(0, 2, 1, 3)
+            # reshape to (batch, seq, hidden_size)
+            attn_output_fake_flat = attn_output_fake_perm.reshape(batch_size, seq_len, -1)
+            # adapter 修正
+            attn_output_fake_adapted = self.adapter(attn_output_fake_flat)
+            # reshape back to (batch, heads, seq, head_dim)
+            attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+
+        # === Step 5: 提取 h_real 和 h_fake ===
+        # h_real: 完整 attention 聚合
+        # h_fake: adapter 修正后的剪枝 attention 聚合
         # 注意：autoregressive LLM 中，位置 i 的 hidden state 预测位置 i+1 的 token
         # 所以生成 answer[ans_start:ans_end] 需要 hidden[ans_start-1:ans_end-1]
         h_real_list = []
@@ -457,6 +474,13 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         # === Step 4: 计算 output ===
         attn_output = torch.matmul(attn_weights, value_states)
+
+        # === Step 4.5: Adapter 修正（推理时也使用）===
+        if self.adapter is not None:
+            attn_output_perm = attn_output.permute(0, 2, 1, 3)
+            attn_output_flat = attn_output_perm.reshape(batch_size, seq_len, -1)
+            attn_output_adapted = self.adapter(attn_output_flat)
+            attn_output = attn_output_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, -1)

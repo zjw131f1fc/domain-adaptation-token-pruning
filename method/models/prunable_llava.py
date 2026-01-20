@@ -22,6 +22,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaDecoderLay
 from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer
+from .adapter import AdapterManager
 
 
 @dataclass
@@ -58,6 +59,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruner_d_internal: int = 128,
         pruner_n_heads: int = 4,
         disc_d_hidden: int = 256,
+        adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
         temperature: float = 1.0,
         dropout: float = 0.1,
         disc_use_spectral_norm: bool = False
@@ -95,6 +97,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             use_spectral_norm=disc_use_spectral_norm
         )
 
+        # 创建 Adapters
+        self.adapter_manager = AdapterManager(
+            layer_indices=pruning_layers,
+            hidden_size=self.hidden_size,
+            bottleneck_dim=adapter_bottleneck
+        )
+
         # 替换剪枝层
         self._replace_pruning_layers()
 
@@ -106,20 +115,22 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             original_layer = llm.layers[layer_idx]
             pruner = self.pruner_manager.get_pruner(layer_idx)
             discriminator = self.disc_manager.get_discriminator(layer_idx)
+            adapter = self.adapter_manager.get_adapter(layer_idx)
 
-            # 将 pruner 和 discriminator 移动到与原始层相同的设备和 dtype
-            # 注意：直接在原对象上调用 to()，不要重新赋值
+            # 将 pruner, discriminator, adapter 移动到与原始层相同的设备和 dtype
             layer_param = next(original_layer.parameters())
             layer_device = layer_param.device
             layer_dtype = layer_param.dtype
             pruner.to(device=layer_device, dtype=layer_dtype)
             discriminator.to(device=layer_device, dtype=layer_dtype)
+            adapter.to(device=layer_device, dtype=layer_dtype)
 
             llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
                 original_layer=original_layer,
                 layer_idx=layer_idx,
                 pruner=pruner,
-                discriminator=discriminator
+                discriminator=discriminator,
+                adapter=adapter
             )
 
     def _restore_original_layers(self):
@@ -347,16 +358,22 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         """获取所有 discriminator 的参数"""
         return self.disc_manager.parameters()
 
+    def get_adapter_parameters(self):
+        """获取所有 adapter 的参数"""
+        return self.adapter_manager.parameters()
+
     def freeze_base_model(self):
-        """冻结基础模型参数（但保持 pruner 和 discriminator 可训练）"""
+        """冻结基础模型参数（但保持 pruner, discriminator, adapter 可训练）"""
         for param in self.base_model.parameters():
             param.requires_grad = False
 
-        # 重新启用 pruner 和 discriminator 的梯度
+        # 重新启用 pruner, discriminator, adapter 的梯度
         # （因为它们已经被添加到 llm.layers 中，会被上面的循环冻结）
         for param in self.pruner_manager.parameters():
             param.requires_grad = True
         for param in self.disc_manager.parameters():
+            param.requires_grad = True
+        for param in self.adapter_manager.parameters():
             param.requires_grad = True
 
     def unfreeze_base_model(self):

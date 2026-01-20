@@ -14,16 +14,16 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 13
+    batch_size: 16
     optimizers:
       layer_pruners:
         type: "adam"
         lr: 5.0e-04  # 提高学习率，让 pruner 更快学习
       discriminator:
         type: "adam"
-        lr: 2.0e-01
+        lr: 2.0e-04
     print_loss_every_batches: 10
-    eval_every_batches: 700
+    eval_every_batches: 400
     eval_max_samples: 500
     save_every_batches: 700
     grad_clip_max_norm: null
@@ -41,11 +41,11 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [4, 14, 24]
+  pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
-  pruner_d_internal: 128   # 内部特征维度
+  pruner_d_internal: 256   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
   pruner_dropout: 0.1
 
@@ -54,7 +54,7 @@ method_settings:
   disc_d_d: 256
   disc_dropout: 0.1
   disc_use_spectral_norm: false
-  disc_reinit_threshold: 0.85  # 判别器准确率超过此阈值时重新初始化
+  disc_reinit_threshold: 0.95  # 判别器准确率超过此阈值时重新初始化
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
@@ -63,7 +63,7 @@ method_settings:
   # Gumbel-Softmax 温度，控制决策的"软硬"程度
   temperature: 1.0
   temperature_min: 0.5
-  temperature_anneal_rate: 0.4
+  temperature_anneal_rate: 0.3
 
   # ==================== 损失权重 ====================
   # task_loss: Cross entropy on answer tokens
@@ -71,8 +71,8 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.5
-  adv_loss_weight: 0.7   # 增加到 1.0，让 pruner 更努力骗过判别器
-  sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
+  adv_loss_weight: 0.9   # 增加到 1.0，让 pruner 更努力骗过判别器
+  sparsity_weight: 0.2   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
@@ -82,7 +82,7 @@ method_settings:
   # Sparsity warmup - 启用，逐渐增加 sparsity 约束
   sparsity_warmup_enable: true
   sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
-  sparsity_weight_max: 3.0   # warmup 结束后达到 10.0
+  sparsity_weight_max: 1.0   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard"]
+  eval_mode: ["hard"]

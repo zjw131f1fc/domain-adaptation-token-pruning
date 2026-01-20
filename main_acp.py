@@ -113,7 +113,7 @@ def load_model(config, device: torch.device):
     model.freeze_base_model()
 
     logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
-    logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
+    logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, Adapters={sum(p.numel() for p in model.get_adapter_parameters()):,}, Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
 
     return model, processor
 
@@ -687,7 +687,10 @@ def train(config):
     pruner_lr = opt_cfg.get('layer_pruners', {}).get('lr', 1e-4)
     disc_lr = opt_cfg.get('discriminator', {}).get('lr', 1.5e-4)
 
-    pruner_optimizer = torch.optim.Adam(model.get_pruner_parameters(), lr=pruner_lr)
+    # Pruner 和 Adapter 一起优化（都是生成器的一部分）
+    from itertools import chain
+    pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
+    pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr)
     disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
 
     # 训练参数
@@ -893,6 +896,7 @@ def train(config):
                 torch.save({
                     'step': global_step,
                     'pruner_state_dict': model.pruner_manager.state_dict(),
+                    'adapter_state_dict': model.adapter_manager.state_dict(),
                     'disc_state_dict': model.disc_manager.state_dict(),
                     'pruner_optimizer': pruner_optimizer.state_dict(),
                     'disc_optimizer': disc_optimizer.state_dict(),
@@ -907,6 +911,7 @@ def train(config):
     torch.save({
         'step': global_step,
         'pruner_state_dict': model.pruner_manager.state_dict(),
+        'adapter_state_dict': model.adapter_manager.state_dict(),
         'disc_state_dict': model.disc_manager.state_dict(),
     }, final_path)
     logger.info(f"Training completed. Final checkpoint saved to {final_path}")

@@ -41,37 +41,27 @@ class LayerDiscriminator(nn.Module):
         self.head_dim = head_dim
         self.input_dim = num_heads * head_dim  # 32 * 128 = 4096
 
-        # 构建网络层 - 更平缓的降维
-        # 4096 -> 1024 -> 512 -> 256 -> 1
-        layers = []
-
-        def make_layer(in_dim, out_dim):
-            linear = nn.Linear(in_dim, out_dim)
-            if use_spectral_norm:
-                linear = nn.utils.spectral_norm(linear)
-            return [
-                linear,
-                nn.LayerNorm(out_dim),
-                nn.GELU(),
-                nn.Dropout(dropout)
-            ]
-
-        # Layer 1: 4096 -> 1024
-        layers.extend(make_layer(self.input_dim, 1024))
-
-        # Layer 2: 1024 -> 512
-        layers.extend(make_layer(1024, 512))
-
-        # Layer 3: 512 -> 256
-        layers.extend(make_layer(512, d_hidden))
-
-        # Output layer: 256 -> 1
+        # 简化的网络结构: 4096 -> 512 -> 256 -> 1
+        linear1 = nn.Linear(self.input_dim, 512)
+        linear2 = nn.Linear(512, d_hidden)
         linear_out = nn.Linear(d_hidden, 1)
-        if use_spectral_norm:
-            linear_out = nn.utils.spectral_norm(linear_out)
-        layers.append(linear_out)
 
-        self.net = nn.Sequential(*layers)
+        if use_spectral_norm:
+            linear1 = nn.utils.spectral_norm(linear1)
+            linear2 = nn.utils.spectral_norm(linear2)
+            linear_out = nn.utils.spectral_norm(linear_out)
+
+        self.net = nn.Sequential(
+            linear1,
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            linear2,
+            nn.LayerNorm(d_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            linear_out
+        )
 
     def reset_parameters(self):
         """重新初始化网络参数（当判别器过强时调用）"""
