@@ -745,21 +745,21 @@ def train(config):
             stats = result['stats']
 
             # === 先 backward 所有 loss，再 step ===
-            # （因为 adv_loss 需要通过 discriminator 计算梯度，
-            #  如果先 step discriminator 会导致计算图不一致）
+            # 注意顺序：先 Pruner backward，再清零判别器梯度，再 Discriminator backward
+            # 这样 adv_loss 的梯度不会累加到判别器上
 
-            # 1. Discriminator backward
-            disc_optimizer.zero_grad()
-            disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
-            if disc_has_grad:
-                losses['disc_loss'].backward(retain_graph=True)
-
-            # 2. Pruner backward
+            # 1. Pruner backward
             pruner_optimizer.zero_grad()
             pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
             pruner_has_grad = pruner_total.requires_grad
             if pruner_has_grad:
-                pruner_total.backward()
+                pruner_total.backward(retain_graph=True)
+
+            # 2. Discriminator backward（先 zero_grad 清除 adv_loss 累加的梯度）
+            disc_optimizer.zero_grad()
+            disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
+            if disc_has_grad:
+                losses['disc_loss'].backward()
 
             # 3. Clip gradients and step
             if disc_has_grad:
