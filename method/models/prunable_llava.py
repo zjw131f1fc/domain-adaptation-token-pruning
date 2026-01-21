@@ -60,6 +60,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruner_n_heads: int = 4,
         disc_d_hidden: int = 256,
         adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
+        adapter_type: str = 'simple',    # adapter 类型: 'simple' 或 'query_aware'
+        adapter_n_heads: int = 4,        # query_aware adapter 的 attention 头数
         temperature: float = 1.0,
         dropout: float = 0.1,
         disc_use_spectral_norm: bool = False,
@@ -103,7 +105,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.adapter_manager = AdapterManager(
             layer_indices=pruning_layers,
             hidden_size=self.hidden_size,
-            bottleneck_dim=adapter_bottleneck
+            bottleneck_dim=adapter_bottleneck,
+            adapter_type=adapter_type,
+            n_vision=576,  # LLaVA 1.5 的 vision token 数量
+            n_heads=adapter_n_heads,
+            dropout=dropout
         )
 
         # 替换剪枝层
