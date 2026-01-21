@@ -785,8 +785,16 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     if is_main_process():
         logger.info("Loading dataset...")
 
+    # 临时保存原始 logger，非主进程设置为 None 以避免重复日志
+    original_logger = config.logger
+    if not is_main_process():
+        config.logger = None
+
     from engine.datas.loader import load_dataset
     data_bundle = load_dataset(config)
+
+    # 恢复原始 logger
+    config.logger = original_logger
 
     train_dataset = data_bundle['splits']['train']
     test_dataset = data_bundle['splits'].get('test', None)
@@ -1116,6 +1124,10 @@ def main():
     try:
         # 加载配置
         config = load_config(override_file=args.config)
+
+        # 非主进程：禁用 logger 以避免重复日志
+        if rank != 0:
+            config.logger = None
 
         if rank == 0:
             logger = config.logger
