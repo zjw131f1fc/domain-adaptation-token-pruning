@@ -153,7 +153,8 @@ class QueryAwareAdapter(nn.Module):
 
         # 1. Encode mask pattern
         # mask: (batch, n_vision) -> (batch, hidden)
-        mask_float = mask.float()
+        # 确保 mask 的 dtype 与模型权重一致
+        mask_float = mask.to(dtype=dtype)
         mask_emb = self.mask_encoder(mask_float)
 
         # 2. Pool question into single vector
