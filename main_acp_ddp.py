@@ -933,19 +933,27 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 pruner_optimizer.step()
 
             # 判别器过强时重新初始化
-            # 注意：重新初始化后需要同步参数到所有进程
+            # 注意：需要在所有进程间同步决策，避免死锁
             disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
             if disc_reinit_enable and 'disc_per_layer' in stats:
                 for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
                     layer_acc = (real_acc + fake_acc) / 2
-                    if layer_acc > disc_reinit_threshold:
+
+                    # 汇总所有 rank 的 accuracy（取平均），确保所有进程做出相同决策
+                    layer_acc_tensor = torch.tensor(layer_acc, device=device)
+                    if dist.is_initialized():
+                        dist.all_reduce(layer_acc_tensor, op=dist.ReduceOp.SUM)
+                        layer_acc_tensor /= dist.get_world_size()
+                    layer_acc_global = layer_acc_tensor.item()
+
+                    if layer_acc_global > disc_reinit_threshold:
                         model.disc_manager.reinit_layer(layer_idx)
                         # 重新初始化后，从 rank 0 广播新参数
                         broadcast_model_params(model, src=0)
                         if is_main_process():
                             logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited "
-                                       f"(acc={layer_acc:.2%} > {disc_reinit_threshold:.0%})")
+                                       f"(global_acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%})")
 
             # 累计统计
             for k, v in losses.items():
