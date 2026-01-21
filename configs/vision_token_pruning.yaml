@@ -23,7 +23,7 @@ trainer_settings:
         type: "adam"
         lr: 2.0e-04
     print_loss_every_batches: 50
-    eval_every_batches: 1000
+    eval_every_batches: 10
     eval_max_samples: 1000
     save_every_batches: 1000
     grad_clip_max_norm: null
@@ -47,7 +47,7 @@ method_settings:
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
   pruner_d_internal: 256   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
-  pruner_dropout: 0.1
+  pruner_dropout: 0.2
 
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
@@ -76,8 +76,8 @@ method_settings:
   # adv_loss: 让 fake 被判为 real
   # sparsity_loss: 约束保留率到目标值
 
-  task_loss_weight: 1.5
-  adv_loss_weight: 0.9   # 增加到 1.0，让 pruner 更努力骗过判别器
+  task_loss_weight: 1.1
+  adv_loss_weight: 0.5   # 增加到 1.0，让 pruner 更努力骗过判别器
   sparsity_weight: 0.2   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
@@ -86,9 +86,9 @@ method_settings:
   adv_loss_weight_start: 0.7
 
   # Sparsity warmup - 启用，逐渐增加 sparsity 约束
-  sparsity_warmup_enable: true
+  sparsity_warmup_enable: false
   sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard"]
+  eval_mode: ["origin", "hard"]
