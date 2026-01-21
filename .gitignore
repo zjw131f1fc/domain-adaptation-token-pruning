@@ -3,3 +3,4 @@ outputs
 *.pyc
 .history
 start_claude.sh
+wandb

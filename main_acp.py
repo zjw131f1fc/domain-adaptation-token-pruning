@@ -17,7 +17,8 @@ import sys
 # 环境变量设置（在任何其他 import 之前）
 # ============================================================
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
+# os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
+os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
