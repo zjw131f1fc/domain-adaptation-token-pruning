@@ -1,0 +1,1068 @@
+#!/usr/bin/env python
+"""Attention Consistency Pruning - DDP 分布式训练脚本
+
+使用 PyTorch DistributedDataParallel (DDP) 进行多卡训练。
+
+启动方式：
+    torchrun --nproc_per_node=4 main_acp_ddp.py --config configs/vision_token_pruning.yaml
+
+特点：
+1. 使用 torchrun 启动，自动设置分布式环境
+2. 只对可训练模块使用 DDP（base_model 冻结，无需 DDP）
+3. 使用 DistributedSampler 进行数据分发
+4. 只在 rank 0 进行日志记录和模型保存
+"""
+
+import os
+import sys
+
+# 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
+# os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
+os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from collections import defaultdict
+from tqdm import tqdm
+
+# 添加项目根目录
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+
+# 导入配置加载器
+from engine.configs.loader import load_config
+
+
+# ============================================================
+# 分布式工具函数
+# ============================================================
+
+def setup_distributed():
+    """初始化分布式环境
+
+    使用 torchrun 启动时，环境变量会自动设置
+    """
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    return rank, world_size, local_rank, device
+
+
+def cleanup_distributed():
+    """清理分布式环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """判断是否是主进程"""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
+    """在所有进程间平均 tensor"""
+    if not dist.is_initialized():
+        return tensor
+
+    tensor = tensor.clone()
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor = tensor / dist.get_world_size()
+    return tensor
+
+
+# ============================================================
+# 模型加载与预处理
+# ============================================================
+
+def load_model(config, device: torch.device, local_rank: int):
+    """加载可剪枝的 LLaVA 模型（DDP 兼容版本）
+
+    关键改动：
+    1. 不使用 device_map='auto'，手动放置到指定 device
+    2. 返回可训练模块列表用于 DDP 包装
+    """
+    from transformers import LlavaForConditionalGeneration, AutoProcessor
+
+    logger = config.logger if is_main_process() else None
+    method_cfg = config.method_settings
+    backbone_cfg = config.backbone_settings
+    global_cfg = config.global_settings
+
+    # 获取数据类型配置
+    dtype_str = global_cfg.get('dtype', 'float32')
+    dtype_mapping = {
+        'float16': torch.float16,
+        'fp16': torch.float16,
+        'float32': torch.float32,
+        'fp32': torch.float32,
+        'bfloat16': torch.bfloat16,
+        'bf16': torch.bfloat16,
+    }
+    torch_dtype = dtype_mapping.get(dtype_str, torch.float32)
+    if logger:
+        logger.info(f"Using dtype: {dtype_str} -> {torch_dtype}")
+
+    # 获取剪枝层配置
+    pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
+    pruner_d_internal = method_cfg.get('pruner_d_internal', 128)
+    pruner_n_heads = method_cfg.get('pruner_n_heads', 4)
+    disc_d_hidden = method_cfg.get('disc_d_d', 256)
+    temperature = method_cfg.get('temperature', 1.0)
+    dropout = method_cfg.get('pruner_dropout', 0.1)
+    disc_spectral_norm = method_cfg.get('disc_use_spectral_norm', False)
+
+    # 模型路径
+    model_name = backbone_cfg.get('name', 'llava-1.5-7b')
+    model_mapping = {
+        'llava-1.5-7b': 'llava-hf/llava-1.5-7b-hf',
+        'llava-1.5-13b': 'llava-hf/llava-1.5-13b-hf',
+    }
+    model_path = model_mapping.get(model_name, model_name)
+
+    if logger:
+        logger.info(f"Loading base model from {model_path}...")
+
+    # 加载基础模型 - 不使用 device_map='auto'
+    # 先加载到 CPU，然后手动移动到指定 device
+    base_model = LlavaForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch_dtype,
+        # 不使用 device_map，让模型先加载到 CPU
+        device_map=None,
+        low_cpu_mem_usage=True,
+    )
+
+    # 手动移动到指定设备
+    base_model = base_model.to(device)
+
+    processor = AutoProcessor.from_pretrained(model_path)
+
+    # 设置 padding side 为 right
+    processor.tokenizer.padding_side = "right"
+
+    # 将 processor 附加到模型
+    base_model.processor = processor
+
+    # 创建可剪枝模型
+    from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
+
+    model = PrunableLlavaForConditionalGeneration(
+        base_model=base_model,
+        pruning_layers=pruning_layers,
+        pruner_d_internal=pruner_d_internal,
+        pruner_n_heads=pruner_n_heads,
+        disc_d_hidden=disc_d_hidden,
+        temperature=temperature,
+        dropout=dropout,
+        disc_use_spectral_norm=disc_spectral_norm,
+    )
+
+    # 冻结基础模型
+    model.freeze_base_model()
+
+    if logger:
+        logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
+        logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, "
+                   f"Adapters={sum(p.numel() for p in model.get_adapter_parameters()):,}, "
+                   f"Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
+
+    return model, processor
+
+
+def sync_gradients(model):
+    """手动同步所有可训练参数的梯度
+
+    由于我们的模型结构特殊（冻结主干 + 可训练小模块），
+    使用手动梯度同步比 DDP 更灵活。
+
+    这个函数会对所有有梯度的参数执行 all_reduce 平均。
+    """
+    if not dist.is_initialized():
+        return
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+
+    # 收集所有需要同步的梯度
+    grads = []
+    for param in model.get_pruner_parameters():
+        if param.grad is not None:
+            grads.append(param.grad.data)
+    for param in model.get_adapter_parameters():
+        if param.grad is not None:
+            grads.append(param.grad.data)
+    for param in model.get_discriminator_parameters():
+        if param.grad is not None:
+            grads.append(param.grad.data)
+
+    # 合并成一个大 tensor 以减少通信开销
+    if grads:
+        # 扁平化所有梯度
+        flat_grads = torch.cat([g.flatten() for g in grads])
+
+        # All-reduce（求和后平均）
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+        flat_grads.div_(world_size)
+
+        # 写回原始梯度
+        offset = 0
+        for grad in grads:
+            numel = grad.numel()
+            grad.copy_(flat_grads[offset:offset + numel].view_as(grad))
+            offset += numel
+
+
+def broadcast_model_params(model, src: int = 0):
+    """从 src 进程广播模型参数到所有进程
+
+    在训练开始前调用，确保所有进程的模型参数一致。
+    """
+    if not dist.is_initialized():
+        return
+
+    for param in model.get_pruner_parameters():
+        dist.broadcast(param.data, src=src)
+    for param in model.get_adapter_parameters():
+        dist.broadcast(param.data, src=src)
+    for param in model.get_discriminator_parameters():
+        dist.broadcast(param.data, src=src)
+
+
+def preprocess_batch(
+    batch: List[Dict[str, Any]],
+    processor,
+    device: torch.device,
+    max_length: int = 1024,
+    mode: str = "train"
+) -> Dict[str, Any]:
+    """预处理一个 batch 的数据（与原版相同）"""
+    images = [sample['image'] for sample in batch]
+    questions = [sample['question'] for sample in batch]
+
+    if mode == "train":
+        answers = [sample['answer'] for sample in batch]
+        prompts = []
+        for q, a in zip(questions, answers):
+            prompt = f"USER: <image>\n{q}\nASSISTANT: {a}"
+            prompts.append(prompt)
+    else:
+        answers = None
+        prompts = []
+        for q in questions:
+            prompt = f"USER: <image>\n{q}\nASSISTANT:"
+            prompts.append(prompt)
+
+    inputs = processor(
+        text=prompts,
+        images=images,
+        return_tensors="pt",
+        padding=True,
+    ).to(device)
+
+    input_ids = inputs['input_ids']
+    batch_size, seq_len = input_ids.shape
+
+    image_token_id = processor.tokenizer.convert_tokens_to_ids('<image>')
+    n_vision_tokens = 576
+
+    image_positions = (input_ids[0] == image_token_id).nonzero(as_tuple=True)[0]
+
+    if len(image_positions) > 0:
+        vision_start = image_positions[0].item()
+        vision_end = vision_start + n_vision_tokens
+    else:
+        vision_start = 1
+        vision_end = vision_start + n_vision_tokens
+
+    assistant_ids = processor.tokenizer.encode("\nASSISTANT:", add_special_tokens=False)
+    if assistant_ids[0] == 29871:
+        assistant_ids = assistant_ids[1:]
+
+    assistant_positions = []
+    for i in range(batch_size):
+        ids = input_ids[i].tolist()
+        found = False
+        for j in range(len(ids) - len(assistant_ids) + 1):
+            if ids[j:j+len(assistant_ids)] == assistant_ids:
+                assistant_positions.append(j + len(assistant_ids))
+                found = True
+                break
+        if not found:
+            raise ValueError(f"Cannot find ASSISTANT: in sample {i}")
+
+    question_starts = [vision_end] * batch_size
+    question_ends = assistant_positions
+
+    result = {
+        'inputs': inputs,
+        'images': images,
+        'questions': questions,
+        'vision_start': vision_start,
+        'vision_end': vision_end,
+        'question_starts': question_starts,
+        'question_ends': question_ends,
+        'n_vision': n_vision_tokens,
+    }
+
+    if mode == "train":
+        answer_starts = assistant_positions
+
+        pad_token_id = processor.tokenizer.pad_token_id
+        answer_ends = []
+        for i in range(batch_size):
+            ids = input_ids[i].tolist()
+            end_pos = seq_len
+            for j in range(answer_starts[i], seq_len):
+                if ids[j] == pad_token_id:
+                    end_pos = j
+                    break
+            answer_ends.append(end_pos)
+
+        for i in range(batch_size):
+            if answer_ends[i] <= answer_starts[i]:
+                raise ValueError(f"Empty answer region in sample {i}")
+
+        result['answers'] = answers
+        result['answer_starts'] = answer_starts
+        result['answer_ends'] = answer_ends
+
+    return result
+
+
+# ============================================================
+# 损失计算
+# ============================================================
+
+def compute_task_loss(
+    logits: torch.Tensor,
+    answer_starts: List[int],
+    answers: List[str],
+    tokenizer,
+    device: torch.device
+) -> torch.Tensor:
+    """计算 task loss (cross entropy)"""
+    batch_size = logits.shape[0]
+    total_loss = torch.tensor(0.0, device=device)
+
+    for i in range(batch_size):
+        answer = answers[i].capitalize()
+        answer_ids = tokenizer(answer, add_special_tokens=False)['input_ids']
+        if len(answer_ids) == 0:
+            continue
+
+        pred_start = answer_starts[i] - 1
+        pred_end = min(pred_start + len(answer_ids), logits.shape[1] - 1)
+
+        if pred_start < 0 or pred_end <= pred_start:
+            continue
+
+        pred_logits = logits[i, pred_start:pred_end]
+        target_len = min(len(answer_ids), pred_end - pred_start)
+        targets = torch.tensor(answer_ids[:target_len], device=device)
+
+        loss = F.cross_entropy(pred_logits, targets)
+        total_loss = total_loss + loss
+
+    return total_loss / batch_size if batch_size > 0 else total_loss
+
+
+# ============================================================
+# 训练步骤
+# ============================================================
+
+def train_step(
+    batch: List[Dict[str, Any]],
+    model,
+    processor,
+    config,
+    current_step: int,
+    total_steps: int,
+    device: torch.device
+) -> Dict[str, Any]:
+    """执行一个训练步骤"""
+    method_cfg = config.method_settings
+
+    # === Temperature Annealing ===
+    temperature = method_cfg.get('temperature', 1.0)
+    temperature_min = method_cfg.get('temperature_min', 0.5)
+    anneal_rate = method_cfg.get('temperature_anneal_rate', 0.4)
+
+    progress = current_step / total_steps if total_steps > 0 else 0
+    if progress < anneal_rate:
+        current_temp = temperature - (progress / anneal_rate) * (temperature - temperature_min)
+    else:
+        current_temp = temperature_min
+
+    model.set_temperature(current_temp)
+
+    # === 预处理 ===
+    prep = preprocess_batch(batch, processor, device)
+    inputs = prep['inputs']
+
+    # === Forward ===
+    model.train()
+
+    output = model(
+        input_ids=inputs['input_ids'],
+        pixel_values=inputs['pixel_values'],
+        attention_mask=inputs['attention_mask'],
+        vision_start=prep['vision_start'],
+        vision_end=prep['vision_end'],
+        question_starts=prep['question_starts'],
+        question_ends=prep['question_ends'],
+        answer_starts=prep['answer_starts'],
+        answer_ends=prep['answer_ends'],
+        return_pruning_info=True,
+    )
+
+    # === 计算 Losses ===
+    losses = {}
+    stats = {'temperature': current_temp}
+
+    # 1. Task Loss
+    task_loss = compute_task_loss(
+        output.logits,
+        prep['answer_starts'],
+        prep['answers'],
+        processor.tokenizer,
+        device
+    )
+    losses['task_loss'] = task_loss
+    stats['raw_task_loss'] = task_loss.item()
+
+    # 2. 如果有剪枝信息，计算 GAN 相关 losses
+    if output.pruning_infos and len(output.pruning_infos) > 0:
+        h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
+        h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
+
+        loss_type = method_cfg.get('disc_loss_type', 'bce')
+        gp_weight = method_cfg.get('disc_gp_weight', 10.0)
+
+        warmup_ratio = method_cfg.get('pruner_warmup_ratio', 0.0)
+        in_warmup = current_step < total_steps * warmup_ratio
+        gan_weight = 0.0 if in_warmup else 1.0
+        stats['in_warmup'] = in_warmup
+
+        # 获取 disc_manager（可能被 DDP 包装）
+        disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
+
+        adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
+        losses['adv_loss'] = adv_loss * gan_weight
+        stats['raw_adv_loss'] = adv_loss.item()
+
+        disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
+        losses['disc_loss'] = disc_loss * gan_weight
+        stats['raw_disc_loss'] = disc_loss.item()
+
+        acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
+        stats['disc_accuracy'] = acc_info['overall']
+        stats['disc_real_acc'] = acc_info['real_acc']
+        stats['disc_fake_acc'] = acc_info['fake_acc']
+        stats['disc_per_layer'] = acc_info['per_layer']
+
+        # Sparsity Loss
+        target_token_num = method_cfg.get('target_token_num', 144)
+        n_vision = prep['n_vision']
+        target_ratio = target_token_num / n_vision
+
+        total_layers = len(model.base_model.language_model.layers)
+        pruning_layers = sorted(output.pruning_infos.keys())
+
+        weighted_kept = torch.tensor(0.0, device=device)
+        cumulative_mask = None
+
+        for i, layer_idx in enumerate(pruning_layers):
+            if i == 0:
+                n_layers_before = layer_idx
+                weighted_kept = weighted_kept + n_layers_before * 1.0
+
+            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
+            layer_mask = hard_mask.float().mean(dim=0)
+
+            if cumulative_mask is None:
+                cumulative_mask = layer_mask
+            else:
+                cumulative_mask = cumulative_mask * layer_mask
+
+            cumulative_ratio = cumulative_mask.mean()
+            stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
+
+            if i < len(pruning_layers) - 1:
+                n_affected = pruning_layers[i + 1] - layer_idx
+            else:
+                n_affected = total_layers - layer_idx
+
+            weighted_kept = weighted_kept + n_affected * cumulative_ratio
+
+        avg_kept_ratio_tensor = weighted_kept / total_layers
+        sparsity_loss = torch.abs(avg_kept_ratio_tensor - target_ratio)
+
+        losses['sparsity_loss'] = sparsity_loss
+        stats['raw_sparsity_loss'] = sparsity_loss.item()
+        stats['avg_kept_ratio'] = avg_kept_ratio_tensor.item()
+        stats['target_kept_ratio'] = target_ratio
+        stats['total_layers'] = total_layers
+
+    # === 应用权重 ===
+    task_weight = method_cfg.get('task_loss_weight', 1.0)
+    adv_weight = method_cfg.get('adv_loss_weight', 0.5)
+    sparsity_weight = method_cfg.get('sparsity_weight', 0.2)
+
+    warmup_ratio = method_cfg.get('loss_weight_warmup_ratio', 0.0)
+    if warmup_ratio > 0 and progress < warmup_ratio:
+        warmup_progress = progress / warmup_ratio
+        cosine_factor = (1 - torch.cos(torch.tensor(warmup_progress * 3.14159))) / 2
+
+        task_weight_start = method_cfg.get('task_loss_weight_start', task_weight)
+        adv_weight_start = method_cfg.get('adv_loss_weight_start', adv_weight)
+
+        task_weight = task_weight_start + (task_weight - task_weight_start) * cosine_factor.item()
+        adv_weight = adv_weight_start + (adv_weight - adv_weight_start) * cosine_factor.item()
+
+    if method_cfg.get('sparsity_warmup_enable', False):
+        sparsity_warmup_ratio = method_cfg.get('sparsity_warmup_ratio', 0.2)
+        sparsity_weight_max = method_cfg.get('sparsity_weight_max', sparsity_weight)
+        if progress < sparsity_warmup_ratio:
+            sparsity_weight = sparsity_weight + (sparsity_weight_max - sparsity_weight) * (progress / sparsity_warmup_ratio)
+        else:
+            sparsity_weight = sparsity_weight_max
+
+    stats['task_weight'] = task_weight
+    stats['adv_weight'] = adv_weight
+    stats['sparsity_weight'] = sparsity_weight
+
+    weighted_losses = {
+        'task_loss': losses['task_loss'] * task_weight,
+    }
+    if 'adv_loss' in losses:
+        weighted_losses['adv_loss'] = losses['adv_loss'] * adv_weight
+    if 'sparsity_loss' in losses:
+        weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
+    if 'disc_loss' in losses:
+        weighted_losses['disc_loss'] = losses['disc_loss']
+
+    return {
+        'losses': weighted_losses,
+        'stats': stats,
+        'pruning_infos': {idx: info for idx, info in output.pruning_infos.items()} if output.pruning_infos else None,
+    }
+
+
+# ============================================================
+# 评估
+# ============================================================
+
+@torch.no_grad()
+def evaluate(
+    model,
+    processor,
+    dataset,
+    judge,
+    config,
+    device: torch.device,
+    max_samples: int = 500,
+    mode: str = "origin",
+) -> Dict[str, float]:
+    """评估模型（只在主进程执行）"""
+    model.eval()
+
+    n_samples = min(len(dataset), max_samples)
+    predictions = []
+    references = []
+    kept_ratios = []
+    layer_kept_ratios = {}
+
+    pruning_layers = config.method_settings.get('pruning_layers', [4, 14, 24])
+    desc = f"Evaluating ({mode})"
+
+    for i in tqdm(range(n_samples), desc=desc, disable=not is_main_process()):
+        sample = dataset[i]
+
+        if mode == "hard":
+            preprocessed = preprocess_batch(
+                batch=[sample],
+                processor=processor,
+                device=device,
+                mode="inference"
+            )
+            inputs = preprocessed['inputs']
+
+            output_ids, stats = model.generate_with_hard_pruning(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                attention_mask=inputs.get('attention_mask'),
+                vision_start=preprocessed['vision_start'],
+                vision_end=preprocessed['vision_end'],
+                question_starts=preprocessed['question_starts'],
+                question_ends=preprocessed['question_ends'],
+                max_new_tokens=32,
+            )
+
+            if 'avg_kept_ratio' in stats:
+                kept_ratios.append(stats['avg_kept_ratio'])
+            for key, value in stats.items():
+                if key.startswith('L') and '_kept' in key:
+                    layer_idx = int(key[1:].split('_')[0])
+                    if key.endswith('_n_kept'):
+                        if f'{layer_idx}_n_kept' not in layer_kept_ratios:
+                            layer_kept_ratios[f'{layer_idx}_n_kept'] = []
+                        layer_kept_ratios[f'{layer_idx}_n_kept'].append(value)
+                    elif key == f'L{layer_idx}_kept':
+                        if layer_idx not in layer_kept_ratios:
+                            layer_kept_ratios[layer_idx] = []
+                        layer_kept_ratios[layer_idx].append(value)
+        else:
+            prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
+            inputs = processor(
+                text=prompt,
+                images=sample['image'],
+                return_tensors="pt",
+            ).to(device)
+
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=32,
+                do_sample=False,
+            )
+
+        generated = processor.decode(output_ids[0], skip_special_tokens=True)
+
+        if "ASSISTANT:" in generated:
+            pred = generated.split("ASSISTANT:")[-1].strip()
+        else:
+            pred = generated.strip()
+
+        predictions.append(pred)
+
+        if 'answers' in sample:
+            references.append(sample['answers'])
+        else:
+            references.append(sample['answer'])
+
+    result = judge(predictions, references)
+
+    eval_result = {
+        'accuracy': result['accuracy'],
+        'correct': result['correct'],
+        'total': result['total'],
+        'mode': mode,
+    }
+
+    if kept_ratios:
+        eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)
+
+    for key, values in layer_kept_ratios.items():
+        if isinstance(key, int):
+            eval_result[f'L{key}_kept'] = sum(values) / len(values)
+        elif isinstance(key, str) and key.endswith('_n_kept'):
+            layer_idx = key.split('_')[0]
+            eval_result[f'L{layer_idx}_n_kept'] = sum(values) / len(values)
+
+    return eval_result
+
+
+# ============================================================
+# 简单 Dataset 包装器
+# ============================================================
+
+class SimpleDataset(torch.utils.data.Dataset):
+    """简单的 Dataset 包装器，用于支持 DataLoader"""
+    def __init__(self, data_list):
+        self.data = data_list
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+def collate_fn(batch):
+    """DataLoader 的 collate 函数，直接返回样本列表"""
+    return batch
+
+
+# ============================================================
+# 主训练循环
+# ============================================================
+
+def train(config, rank: int, world_size: int, local_rank: int, device: torch.device):
+    """主训练函数（分布式版本）"""
+    logger = config.logger if is_main_process() else None
+    method_cfg = config.method_settings
+
+    pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
+
+    # 启用 anomaly detection
+    torch.autograd.set_detect_anomaly(True)
+
+    # 设置随机种子（每个进程使用不同的种子以获得不同的数据顺序）
+    seed = config.global_settings.get('seed', 42)
+    torch.manual_seed(seed + rank)
+
+    # 加载模型
+    model, processor = load_model(config, device, local_rank)
+
+    # 广播模型参数，确保所有进程的初始参数一致
+    broadcast_model_params(model, src=0)
+
+    if is_main_process():
+        logger.info("Model parameters broadcasted to all processes.")
+
+    # 加载数据
+    if is_main_process():
+        logger.info("Loading dataset...")
+
+    from engine.datas.loader import load_dataset
+    data_bundle = load_dataset(config)
+
+    train_dataset = data_bundle['splits']['train']
+    test_dataset = data_bundle['splits'].get('test', None)
+    judge = data_bundle['judge']
+
+    dataset_name = config.dataset_settings.get('name', 'unknown')
+    if is_main_process():
+        logger.info(f"Dataset: {dataset_name}")
+        logger.info(f"Train samples: {len(train_dataset)}")
+        if test_dataset:
+            logger.info(f"Test samples: {len(test_dataset)}")
+
+    # 创建 DistributedSampler 和 DataLoader
+    train_wrapper = SimpleDataset(train_dataset)
+    train_sampler = DistributedSampler(
+        train_wrapper,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=seed,
+    )
+
+    trainer_cfg = config.trainer_settings.get('dl_settings', {})
+    batch_size = trainer_cfg.get('batch_size', 4)
+
+    train_loader = DataLoader(
+        train_wrapper,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        collate_fn=collate_fn,
+        num_workers=0,  # 图像处理需要在主进程
+        pin_memory=True,
+    )
+
+    # 创建优化器
+    opt_cfg = trainer_cfg.get('optimizers', {})
+
+    pruner_lr = opt_cfg.get('layer_pruners', {}).get('lr', 1e-4)
+    pruner_weight_decay = opt_cfg.get('layer_pruners', {}).get('weight_decay', 0.0)
+    disc_lr = opt_cfg.get('discriminator', {}).get('lr', 1.5e-4)
+
+    from itertools import chain
+    pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
+    pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
+    disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
+
+    # 训练参数
+    epochs = trainer_cfg.get('epochs', 1)
+    print_every = trainer_cfg.get('print_loss_every_batches', 50)
+    eval_every = trainer_cfg.get('eval_every_batches', 1000)
+    eval_max_samples = trainer_cfg.get('eval_max_samples', 500)
+    save_every = trainer_cfg.get('save_every_batches', 3000)
+    grad_clip = trainer_cfg.get('grad_clip_max_norm', None)
+
+    # 计算总步数
+    total_batches_per_epoch = len(train_loader)
+    total_steps = epochs * total_batches_per_epoch
+
+    if is_main_process():
+        logger.info(f"Training config: epochs={epochs}, batch_size={batch_size}, "
+                   f"batches_per_epoch={total_batches_per_epoch}")
+        logger.info(f"Total steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
+        logger.info(f"World size: {world_size}, Effective batch size: {batch_size * world_size}")
+
+    # 保存目录
+    save_dir = Path(config.global_settings.get('save_dir', './outputs/checkpoints'))
+    if is_main_process():
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    # 训练循环
+    global_step = 0
+    cached_origin_result = None
+
+    for epoch in range(epochs):
+        # 设置 epoch 以确保不同 epoch 的 shuffle 不同
+        train_sampler.set_epoch(epoch)
+
+        if is_main_process():
+            logger.info(f"{'='*60}")
+            logger.info(f"Epoch {epoch + 1}/{epochs}")
+            logger.info(f"{'='*60}")
+
+        epoch_losses = defaultdict(float)
+        epoch_stats = defaultdict(float)
+        n_batches = 0
+
+        # 使用 tqdm 包装 DataLoader（只在主进程显示进度条）
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+
+        for batch in pbar:
+            # 训练步骤
+            result = train_step(
+                batch=batch,
+                model=model,
+                processor=processor,
+                config=config,
+                current_step=global_step,
+                total_steps=total_steps,
+                device=device,
+            )
+
+            losses = result['losses']
+            stats = result['stats']
+
+            # === 先 backward 所有 loss，再同步梯度，再 step ===
+            pruner_optimizer.zero_grad()
+            pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
+            pruner_has_grad = pruner_total.requires_grad
+            if pruner_has_grad:
+                pruner_total.backward(retain_graph=True)
+
+            disc_optimizer.zero_grad()
+            disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
+            if disc_has_grad:
+                losses['disc_loss'].backward()
+
+            # === 同步梯度（关键步骤！）===
+            sync_gradients(model)
+
+            if disc_has_grad:
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.get_discriminator_parameters(), grad_clip)
+                disc_optimizer.step()
+
+            if pruner_has_grad:
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
+                pruner_optimizer.step()
+
+            # 判别器过强时重新初始化
+            # 注意：重新初始化后需要同步参数到所有进程
+            disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
+            disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
+            if disc_reinit_enable and 'disc_per_layer' in stats:
+                for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
+                    layer_acc = (real_acc + fake_acc) / 2
+                    if layer_acc > disc_reinit_threshold:
+                        model.disc_manager.reinit_layer(layer_idx)
+                        # 重新初始化后，从 rank 0 广播新参数
+                        broadcast_model_params(model, src=0)
+                        if is_main_process():
+                            logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited "
+                                       f"(acc={layer_acc:.2%} > {disc_reinit_threshold:.0%})")
+
+            # 累计统计
+            for k, v in losses.items():
+                epoch_losses[k] += v.item()
+            for k, v in stats.items():
+                if k == 'disc_per_layer':
+                    if k not in epoch_stats:
+                        epoch_stats[k] = {}
+                    for layer_idx, (real_acc, fake_acc) in v.items():
+                        if layer_idx not in epoch_stats[k]:
+                            epoch_stats[k][layer_idx] = [0, 0]
+                        epoch_stats[k][layer_idx][0] += real_acc
+                        epoch_stats[k][layer_idx][1] += fake_acc
+                else:
+                    epoch_stats[k] += v
+            n_batches += 1
+            global_step += 1
+
+            # 打印（只在主进程）
+            if global_step % print_every == 0 and is_main_process():
+                loss_str = ", ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
+                logger.info(f"Step {global_step}: {loss_str}")
+
+                if 'avg_kept_ratio' in stats:
+                    layer_ratios = []
+                    for layer_idx in pruning_layers:
+                        cumulative_key = f'L{layer_idx}_cumulative'
+                        kept_key = f'L{layer_idx}_kept'
+                        if cumulative_key in stats:
+                            layer_ratios.append(f"L{layer_idx}={stats[cumulative_key]:.2%}")
+                        elif kept_key in stats:
+                            layer_ratios.append(f"L{layer_idx}={stats[kept_key]:.2%}")
+                    layer_str = ", ".join(layer_ratios)
+                    logger.info(f"  Kept ratio: {stats['avg_kept_ratio']:.2%} "
+                               f"(target: {stats['target_kept_ratio']:.2%}) [{layer_str}]")
+
+                if 'disc_per_layer' in stats:
+                    per_layer_strs = []
+                    for layer_idx in sorted(stats['disc_per_layer'].keys()):
+                        real_acc, fake_acc = stats['disc_per_layer'][layer_idx]
+                        layer_acc = (real_acc + fake_acc) / 2
+                        per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
+                    logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
+
+            # 评估（只在主进程）
+            if test_dataset and global_step % eval_every == 0 and is_main_process():
+                logger.info(f"Evaluating at step {global_step}...")
+
+                eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
+                for eval_mode in eval_modes:
+                    if eval_mode == 'origin':
+                        if cached_origin_result is None:
+                            eval_result = evaluate(
+                                model, processor, test_dataset, judge, config, device,
+                                max_samples=eval_max_samples,
+                                mode=eval_mode
+                            )
+                            cached_origin_result = eval_result
+                            logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                        else:
+                            eval_result = cached_origin_result
+                            logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
+                    else:
+                        eval_result = evaluate(
+                            model, processor, test_dataset, judge, config, device,
+                            max_samples=eval_max_samples,
+                            mode=eval_mode
+                        )
+                        logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                        if 'avg_kept_ratio' in eval_result:
+                            layer_ratios = []
+                            for layer_idx in pruning_layers:
+                                kept_key = f'L{layer_idx}_kept'
+                                n_kept_key = f'L{layer_idx}_n_kept'
+                                if kept_key in eval_result:
+                                    if n_kept_key in eval_result:
+                                        layer_ratios.append(
+                                            f"L{layer_idx}={eval_result[kept_key]:.2%}"
+                                            f"({int(eval_result[n_kept_key])})"
+                                        )
+                                    else:
+                                        layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                            layer_str = ", ".join(layer_ratios)
+                            logger.info(f"  [{eval_mode}] Avg kept ratio: "
+                                       f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+
+                model.train()
+
+            # 保存（只在主进程）
+            if global_step % save_every == 0 and is_main_process():
+                ckpt_path = save_dir / f"checkpoint_step{global_step}.pt"
+                torch.save({
+                    'step': global_step,
+                    'pruner_state_dict': model.pruner_manager.state_dict(),
+                    'adapter_state_dict': model.adapter_manager.state_dict(),
+                    'disc_state_dict': model.disc_manager.state_dict(),
+                    'pruner_optimizer': pruner_optimizer.state_dict(),
+                    'disc_optimizer': disc_optimizer.state_dict(),
+                }, ckpt_path)
+                logger.info(f"Saved checkpoint to {ckpt_path}")
+
+            # 同步所有进程
+            if dist.is_initialized():
+                dist.barrier()
+
+        if is_main_process():
+            logger.info(f"Epoch {epoch + 1} completed.")
+
+    # 最终保存（只在主进程）
+    if is_main_process():
+        final_path = save_dir / "checkpoint_final.pt"
+        torch.save({
+            'step': global_step,
+            'pruner_state_dict': model.pruner_manager.state_dict(),
+            'adapter_state_dict': model.adapter_manager.state_dict(),
+            'disc_state_dict': model.disc_manager.state_dict(),
+        }, final_path)
+        logger.info(f"Training completed. Final checkpoint saved to {final_path}")
+
+        # 最终评估
+        if test_dataset:
+            logger.info("Final evaluation...")
+            eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
+            for eval_mode in eval_modes:
+                if eval_mode == 'origin' and cached_origin_result is not None:
+                    eval_result = cached_origin_result
+                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
+                else:
+                    eval_result = evaluate(
+                        model, processor, test_dataset, judge, config, device,
+                        max_samples=eval_max_samples,
+                        mode=eval_mode
+                    )
+                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
+                    if 'avg_kept_ratio' in eval_result:
+                        layer_ratios = []
+                        for layer_idx in pruning_layers:
+                            kept_key = f'L{layer_idx}_kept'
+                            n_kept_key = f'L{layer_idx}_n_kept'
+                            if kept_key in eval_result:
+                                if n_kept_key in eval_result:
+                                    layer_ratios.append(
+                                        f"L{layer_idx}={eval_result[kept_key]:.2%}"
+                                        f"({int(eval_result[n_kept_key])})"
+                                    )
+                                else:
+                                    layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                        layer_str = ", ".join(layer_ratios)
+                        logger.info(f"[{eval_mode}] Avg kept ratio: "
+                                   f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+
+
+# ============================================================
+# 入口
+# ============================================================
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Attention Consistency Pruning Training (DDP)")
+    parser.add_argument('--config', type=str, default='configs/vision_token_pruning.yaml',
+                        help='Path to config file')
+    args = parser.parse_args()
+
+    # 初始化分布式环境
+    rank, world_size, local_rank, device = setup_distributed()
+
+    if rank == 0:
+        print("=" * 60)
+        print("Attention Consistency Pruning - DDP Training")
+        print(f"World size: {world_size}")
+        print("=" * 60)
+
+    try:
+        # 加载配置
+        config = load_config(override_file=args.config)
+
+        if rank == 0:
+            logger = config.logger
+            logger.info("Starting Attention Consistency Pruning training (DDP)...")
+            logger.info(f"Rank: {rank}, World size: {world_size}, Local rank: {local_rank}")
+
+        # 训练
+        train(config, rank, world_size, local_rank, device)
+
+    finally:
+        # 清理
+        cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()
