@@ -158,8 +158,11 @@ class BasePreparer:
                 subset = self._category_balanced_sample(samples, need, mode)
                 result[name] = BsesDataset(subset)
             else:
-                # 按顺序截取（不打乱，保留原顺序）
-                result[name] = BsesDataset(samples[:need])
+                # 使用固定种子打乱后截取
+                random.seed(self.seed)
+                shuffled = samples[:]
+                random.shuffle(shuffled)
+                result[name] = BsesDataset(shuffled[:need])
 
         # 对于 split_cfg 中声明但未在 presplits 出现的占位/全量, 创建空集合或占位
         for name, v in self.split_cfg.items():
