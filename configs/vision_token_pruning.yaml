@@ -61,7 +61,7 @@ method_settings:
   disc_reinit_threshold: 0.95    # 判别器准确率超过此阈值时重新初始化
 
   # ==================== Pruner Warmup ====================
-  pruner_warmup_ratio: 0.1  # 前 10% 步数不做对抗训练
+  pruner_warmup_ratio: 0.2  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
