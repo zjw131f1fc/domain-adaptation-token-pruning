@@ -281,7 +281,7 @@ class LayerDiscriminatorManager(nn.Module):
         )[0]
 
         # 梯度范数
-        gradients = gradients.view(batch_size, -1)
+        gradients = gradients.reshape(batch_size, -1)
         gradient_norm = gradients.norm(2, dim=1)
         # 惩罚项: (||grad|| - 1)^2
         gradient_penalty = ((gradient_norm - 1) ** 2).mean()
