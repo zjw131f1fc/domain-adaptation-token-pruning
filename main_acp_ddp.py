@@ -607,8 +607,8 @@ def evaluate(
     pruning_layers = config.method_settings.get('pruning_layers', [4, 14, 24])
     desc = f"Evaluating ({mode})"
 
-    # 显示进度条：分布式时所有 rank 都显示，非分布式时只有主进程显示
-    show_progress = distributed or is_main_process()
+    # 只在主进程显示进度条
+    show_progress = is_main_process()
 
     for i in tqdm(local_indices, desc=desc, disable=not show_progress):
         sample = dataset[i]
