@@ -55,31 +55,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 从原始层获取配置
         self.hidden_size = original_layer.hidden_size
 
-        # === 推理剪枝模式 ===
-        # 缓存的 hard_mask，用于 generate 时复用
-        self._cached_mask: Optional[torch.Tensor] = None
-        self._inference_pruning_enabled: bool = False
-        self._vision_start: Optional[int] = None
-        self._vision_end: Optional[int] = None
-
-    def enable_inference_pruning(self, vision_start: int, vision_end: int):
-        """启用推理剪枝模式"""
-        self._inference_pruning_enabled = True
-        self._vision_start = vision_start
-        self._vision_end = vision_end
-        self._cached_mask = None  # 清除旧缓存
-
-    def disable_inference_pruning(self):
-        """禁用推理剪枝模式"""
-        self._inference_pruning_enabled = False
-        self._cached_mask = None
-        self._vision_start = None
-        self._vision_end = None
-
-    def set_cached_mask(self, mask: torch.Tensor):
-        """设置缓存的 mask（外部预计算后设置）"""
-        self._cached_mask = mask
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -130,20 +105,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 return output, None
             return output
 
-        # === 推理剪枝模式（generate 调用时使用缓存的 mask）===
-        if self._inference_pruning_enabled and self._cached_mask is not None:
-            return self._forward_with_cached_mask(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs
-            )
-
-        # 如果没有提供剪枝参数（如 generate 调用且未启用推理剪枝），直接调用原始 layer
+        # 如果没有提供剪枝参数（如 generate 调用），直接调用原始 layer
         if vision_start is None or vision_end is None:
             output = self.original_layer(
                 hidden_states,
@@ -380,119 +342,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 'layer_idx': self.layer_idx,
             }
             return hidden_states, pruning_info
-
-        return hidden_states
-
-    def _forward_with_cached_mask(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        position_ids: Optional[torch.LongTensor],
-        past_key_values: Optional[Any],
-        use_cache: bool,
-        cache_position: Optional[torch.LongTensor],
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        **kwargs
-    ):
-        """使用缓存的 mask 进行推理（用于 generate）
-
-        与 _forward_with_pruning 类似，但使用预先计算的 mask，
-        不计算 h_real/h_fake，也不返回 pruning_info。
-        """
-        layer = self.original_layer
-        attn = layer.self_attn
-
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # 获取配置
-        num_heads = attn.config.num_attention_heads
-        num_kv_heads = attn.config.num_key_value_heads
-        head_dim = attn.head_dim
-        num_kv_groups = num_heads // num_kv_heads
-
-        vision_start = self._vision_start
-        vision_end = self._vision_end
-
-        # === Step 1: LayerNorm + Q/K/V 投影 ===
-        residual = hidden_states
-        hidden_states_normed = layer.input_layernorm(hidden_states)
-
-        query_states = attn.q_proj(hidden_states_normed)
-        key_states = attn.k_proj(hidden_states_normed)
-        value_states = attn.v_proj(hidden_states_normed)
-
-        query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-
-        # Apply RoPE
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # Handle KV cache
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        # Repeat KV for GQA
-        key_states = repeat_kv(key_states, num_kv_groups)
-        value_states = repeat_kv(value_states, num_kv_groups)
-
-        # === Step 2: 计算 Attention Weights ===
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
-
-        if attention_mask is not None:
-            causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-        # === Step 3: 应用缓存的 mask ===
-        # _cached_mask: (batch, n_vision)
-        hard_mask = self._cached_mask
-
-        # 确保 batch size 匹配（可能因为 generate 时 batch=1）
-        if hard_mask.shape[0] != batch_size:
-            hard_mask = hard_mask[:batch_size]
-
-        # 扩展 mask: (batch, n_vision) -> (batch, 1, 1, n_vision)
-        mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)
-
-        # 只对 vision tokens 部分应用 mask
-        # 注意：在 KV cache 模式下，key_states 可能包含历史 tokens
-        kv_seq_len = key_states.shape[-2]
-        if kv_seq_len >= vision_end:
-            # 完整序列，直接应用 mask
-            attn_weights[:, :, :, vision_start:vision_end] = \
-                attn_weights[:, :, :, vision_start:vision_end] * mask_expanded
-
-        # 重新归一化
-        attn_sum = attn_weights.sum(dim=-1, keepdim=True)
-        attn_weights = attn_weights / (attn_sum + 1e-8)
-
-        # === Step 4: 计算 output ===
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        # === Step 4.5: Adapter 修正（推理时也使用）===
-        if self.adapter is not None:
-            attn_output_perm = attn_output.permute(0, 2, 1, 3)
-            attn_output_flat = attn_output_perm.reshape(batch_size, seq_len, -1)
-            attn_output_adapted = self.adapter(attn_output_flat)
-            attn_output = attn_output_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, seq_len, -1)
-        attn_output = attn.o_proj(attn_output)
-
-        hidden_states = residual + attn_output
-
-        # === Step 5: MLP ===
-        residual = hidden_states
-        hidden_states = layer.post_attention_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
         return hidden_states
 

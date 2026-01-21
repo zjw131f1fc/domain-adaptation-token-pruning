@@ -483,238 +483,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         """生成文本（直接调用基础模型）"""
         return self.base_model.generate(*args, **kwargs)
 
-    # ========== 推理剪枝模式 ==========
-
-    def compute_pruning_masks(
-        self,
-        input_ids: torch.LongTensor,
-        pixel_values: torch.FloatTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        vision_start: int = None,
-        vision_end: int = None,
-        question_starts: List[int] = None,
-        question_ends: List[int] = None,
-    ) -> Dict[int, torch.Tensor]:
-        """预计算剪枝 masks
-
-        在 generate 之前调用，为每个剪枝层计算 hard_mask。
-        现在会计算 q2v_attn 并传给 pruner。
-
-        参数:
-            input_ids: 输入 token IDs
-            pixel_values: 图像像素值
-            attention_mask: 注意力掩码
-            vision_start: vision tokens 起始位置
-            vision_end: vision tokens 结束位置
-            question_starts: 每个样本的 question 开始位置
-            question_ends: 每个样本的 question 结束位置
-
-        返回:
-            masks: {layer_idx: hard_mask} 字典
-        """
-        from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
-
-        self.eval()
-        model = self.base_model.model
-        llm = model.language_model
-
-        # 获取 image features 并准备 inputs_embeds
-        vision_feature_layer = self.config.vision_feature_layer
-        vision_feature_select_strategy = self.config.vision_feature_select_strategy
-
-        inputs_embeds = model.get_input_embeddings()(input_ids)
-
-        if pixel_values is not None:
-            image_features = model.get_image_features(
-                pixel_values=pixel_values,
-                vision_feature_layer=vision_feature_layer,
-                vision_feature_select_strategy=vision_feature_select_strategy,
-            )
-            image_features = torch.cat(image_features, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
-            special_image_mask = model.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_features
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
-
-        # 自动检测 vision tokens 位置
-        if vision_start is None:
-            vision_start = 1  # 跳过 BOS
-        if vision_end is None:
-            vision_end = vision_start + 576  # LLaVA 1.5 默认 576 tokens
-
-        batch_size, seq_len, _ = inputs_embeds.shape
-
-        # 如果没有提供 question 位置，使用默认值
-        if question_starts is None:
-            question_starts = [vision_end] * batch_size
-        if question_ends is None:
-            # 默认：question 到序列末尾
-            question_ends = [seq_len] * batch_size
-
-        # 准备 position embeddings
-        position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0)
-        position_embeddings = llm.rotary_emb(inputs_embeds, position_ids)
-        cos, sin = position_embeddings
-
-        # 遍历所有层
-        hidden_states = inputs_embeds
-        masks = {}
-
-        for layer_idx, decoder_layer in enumerate(llm.layers):
-            # 获取原始层（如果是 PrunableLlamaDecoderLayer）
-            if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
-                original_layer = decoder_layer.original_layer
-            else:
-                original_layer = decoder_layer
-
-            if layer_idx in self.pruning_layers:
-                # 在剪枝层，计算 attention weights 和 q2v_attn
-                attn = original_layer.self_attn
-
-                # 获取配置
-                num_heads = attn.config.num_attention_heads
-                num_kv_heads = attn.config.num_key_value_heads
-                head_dim = attn.head_dim
-                num_kv_groups = num_heads // num_kv_heads
-
-                # LayerNorm + Q/K/V 投影
-                hidden_normed = original_layer.input_layernorm(hidden_states)
-                query_states = attn.q_proj(hidden_normed)
-                key_states = attn.k_proj(hidden_normed)
-
-                # Reshape
-                query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-                key_states = key_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-
-                # Apply RoPE
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-                # Repeat KV for GQA
-                key_states = repeat_kv(key_states, num_kv_groups)
-
-                # 计算 attention weights
-                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-                # 提取 question→vision attention
-                q2v_attn_list = []
-                for i in range(batch_size):
-                    q_start, q_end = question_starts[i], question_ends[i]
-                    q2v_i = attn_weights[i, :, q_start:q_end, vision_start:vision_end]
-                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
-                    q2v_attn_list.append(q2v_avg_i)
-                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
-
-                # 提取 vision hidden
-                vision_hidden = hidden_normed[:, vision_start:vision_end, :]
-
-                # 调用 pruner
-                pruner = self.pruner_manager.get_pruner(layer_idx)
-                with torch.no_grad():
-                    hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
-                masks[layer_idx] = hard_mask
-
-            # 继续前向传播（使用原始层，不剪枝）
-            hidden_states = original_layer(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-
-        return masks
-
-    def enable_inference_pruning(
-        self,
-        masks: Dict[int, torch.Tensor],
-        vision_start: int,
-        vision_end: int
-    ):
-        """启用推理剪枝模式
-
-        参数:
-            masks: 预计算的 {layer_idx: hard_mask} 字典
-            vision_start: vision tokens 起始位置
-            vision_end: vision tokens 结束位置
-        """
-        llm = self.base_model.model.language_model
-
-        for layer_idx in self.pruning_layers:
-            decoder_layer = llm.layers[layer_idx]
-            if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
-                decoder_layer.enable_inference_pruning(vision_start, vision_end)
-                if layer_idx in masks:
-                    decoder_layer.set_cached_mask(masks[layer_idx])
-
-    def disable_inference_pruning(self):
-        """禁用推理剪枝模式"""
-        llm = self.base_model.model.language_model
-
-        for layer_idx in self.pruning_layers:
-            decoder_layer = llm.layers[layer_idx]
-            if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
-                decoder_layer.disable_inference_pruning()
-
-    def generate_with_pruning(
-        self,
-        input_ids: torch.LongTensor,
-        pixel_values: torch.FloatTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        vision_start: int = None,
-        vision_end: int = None,
-        question_starts: List[int] = None,
-        question_ends: List[int] = None,
-        **generate_kwargs
-    ) -> torch.LongTensor:
-        """带剪枝的生成
-
-        参数:
-            input_ids: 输入 token IDs
-            pixel_values: 图像像素值
-            attention_mask: 注意力掩码
-            vision_start: vision tokens 起始位置（可选，自动检测）
-            vision_end: vision tokens 结束位置（可选，自动检测）
-            question_starts: 每个样本的 question 开始位置
-            question_ends: 每个样本的 question 结束位置
-            **generate_kwargs: 传递给 generate 的其他参数
-
-        返回:
-            output_ids: 生成的 token IDs
-        """
-        # 自动检测 vision tokens 位置
-        if vision_start is None:
-            vision_start = 1
-        if vision_end is None:
-            vision_end = vision_start + 576
-
-        # 1. 预计算 masks（传入 question 位置）
-        masks = self.compute_pruning_masks(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            attention_mask=attention_mask,
-            vision_start=vision_start,
-            vision_end=vision_end,
-            question_starts=question_starts,
-            question_ends=question_ends,
-        )
-
-        # 2. 启用推理剪枝
-        self.enable_inference_pruning(masks, vision_start, vision_end)
-
-        try:
-            # 3. 生成
-            output_ids = self.base_model.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                attention_mask=attention_mask,
-                **generate_kwargs
-            )
-        finally:
-            # 4. 禁用推理剪枝
-            self.disable_inference_pruning()
-
-        return output_ids
-
     def get_kept_ratio_from_masks(
         self,
         masks: Dict[int, torch.Tensor],
@@ -948,6 +716,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # 计算 attention output
             attn_output = torch.matmul(attn_weights, value_states_expanded)
             attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+
+            # === 剪枝层应用 Adapter 修正 ===
+            if layer_idx in self.pruning_layers:
+                adapter = self.adapter_manager.get_adapter(layer_idx)
+                if adapter is not None:
+                    attn_output = adapter(attn_output)
+
             attn_output = attn.o_proj(attn_output)
 
             # 残差连接
@@ -962,8 +737,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # === 在剪枝层进行硬剪枝 ===
             if layer_idx in self.pruning_layers:
                 # 计算 question->vision attention
-                current_n_vision = current_vision_end - current_vision_start
-
                 q2v_attn_list = []
                 for i in range(batch_size):
                     # 找到当前 question 在缩短后序列中的位置
