@@ -84,9 +84,6 @@ class LayerDiscriminator(nn.Module):
         返回:
             logit: (batch,) 或 (batch, n_ans) - real/fake 判断的 logit
         """
-        # L2 normalize 输入特征（消除 magnitude 差异，让判别器关注方向）
-        h = F.normalize(h, p=2, dim=-1)
-
         if h.dim() == 3:
             # 单个 answer token: (batch, heads, head_dim)
             h_flat = h.view(h.shape[0], -1)  # (batch, heads * head_dim)
