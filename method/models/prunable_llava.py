@@ -62,7 +62,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
         temperature: float = 1.0,
         dropout: float = 0.1,
-        disc_use_spectral_norm: bool = False
+        disc_use_spectral_norm: bool = False,
+        pruner_thresholds: Dict[int, float] = None  # 每层的推理阈值
     ):
         super().__init__()
 
@@ -84,7 +85,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             d_internal=pruner_d_internal,
             n_heads=pruner_n_heads,
             temperature=temperature,
-            dropout=dropout
+            dropout=dropout,
+            thresholds=pruner_thresholds
         )
 
         # 创建 Discriminators
@@ -349,6 +351,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
     def set_temperature(self, temperature: float):
         """设置所有 pruner 的温度"""
         self.pruner_manager.set_temperature(temperature)
+
+    def set_pruner_threshold(self, layer_idx: int, threshold: float):
+        """设置指定层的推理阈值"""
+        self.pruner_manager.set_threshold(layer_idx, threshold)
+
+    def set_pruner_thresholds(self, thresholds: Dict[int, float]):
+        """设置多层的推理阈值"""
+        self.pruner_manager.set_thresholds(thresholds)
 
     def get_pruner_parameters(self):
         """获取所有 pruner 的参数"""

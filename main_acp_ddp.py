@@ -126,6 +126,11 @@ def load_model(config, device: torch.device, local_rank: int):
     dropout = method_cfg.get('pruner_dropout', 0.1)
     disc_spectral_norm = method_cfg.get('disc_use_spectral_norm', False)
 
+    # 获取每层的推理阈值配置
+    pruner_thresholds_raw = method_cfg.get('pruner_thresholds', {})
+    # 确保 key 是整数
+    pruner_thresholds = {int(k): float(v) for k, v in pruner_thresholds_raw.items()} if pruner_thresholds_raw else None
+
     # 模型路径
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
     model_mapping = {
@@ -170,6 +175,7 @@ def load_model(config, device: torch.device, local_rank: int):
         temperature=temperature,
         dropout=dropout,
         disc_use_spectral_norm=disc_spectral_norm,
+        pruner_thresholds=pruner_thresholds,
     )
 
     # 冻结基础模型
@@ -177,6 +183,8 @@ def load_model(config, device: torch.device, local_rank: int):
 
     if logger:
         logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
+        if pruner_thresholds:
+            logger.info(f"Pruner thresholds: {pruner_thresholds}")
         logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, "
                    f"Adapters={sum(p.numel() for p in model.get_adapter_parameters()):,}, "
                    f"Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")

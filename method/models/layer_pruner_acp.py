@@ -26,6 +26,9 @@ class CrossAttentionPruner(nn.Module):
         n_heads: Cross-attention 头数
         temperature: Gumbel-Softmax 温度
         dropout: Dropout 比例
+        threshold: 推理时的剪枝阈值（概率空间，0-1）
+                   保留概率 > threshold 时保留 token
+                   默认 0.5 等价于训练时的行为
     """
 
     def __init__(
@@ -34,13 +37,15 @@ class CrossAttentionPruner(nn.Module):
         d_internal: int = 128,
         n_heads: int = 4,
         temperature: float = 1.0,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        threshold: float = 0.5
     ):
         super().__init__()
         self.d_model = d_model
         self.d_internal = d_internal
         self.n_heads = n_heads
         self.temperature = temperature
+        self.threshold = threshold
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
@@ -191,9 +196,10 @@ class CrossAttentionPruner(nn.Module):
             y = F.gumbel_softmax(stacked, tau=temp, hard=True, dim=-1)
             hard_mask = y[..., 1]  # 取 keep 的决策
         else:
-            # 推理模式：简单阈值判断
-            # keep_logits > 0 等价于 softmax([0, x])[1] > 0.5
-            hard_mask = (keep_logits > 0).float()
+            # 推理模式：概率阈值判断
+            # sigmoid(keep_logits) 是保留概率，threshold 是概率阈值（0-1）
+            keep_prob = torch.sigmoid(keep_logits)
+            hard_mask = (keep_prob > self.threshold).float()
 
         return hard_mask
 
@@ -226,6 +232,10 @@ class CrossAttentionPruner(nn.Module):
         """设置 Gumbel-Softmax 温度"""
         self.temperature = temperature
 
+    def set_threshold(self, threshold: float):
+        """设置推理时的剪枝阈值"""
+        self.threshold = threshold
+
 
 class LayerPrunerManager(nn.Module):
     """多层剪枝器管理器
@@ -239,6 +249,7 @@ class LayerPrunerManager(nn.Module):
         n_heads: Cross-attention 头数
         temperature: 初始温度
         dropout: Dropout 比例
+        thresholds: 每层的推理阈值字典 {layer_idx: threshold}
     """
 
     def __init__(
@@ -248,11 +259,16 @@ class LayerPrunerManager(nn.Module):
         d_internal: int = 128,
         n_heads: int = 4,
         temperature: float = 1.0,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        thresholds: Optional[Dict[int, float]] = None
     ):
         super().__init__()
         self.layer_indices = layer_indices
         self.d_model = d_model
+
+        # 默认阈值为 0
+        if thresholds is None:
+            thresholds = {}
 
         # 为每层创建独立的 pruner
         self.pruners = nn.ModuleDict({
@@ -261,7 +277,8 @@ class LayerPrunerManager(nn.Module):
                 d_internal=d_internal,
                 n_heads=n_heads,
                 temperature=temperature,
-                dropout=dropout
+                dropout=dropout,
+                threshold=thresholds.get(idx, 0.5)
             )
             for idx in layer_indices
         })
@@ -277,6 +294,16 @@ class LayerPrunerManager(nn.Module):
         """设置所有剪枝器的温度"""
         for pruner in self.pruners.values():
             pruner.set_temperature(temperature)
+
+    def set_threshold(self, layer_idx: int, threshold: float):
+        """设置指定层的推理阈值"""
+        self.get_pruner(layer_idx).set_threshold(threshold)
+
+    def set_thresholds(self, thresholds: Dict[int, float]):
+        """设置多层的推理阈值"""
+        for layer_idx, threshold in thresholds.items():
+            if layer_idx in self.layer_indices:
+                self.set_threshold(layer_idx, threshold)
 
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""

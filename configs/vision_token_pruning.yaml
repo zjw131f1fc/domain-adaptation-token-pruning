@@ -50,6 +50,15 @@ method_settings:
   pruner_n_heads: 4        # Cross-attention 头数
   pruner_dropout: 0.2
 
+  # 推理时的剪枝阈值（概率空间，0-1）
+  # 保留概率 > threshold 时保留 token
+  # 0.5 = 与训练时行为一致
+  # 0.6 = 更严格（保留更少），0.4 = 更宽松（保留更多）
+  pruner_thresholds:
+    4: 0.5
+    14: 0.5
+    24: 0.5
+
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
   disc_d_d: 512
