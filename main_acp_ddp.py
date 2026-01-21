@@ -595,6 +595,17 @@ def evaluate(
     """
     model.eval()
 
+    # 设置推理模式
+    method_cfg = config.method_settings
+    inference_mode = method_cfg.get('pruner_inference_mode', 'threshold')
+    model.pruner_manager.set_inference_mode(inference_mode)
+
+    if inference_mode == 'topk':
+        topk_ks_raw = method_cfg.get('pruner_topk_ks', {})
+        topk_ks = {int(k): int(v) for k, v in topk_ks_raw.items()} if topk_ks_raw else {}
+        if topk_ks:
+            model.pruner_manager.set_topk_ks(topk_ks)
+
     n_samples = min(len(dataset), max_samples)
 
     # 分布式评估：每个 rank 处理一部分数据
@@ -876,6 +887,9 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     global_step = 0
     cached_origin_result = None
 
+    # 统计每层的保留数量（用于推荐 topk_ks）
+    layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
+
     for epoch in range(epochs):
         # 设置 epoch 以确保不同 epoch 的 shuffle 不同
         train_sampler.set_epoch(epoch)
@@ -977,6 +991,15 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         broadcast_model_params(model, src=0)
                         if is_main_process():
                             logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited ({reinit_reason})")
+
+            # 统计每层保留的 token 数量（用于训练结束后推荐 topk_ks）
+            if result['pruning_infos']:
+                for layer_idx, info in result['pruning_infos'].items():
+                    if 'hard_mask' in info:
+                        # hard_mask: (batch, n_vision), 计算每个样本保留的 token 数量
+                        hard_mask = info['hard_mask']
+                        n_kept_per_sample = hard_mask.sum(dim=-1)  # (batch,)
+                        layer_kept_counts[layer_idx].extend(n_kept_per_sample.tolist())
 
             # 累计统计
             for k, v in losses.items():
@@ -1101,6 +1124,41 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             'disc_state_dict': model.disc_manager.state_dict(),
         }, final_path)
         logger.info(f"Training completed. Final checkpoint saved to {final_path}")
+
+    # 汇总训练期间每层的保留数量统计（分布式聚合）
+    if dist.is_initialized():
+        # 收集所有 rank 的 layer_kept_counts
+        all_kept_counts = [None] * dist.get_world_size()
+        dist.all_gather_object(all_kept_counts, layer_kept_counts)
+        # 合并所有 rank 的统计
+        merged_kept_counts = {idx: [] for idx in pruning_layers}
+        for counts_dict in all_kept_counts:
+            for layer_idx, counts in counts_dict.items():
+                merged_kept_counts[layer_idx].extend(counts)
+        layer_kept_counts = merged_kept_counts
+
+    # 输出推荐的 topk_ks（只在主进程）
+    if is_main_process() and any(len(counts) > 0 for counts in layer_kept_counts.values()):
+        logger.info("=" * 60)
+        logger.info("Training Statistics - Recommended topk_ks for inference:")
+        logger.info("=" * 60)
+        recommended_topk_ks = {}
+        for layer_idx in pruning_layers:
+            counts = layer_kept_counts[layer_idx]
+            if counts:
+                mean_kept = sum(counts) / len(counts)
+                std_kept = (sum((x - mean_kept) ** 2 for x in counts) / len(counts)) ** 0.5
+                min_kept = min(counts)
+                max_kept = max(counts)
+                recommended_k = int(round(mean_kept))
+                recommended_topk_ks[layer_idx] = recommended_k
+                logger.info(f"  Layer {layer_idx}: mean={mean_kept:.1f}, std={std_kept:.1f}, "
+                           f"min={min_kept:.0f}, max={max_kept:.0f} -> recommended k={recommended_k}")
+        logger.info("")
+        logger.info("Add to config (pruner_topk_ks):")
+        for layer_idx, k in recommended_topk_ks.items():
+            logger.info(f"    {layer_idx}: {k}")
+        logger.info("=" * 60)
 
         # 最终评估
         if test_dataset:

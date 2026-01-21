@@ -47,6 +47,10 @@ class CrossAttentionPruner(nn.Module):
         self.temperature = temperature
         self.threshold = threshold
 
+        # 推理模式配置
+        self.inference_mode = 'threshold'  # 'threshold' 或 'topk'
+        self.topk_k = None  # topk 模式下保留的 token 数量
+
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
         self.pruning_queries = nn.Parameter(torch.randn(1, self.n_queries, d_internal) * 0.02)
@@ -196,12 +200,53 @@ class CrossAttentionPruner(nn.Module):
             y = F.gumbel_softmax(stacked, tau=temp, hard=True, dim=-1)
             hard_mask = y[..., 1]  # 取 keep 的决策
         else:
-            # 推理模式：概率阈值判断
-            # sigmoid(keep_logits) 是保留概率，threshold 是概率阈值（0-1）
-            keep_prob = torch.sigmoid(keep_logits)
-            hard_mask = (keep_prob > self.threshold).float()
+            # 推理模式：根据 inference_mode 选择
+            if self.inference_mode == 'topk' and self.topk_k is not None:
+                # Top-k 模式：保留 sigmoid 最高的 k 个 token
+                hard_mask = self._topk_mask(keep_logits, self.topk_k)
+            else:
+                # 阈值模式：sigmoid(keep_logits) > threshold
+                keep_prob = torch.sigmoid(keep_logits)
+                hard_mask = (keep_prob > self.threshold).float()
 
         return hard_mask
+
+    def _topk_mask(self, keep_logits: torch.Tensor, k: int) -> torch.Tensor:
+        """生成 top-k mask
+
+        参数:
+            keep_logits: (batch, n_vision) - 保留 logits
+            k: 保留的 token 数量
+
+        返回:
+            hard_mask: (batch, n_vision) - 0/1 mask
+        """
+        batch_size, n_vision = keep_logits.shape
+        k = min(k, n_vision)  # 确保 k 不超过 token 数量
+
+        keep_prob = torch.sigmoid(keep_logits)
+
+        # 找到 top-k 的阈值
+        topk_values, _ = torch.topk(keep_prob, k, dim=-1)
+        threshold = topk_values[:, -1:]  # 第 k 大的值，形状 (batch, 1)
+
+        # 生成 mask（>= threshold 的保留）
+        hard_mask = (keep_prob >= threshold).float()
+
+        return hard_mask
+
+    def set_inference_mode(self, mode: str):
+        """设置推理模式
+
+        参数:
+            mode: 'threshold' 或 'topk'
+        """
+        assert mode in ('threshold', 'topk'), f"Unknown inference mode: {mode}"
+        self.inference_mode = mode
+
+    def set_topk_k(self, k: int):
+        """设置 topk 模式下保留的 token 数量"""
+        self.topk_k = k
 
     def forward_full(
         self,
@@ -308,6 +353,29 @@ class LayerPrunerManager(nn.Module):
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""
         return self.layer_indices
+
+    def set_inference_mode(self, mode: str):
+        """设置所有剪枝器的推理模式
+
+        参数:
+            mode: 'threshold' 或 'topk'
+        """
+        for pruner in self.pruners.values():
+            pruner.set_inference_mode(mode)
+
+    def set_topk_k(self, layer_idx: int, k: int):
+        """设置指定层的 topk k 值"""
+        self.get_pruner(layer_idx).set_topk_k(k)
+
+    def set_topk_ks(self, topk_ks: Dict[int, int]):
+        """设置多层的 topk k 值
+
+        参数:
+            topk_ks: {layer_idx: k} 字典
+        """
+        for layer_idx, k in topk_ks.items():
+            if layer_idx in self.layer_indices:
+                self.set_topk_k(layer_idx, k)
 
 
 # 保持向后兼容的别名
