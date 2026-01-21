@@ -14,6 +14,7 @@
 """
 
 import os
+import random
 import sys
 
 # 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
@@ -591,7 +592,12 @@ def evaluate(
     pruning_layers = config.method_settings.get('pruning_layers', [4, 14, 24])
     desc = f"Evaluating ({mode})"
 
-    for i in tqdm(range(n_samples), desc=desc, disable=not is_main_process()):
+    # 打乱验证集索引
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    indices = indices[:n_samples]
+
+    for i in tqdm(indices, desc=desc, disable=not is_main_process()):
         sample = dataset[i]
 
         if mode == "hard":
