@@ -932,28 +932,51 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
                 pruner_optimizer.step()
 
-            # 判别器过强时重新初始化
+            # 判别器重新初始化
             # 注意：需要在所有进程间同步决策，避免死锁
             disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
+            disc_reinit_mode = method_cfg.get('disc_reinit_mode', 'threshold')  # 'threshold' 或 'random'
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
+            disc_reinit_prob = method_cfg.get('disc_reinit_prob', 0.01)  # 随机模式下的概率
+
             if disc_reinit_enable and 'disc_per_layer' in stats:
                 for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
-                    layer_acc = (real_acc + fake_acc) / 2
+                    should_reinit = False
+                    reinit_reason = ""
 
-                    # 汇总所有 rank 的 accuracy（取平均），确保所有进程做出相同决策
-                    layer_acc_tensor = torch.tensor(layer_acc, device=device)
-                    if dist.is_initialized():
-                        dist.all_reduce(layer_acc_tensor, op=dist.ReduceOp.SUM)
-                        layer_acc_tensor /= dist.get_world_size()
-                    layer_acc_global = layer_acc_tensor.item()
+                    if disc_reinit_mode == 'threshold':
+                        # 阈值模式：准确率过高时重初始化
+                        layer_acc = (real_acc + fake_acc) / 2
+                        # 汇总所有 rank 的 accuracy（取平均），确保所有进程做出相同决策
+                        layer_acc_tensor = torch.tensor(layer_acc, device=device)
+                        if dist.is_initialized():
+                            dist.all_reduce(layer_acc_tensor, op=dist.ReduceOp.SUM)
+                            layer_acc_tensor /= dist.get_world_size()
+                        layer_acc_global = layer_acc_tensor.item()
 
-                    if layer_acc_global > disc_reinit_threshold:
+                        if layer_acc_global > disc_reinit_threshold:
+                            should_reinit = True
+                            reinit_reason = f"acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%}"
+
+                    elif disc_reinit_mode == 'random':
+                        # 随机模式：按概率随机重初始化
+                        # 在 rank 0 生成随机数，然后广播给所有进程
+                        rand_tensor = torch.tensor(0.0, device=device)
+                        if is_main_process():
+                            rand_tensor = torch.rand(1, device=device)[0]
+                        if dist.is_initialized():
+                            dist.broadcast(rand_tensor, src=0)
+
+                        if rand_tensor.item() < disc_reinit_prob:
+                            should_reinit = True
+                            reinit_reason = f"random (prob={disc_reinit_prob})"
+
+                    if should_reinit:
                         model.disc_manager.reinit_layer(layer_idx)
                         # 重新初始化后，从 rank 0 广播新参数
                         broadcast_model_params(model, src=0)
                         if is_main_process():
-                            logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited "
-                                       f"(global_acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%})")
+                            logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited ({reinit_reason})")
 
             # 累计统计
             for k, v in losses.items():
