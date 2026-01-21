@@ -19,11 +19,12 @@ trainer_settings:
       layer_pruners:
         type: "adam"
         lr: 5.0e-04  # 提高学习率，让 pruner 更快学习
+        weight_decay: 0.01  # 防止过拟合
       discriminator:
         type: "adam"
         lr: 2.0e-04
     print_loss_every_batches: 50
-    eval_every_batches: 10
+    eval_every_batches: 1000
     eval_max_samples: 1000
     save_every_batches: 1000
     grad_clip_max_norm: null
@@ -91,4 +92,4 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard"]
+  eval_mode: ["hard"]
