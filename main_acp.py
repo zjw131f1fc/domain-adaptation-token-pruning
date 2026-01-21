@@ -699,12 +699,13 @@ def train(config):
     opt_cfg = trainer_cfg.get('optimizers', {})
 
     pruner_lr = opt_cfg.get('layer_pruners', {}).get('lr', 1e-4)
+    pruner_weight_decay = opt_cfg.get('layer_pruners', {}).get('weight_decay', 0.0)
     disc_lr = opt_cfg.get('discriminator', {}).get('lr', 1.5e-4)
 
     # Pruner 和 Adapter 一起优化（都是生成器的一部分）
     from itertools import chain
     pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
-    pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr)
+    pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
     disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
 
     # 训练参数
