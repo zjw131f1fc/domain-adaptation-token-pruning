@@ -14,7 +14,7 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 3
+    batch_size: 2
     optimizers:
       layer_pruners:
         type: "adam"
@@ -61,7 +61,7 @@ method_settings:
   disc_reinit_threshold: 0.95    # 判别器准确率超过此阈值时重新初始化
 
   # ==================== Pruner Warmup ====================
-  pruner_warmup_ratio: 0.2  # 前 10% 步数不做对抗训练
+  pruner_warmup_ratio: 0.1  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
@@ -79,7 +79,7 @@ method_settings:
 
   task_loss_weight: 1.1
   adv_loss_weight: 0.5   # 增加到 1.0，让 pruner 更努力骗过判别器
-  sparsity_weight: 0.2   # 提高到 5.0，让 sparsity loss 有足够影响力
+  sparsity_weight: 0.16   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
@@ -92,4 +92,4 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard"]
+  eval_mode: ["origin", "hard"]

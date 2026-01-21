@@ -4,3 +4,4 @@ outputs
 .history
 start_claude.sh
 wandb
+logs
