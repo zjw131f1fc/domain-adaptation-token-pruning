@@ -68,13 +68,13 @@ method_settings:
   # 每个 answer token 独立判别
   disc_d_d: 512
   disc_dropout: 0.2
-  disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
-  disc_loss_type: hinge            # 损失类型: bce, wgan, hinge
+  disc_use_spectral_norm: false  # 谱归一化（提高训练稳定性）
+  disc_loss_type: wgan            # 损失类型: bce, wgan, hinge
   disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
 
   # 判别器重初始化配置
   disc_reinit_enable: false       # 是否启用判别器重新初始化
-  disc_reinit_mode: threshold     # 重初始化模式: threshold(准确率阈值) 或 random(随机概率)
+  disc_reinit_mode: random     # 重初始化模式: threshold(准确率阈值) 或 random(随机概率)
   disc_reinit_threshold: 0.95     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.01          # random 模式：每步重初始化的概率
 
