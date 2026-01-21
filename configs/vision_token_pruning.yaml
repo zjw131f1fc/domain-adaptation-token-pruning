@@ -14,7 +14,7 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 16
+    batch_size: 3
     optimizers:
       layer_pruners:
         type: "adam"
@@ -24,7 +24,7 @@ trainer_settings:
         type: "adam"
         lr: 2.0e-04
     print_loss_every_batches: 50
-    eval_every_batches: 1000
+    eval_every_batches: 500
     eval_max_samples: 1000
     save_every_batches: 1000
     grad_clip_max_norm: null

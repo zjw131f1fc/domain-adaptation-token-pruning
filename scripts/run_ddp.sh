@@ -11,9 +11,6 @@
 
 set -e
 
-# 激活 conda 环境
-source ~/.bashrc
-conda activate rl-pruning
 
 # 参数解析
 NUM_GPUS=${1:-$(nvidia-smi -L | wc -l)}  # 默认使用所有可用 GPU
