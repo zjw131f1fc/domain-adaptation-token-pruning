@@ -5,3 +5,6 @@ outputs
 start_claude.sh
 wandb
 logs
+score.md
+CLAUDE.md
+docs

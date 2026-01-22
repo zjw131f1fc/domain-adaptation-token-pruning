@@ -13,7 +13,7 @@ global_settings:
 
 trainer_settings:
   dl_settings:
-    epochs: 2
+    epochs: 1
     batch_size: 2
     optimizers:
       layer_pruners:
@@ -24,16 +24,16 @@ trainer_settings:
         type: "adam"
         lr: 2.0e-04
     print_loss_every_batches: 50
-    eval_every_batches: 500
-    eval_max_samples: 2000
-    save_every_batches: 1000
+    eval_every_batches: 2000
+    eval_max_samples: 5000
+    save_every_batches: 2000
     grad_clip_max_norm: null
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 40000
-    test: 2000
+    train: "all"
+    test: 5000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -85,10 +85,10 @@ method_settings:
   disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
 
   # 判别器重初始化配置
-  disc_reinit_enable: false       # 是否启用判别器重新初始化
+  disc_reinit_enable: true       # 是否启用判别器重新初始化
   disc_reinit_mode: random     # 重初始化模式: threshold(准确率阈值) 或 random(随机概率)
   disc_reinit_threshold: 0.95     # threshold 模式：准确率超过此阈值时重新初始化
-  disc_reinit_prob: 0.01          # random 模式：每步重初始化的概率
+  disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
   # ==================== Adapter 配置 ====================
   # Adapter 补偿剪枝后的信息损失
@@ -116,7 +116,7 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.3
-  adv_loss_weight: 0.2   # 增加到 1.0，让 pruner 更努力骗过判别器
+  adv_loss_weight: 0.1   # 增加到 1.0，让 pruner 更努力骗过判别器
   sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
