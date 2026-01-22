@@ -188,6 +188,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
         key_states = attn.k_proj(hidden_states_normed)
         value_states = attn.v_proj(hidden_states_normed)
 
+        # 保存 query_states 用于 adapter（reshape 之前）
+        query_states_flat = query_states  # (batch, seq, hidden_size)
+
         # Reshape: (batch, seq, hidden) -> (batch, heads, seq, head_dim)
         query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
@@ -281,7 +284,11 @@ class PrunableLlamaDecoderLayer(nn.Module):
         if self.adapter is not None:
             # (batch, heads, seq, head_dim) -> (batch, seq, hidden_size)
             attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-            attn_output_fake_adapted = self.adapter(attn_output_fake_flat, mask=hard_mask)
+            attn_output_fake_adapted = self.adapter(
+                attn_output_fake_flat,
+                mask=hard_mask,
+                query=query_states_flat
+            )
             # reshape back to (batch, heads, seq, head_dim)
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 

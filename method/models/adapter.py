@@ -28,10 +28,9 @@ class PruningAdapter(nn.Module):
 
 
 class LightweightAdapter(nn.Module):
-    """轻量级 Adapter：Mask-Aware FiLM 调制
+    """轻量级 Adapter：Mask-Aware + Query-Aware FiLM 调制
 
-    用当前 token 自身的表示 + mask 信息进行补偿，
-    不需要额外的 question cross-attention。
+    用 pruning mask + 当前 token 的 attention query 进行补偿。
     """
 
     def __init__(
@@ -52,7 +51,11 @@ class LightweightAdapter(nn.Module):
             nn.Linear(bottleneck_dim, bottleneck_dim)
         )
 
-        # FiLM: 根据 mask 生成调制参数
+        # Query encoder: 投影 attention query 到 bottleneck
+        self.query_proj = nn.Linear(hidden_size, bottleneck_dim)
+
+        # FiLM: 根据 (mask + query) 生成调制参数
+        # 输入是 mask_emb + query_emb，都是 bottleneck 维度
         self.gamma_net = nn.Linear(bottleneck_dim, bottleneck_dim)
         self.beta_net = nn.Linear(bottleneck_dim, bottleneck_dim)
 
@@ -64,6 +67,10 @@ class LightweightAdapter(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # Query proj 小值初始化
+        nn.init.xavier_uniform_(self.query_proj.weight, gain=0.1)
+        nn.init.zeros_(self.query_proj.bias)
+
         # FiLM 初始化：gamma=1, beta=0
         nn.init.zeros_(self.gamma_net.weight)
         nn.init.zeros_(self.gamma_net.bias)
@@ -78,20 +85,32 @@ class LightweightAdapter(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        query: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
         参数:
             x: (batch, seq, hidden_size) - attention output
             mask: (batch, n_vision) - pruning mask (1=keep, 0=prune)
+            query: (batch, seq, hidden_size) - attention query states
         """
         h = self.act(self.down(x))  # (batch, seq, bottleneck)
 
+        # 构建 condition
+        condition = torch.zeros_like(h)  # (batch, seq, bottleneck)
+
         if mask is not None:
             mask_emb = self.mask_encoder(mask.to(dtype=x.dtype))  # (batch, bottleneck)
-            gamma = 1 + self.gamma_net(mask_emb).unsqueeze(1)  # (batch, 1, bottleneck)
-            beta = self.beta_net(mask_emb).unsqueeze(1)
-            h = gamma * h + beta
+            condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
+
+        if query is not None:
+            query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
+            condition = condition + query_emb
+
+        # FiLM modulation
+        gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)
+        beta = self.beta_net(condition)
+        h = gamma * h + beta
 
         return x + self.up(h)
 
