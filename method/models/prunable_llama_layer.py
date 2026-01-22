@@ -278,32 +278,10 @@ class PrunableLlamaDecoderLayer(nn.Module):
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
         # === Step 4.5: Adapter 修正 ===
-        # 将 attn_output_fake 通过 adapter 修正
         if self.adapter is not None:
-            # attn_output_fake: (batch, heads, seq, head_dim) -> (batch, seq, heads, head_dim)
-            attn_output_fake_perm = attn_output_fake.permute(0, 2, 1, 3)
-            # reshape to (batch, seq, hidden_size)
-            attn_output_fake_flat = attn_output_fake_perm.reshape(batch_size, seq_len, -1)
-
-            # 提取 question hidden states（用于 QueryAwareAdapter）
-            # 逐样本提取，因为每个样本的 question 位置不同
-            # 使用 LayerNorm 后的 hidden states
-            max_q_len = max(q_end - q_start for q_start, q_end in zip(question_starts, question_ends))
-            question_hidden_padded = torch.zeros(
-                batch_size, max_q_len, hidden_states_normed.shape[-1],
-                device=hidden_states_normed.device, dtype=hidden_states_normed.dtype
-            )
-            for i in range(batch_size):
-                q_start, q_end = question_starts[i], question_ends[i]
-                q_len = q_end - q_start
-                question_hidden_padded[i, :q_len] = hidden_states_normed[i, q_start:q_end]
-
-            # adapter 修正（传入 mask 和 question_hidden）
-            attn_output_fake_adapted = self.adapter(
-                attn_output_fake_flat,
-                mask=hard_mask,
-                question_hidden=question_hidden_padded
-            )
+            # (batch, heads, seq, head_dim) -> (batch, seq, hidden_size)
+            attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+            attn_output_fake_adapted = self.adapter(attn_output_fake_flat, mask=hard_mask)
             # reshape back to (batch, heads, seq, head_dim)
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 

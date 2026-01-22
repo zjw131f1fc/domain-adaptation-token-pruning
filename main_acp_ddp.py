@@ -127,9 +127,8 @@ def load_model(config, device: torch.device, local_rank: int):
     disc_spectral_norm = method_cfg.get('disc_use_spectral_norm', False)
 
     # Adapter 配置
-    adapter_type = method_cfg.get('adapter_type', 'simple')
+    adapter_type = method_cfg.get('adapter_type', 'lightweight')
     adapter_bottleneck = method_cfg.get('adapter_bottleneck', None)
-    adapter_n_heads = method_cfg.get('adapter_n_heads', 4)
 
     # 获取每层的推理阈值配置
     pruner_thresholds_raw = method_cfg.get('pruner_thresholds', {})
@@ -179,7 +178,6 @@ def load_model(config, device: torch.device, local_rank: int):
         disc_d_hidden=disc_d_hidden,
         adapter_bottleneck=adapter_bottleneck,
         adapter_type=adapter_type,
-        adapter_n_heads=adapter_n_heads,
         temperature=temperature,
         dropout=dropout,
         disc_use_spectral_norm=disc_spectral_norm,
