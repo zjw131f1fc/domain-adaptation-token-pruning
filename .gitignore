@@ -8,3 +8,26 @@ logs
 score.md
 CLAUDE.md
 docs
+
+# 临时笔记
+todo.md
+todo2.md
+TRAINING_NOTES.md
+
+# 日志
+train.log
+*.log
+
+# 过时/测试脚本
+test_acp.py
+optuna_search.py
+run_all_loss_tests.sh
+run_and_shutdown.sh
+train_and_shutdown.sh
+
+# 测试配置和备份
+configs/loss_tests/
+*.backup
+
+# 示例
+examples/
