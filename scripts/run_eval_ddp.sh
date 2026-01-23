@@ -2,37 +2,26 @@
 # DDP 分布式评估启动脚本
 #
 # 使用方法:
-#   ./scripts/run_eval_ddp.sh <checkpoint路径> [GPU数量] [其他参数...]
+#   ./scripts/run_eval_ddp.sh [GPU数量] [其他参数...]
 #
 # 示例:
-#   ./scripts/run_eval_ddp.sh outputs/checkpoints/checkpoint_final.pt
-#   ./scripts/run_eval_ddp.sh outputs/checkpoints/checkpoint_final.pt 4
-#   ./scripts/run_eval_ddp.sh outputs/checkpoints/checkpoint_final.pt 4 --mode origin hard
-#   ./scripts/run_eval_ddp.sh outputs/checkpoints/checkpoint_final.pt 4 --max_samples 5000
-#   ./scripts/run_eval_ddp.sh outputs/checkpoints/checkpoint_final.pt 4 --thresholds 4:0.5 14:0.5 24:0.5
+#   # 使用配置文件中的 checkpoint
+#   ./scripts/run_eval_ddp.sh
+#   ./scripts/run_eval_ddp.sh 4
+#
+#   # 命令行指定 checkpoint（覆盖配置）
+#   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt
+#   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt --mode origin hard
+#   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt --max_samples 5000
+#   ./scripts/run_eval_ddp.sh 4 --thresholds 4:0.5 14:0.5 24:0.5
 #
 # 单卡评估（不使用 torchrun）:
+#   python eval_acp_ddp.py
 #   python eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
 
 set -e
 
-# 检查必需参数
-if [ -z "$1" ]; then
-    echo "Error: checkpoint path is required"
-    echo "Usage: $0 <checkpoint_path> [num_gpus] [extra_args...]"
-    echo ""
-    echo "Examples:"
-    echo "  $0 outputs/checkpoints/checkpoint_final.pt"
-    echo "  $0 outputs/checkpoints/checkpoint_final.pt 4"
-    echo "  $0 outputs/checkpoints/checkpoint_final.pt 4 --mode origin hard"
-    echo "  $0 outputs/checkpoints/checkpoint_final.pt 4 --max_samples 5000"
-    exit 1
-fi
-
-CHECKPOINT=$1
-shift
-
-# 检查第二个参数是否是数字（GPU数量）
+# 检查第一个参数是否是数字（GPU数量）
 if [[ $1 =~ ^[0-9]+$ ]]; then
     NUM_GPUS=$1
     shift
@@ -57,7 +46,6 @@ LOG_FILE="$LOG_DIR/eval_${TIMESTAMP}.log"
 echo "=============================================="
 echo "DDP Evaluation Configuration"
 echo "=============================================="
-echo "Checkpoint: $CHECKPOINT"
 echo "Number of GPUs: $NUM_GPUS"
 echo "Config file: $CONFIG"
 echo "Extra args: $EXTRA_ARGS"
@@ -70,18 +58,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
-# 检查 checkpoint 文件是否存在
-if [ ! -f "$CHECKPOINT" ]; then
-    echo "Error: Checkpoint file not found: $CHECKPOINT"
-    exit 1
-fi
-
 # 使用 torchrun 启动分布式评估
 torchrun \
     --standalone \
     --nproc_per_node=$NUM_GPUS \
     eval_acp_ddp.py \
-    --checkpoint "$CHECKPOINT" \
     --config "$CONFIG" \
     $EXTRA_ARGS 2>&1 | tee "$LOG_FILE"
 

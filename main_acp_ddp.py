@@ -866,6 +866,60 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
     disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
 
+    # 检查是否有 checkpoint 需要加载（用于恢复训练）
+    checkpoint_path = config.global_settings.get('checkpoint', None)
+    start_step = 0
+
+    if checkpoint_path is not None:
+        checkpoint_file = Path(checkpoint_path)
+        if checkpoint_file.exists():
+            if is_main_process():
+                logger.info(f"Loading checkpoint from {checkpoint_path}...")
+
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+            # 加载模型状态
+            if 'pruner_state_dict' in checkpoint:
+                model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
+                if is_main_process():
+                    logger.info("  Loaded pruner_manager state")
+
+            if 'adapter_state_dict' in checkpoint:
+                model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
+                if is_main_process():
+                    logger.info("  Loaded adapter_manager state")
+
+            if 'disc_state_dict' in checkpoint:
+                model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
+                if is_main_process():
+                    logger.info("  Loaded disc_manager state")
+
+            # 加载优化器状态
+            if 'pruner_optimizer' in checkpoint:
+                pruner_optimizer.load_state_dict(checkpoint['pruner_optimizer'])
+                if is_main_process():
+                    logger.info("  Loaded pruner_optimizer state")
+
+            if 'disc_optimizer' in checkpoint:
+                disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
+                if is_main_process():
+                    logger.info("  Loaded disc_optimizer state")
+
+            # 恢复训练步数
+            if 'step' in checkpoint:
+                start_step = checkpoint['step']
+                if is_main_process():
+                    logger.info(f"  Resuming from step {start_step}")
+
+            # 重新广播模型参数确保一致性
+            broadcast_model_params(model, src=0)
+
+            if is_main_process():
+                logger.info("Checkpoint loaded successfully.")
+        else:
+            if is_main_process():
+                logger.warning(f"Checkpoint file not found: {checkpoint_path}, starting from scratch")
+
     # 训练参数
     epochs = trainer_cfg.get('epochs', 1)
     print_every = trainer_cfg.get('print_loss_every_batches', 50)
@@ -890,7 +944,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         save_dir.mkdir(parents=True, exist_ok=True)
 
     # 训练循环
-    global_step = 0
+    global_step = start_step
     cached_origin_result = None
 
     # 统计每层的保留数量（用于推荐 topk_ks）
