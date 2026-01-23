@@ -635,7 +635,17 @@ def evaluate(
     # 只在主进程显示进度条
     show_progress = is_main_process()
 
-    for i in tqdm(local_indices, desc=desc, disable=not show_progress):
+    # 中间统计日志间隔（按全局步数计算）
+    log_interval = 500
+    if distributed and dist.is_initialized():
+        world_size = dist.get_world_size()
+        # 每个 rank 处理 local_log_interval 个样本时，全局约处理 log_interval 个
+        local_log_interval = max(1, log_interval // world_size)
+    else:
+        world_size = 1
+        local_log_interval = log_interval
+
+    for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
 
         if mode == "hard":
@@ -698,6 +708,51 @@ def evaluate(
             references.append(sample['answers'])
         else:
             references.append(sample['answer'])
+
+        # 每 local_log_interval 步打印中间统计
+        if step_idx % local_log_interval == 0:
+            if distributed and dist.is_initialized():
+                # 分布式模式：收集所有 rank 的数据
+                all_predictions = [None] * world_size
+                all_references = [None] * world_size
+                all_kept_ratios = [None] * world_size
+
+                dist.all_gather_object(all_predictions, predictions)
+                dist.all_gather_object(all_references, references)
+                dist.all_gather_object(all_kept_ratios, kept_ratios)
+
+                # 合并所有 rank 的数据
+                merged_preds = []
+                merged_refs = []
+                merged_kept = []
+                for p, r, k in zip(all_predictions, all_references, all_kept_ratios):
+                    merged_preds.extend(p)
+                    merged_refs.extend(r)
+                    merged_kept.extend(k)
+
+                if is_main_process():
+                    interim_result = judge(merged_preds, merged_refs)
+                    interim_acc = interim_result['accuracy']
+                    interim_correct = interim_result['correct']
+                    interim_total = interim_result['total']
+
+                    if merged_kept:
+                        interim_kept = sum(merged_kept) / len(merged_kept)
+                        print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                    else:
+                        print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
+            else:
+                # 单卡模式
+                interim_result = judge(predictions, references)
+                interim_acc = interim_result['accuracy']
+                interim_correct = interim_result['correct']
+                interim_total = interim_result['total']
+
+                if kept_ratios:
+                    interim_kept = sum(kept_ratios) / len(kept_ratios)
+                    print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                else:
+                    print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
 
     # 分布式评估：收集所有 rank 的结果
     if distributed and dist.is_initialized():
