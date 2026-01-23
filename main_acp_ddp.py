@@ -1166,41 +1166,41 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             logger.info(f"    {layer_idx}: {k}")
         logger.info("=" * 60)
 
-        # 最终评估
-        if test_dataset:
-            if is_main_process():
-                logger.info("Final evaluation...")
-            eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
-            for eval_mode in eval_modes:
-                if eval_mode == 'origin' and cached_origin_result is not None:
-                    eval_result = cached_origin_result
-                    if is_main_process():
-                        logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
-                else:
-                    eval_result = evaluate(
-                        model, processor, test_dataset, judge, config, device,
-                        max_samples=eval_max_samples,
-                        mode=eval_mode,
-                        distributed=True
-                    )
-                    if is_main_process():
-                        logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
-                        if 'avg_kept_ratio' in eval_result:
-                            layer_ratios = []
-                            for layer_idx in pruning_layers:
-                                kept_key = f'L{layer_idx}_kept'
-                                n_kept_key = f'L{layer_idx}_n_kept'
-                                if kept_key in eval_result:
-                                    if n_kept_key in eval_result:
-                                        layer_ratios.append(
-                                            f"L{layer_idx}={eval_result[kept_key]:.2%}"
-                                            f"({int(eval_result[n_kept_key])})"
-                                        )
-                                    else:
-                                        layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
-                            layer_str = ", ".join(layer_ratios)
-                            logger.info(f"[{eval_mode}] Avg kept ratio: "
-                                       f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+    # 最终评估（所有 rank 都需要参与分布式评估）
+    if test_dataset:
+        if is_main_process():
+            logger.info("Final evaluation...")
+        eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
+        for eval_mode in eval_modes:
+            if eval_mode == 'origin' and cached_origin_result is not None:
+                eval_result = cached_origin_result
+                if is_main_process():
+                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
+            else:
+                eval_result = evaluate(
+                    model, processor, test_dataset, judge, config, device,
+                    max_samples=eval_max_samples,
+                    mode=eval_mode,
+                    distributed=True
+                )
+                if is_main_process():
+                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
+                    if 'avg_kept_ratio' in eval_result:
+                        layer_ratios = []
+                        for layer_idx in pruning_layers:
+                            kept_key = f'L{layer_idx}_kept'
+                            n_kept_key = f'L{layer_idx}_n_kept'
+                            if kept_key in eval_result:
+                                if n_kept_key in eval_result:
+                                    layer_ratios.append(
+                                        f"L{layer_idx}={eval_result[kept_key]:.2%}"
+                                        f"({int(eval_result[n_kept_key])})"
+                                    )
+                                else:
+                                    layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                        layer_str = ", ".join(layer_ratios)
+                        logger.info(f"[{eval_mode}] Avg kept ratio: "
+                                   f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
 
 # ============================================================
