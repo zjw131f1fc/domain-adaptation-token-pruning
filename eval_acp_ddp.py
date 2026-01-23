@@ -33,10 +33,11 @@ os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import random
 import torch
 import torch.distributed as dist
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from itertools import product
 from tqdm import tqdm
 
@@ -108,6 +109,32 @@ def parse_thresholds(threshold_strs: List[str]) -> Dict[int, float]:
     return thresholds
 
 
+def print_grid_search_progress(
+    results: List[Dict[str, Any]],
+    origin_acc: float,
+    pruning_layers: List[int],
+):
+    """打印当前所有网格搜索结果（按准确率排序）"""
+    if not results:
+        return
+
+    # 按准确率排序
+    sorted_results = sorted(results, key=lambda x: x['accuracy'], reverse=True)
+
+    print("\n" + "-" * 90)
+    print(f"Progress: {len(results)} combinations evaluated | Origin Acc: {origin_acc:.2%}")
+    print("-" * 90)
+    print(f"{'#':<3} {'Acc':<8} {'Rel':<8} {'Kept':<8} {'Thresholds'}")
+    print("-" * 90)
+
+    for i, r in enumerate(sorted_results):
+        rel_acc = r['accuracy'] / origin_acc if origin_acc > 0 else 0
+        thresh_str = '/'.join(f"{r['thresholds'][l]:.2f}" for l in pruning_layers)
+        print(f"{i+1:<3} {r['accuracy']:.4f}   {rel_acc:.4f}   {r['avg_kept_ratio']:.4f}   {thresh_str}")
+
+    print("-" * 90)
+
+
 def run_grid_search(
     model,
     processor,
@@ -119,17 +146,23 @@ def run_grid_search(
     pruning_layers: List[int],
     threshold_values: List[float],
     distributed: bool,
+    origin_result: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """执行网格搜索（笛卡尔积，每层阈值可不同）"""
+    """执行网格搜索（笛卡尔积，每层阈值可不同，随机顺序）"""
     results = []
 
-    # 生成所有组合
+    # 生成所有组合并随机打乱
     combinations = list(product(threshold_values, repeat=len(pruning_layers)))
+    random.shuffle(combinations)
+
+    origin_acc = origin_result['accuracy'] if origin_result else 0.0
 
     if is_main_process():
-        print(f"\nGrid search: {len(combinations)} combinations")
+        print(f"\nGrid search: {len(combinations)} combinations (randomized)")
         print(f"Layers: {pruning_layers}")
         print(f"Values: {threshold_values}")
+        if origin_result:
+            print(f"Origin baseline: {origin_acc:.2%}")
 
     pbar = tqdm(combinations, desc="Grid search", disable=not is_main_process())
 
@@ -165,40 +198,56 @@ def run_grid_search(
         # 更新进度条
         if is_main_process():
             thresh_str = '/'.join(f"{t:.2f}" for t in combo)
+            rel_acc = eval_result['accuracy'] / origin_acc if origin_acc > 0 else 0
             pbar.set_postfix({
                 'thresh': thresh_str,
                 'acc': f"{eval_result['accuracy']:.2%}",
+                'rel': f"{rel_acc:.2%}",
                 'kept': f"{eval_result.get('avg_kept_ratio', 0):.2%}"
             })
+
+            # 每步打印所有结果
+            print_grid_search_progress(results, origin_acc, pruning_layers)
 
     return results
 
 
-def print_grid_search_results(results: List[Dict[str, Any]], pruning_layers: List[int]):
+def print_grid_search_results(
+    results: List[Dict[str, Any]],
+    pruning_layers: List[int],
+    origin_result: Optional[Dict[str, Any]] = None,
+):
     """打印网格搜索结果"""
     if not results:
         print("No results.")
         return
 
+    origin_acc = origin_result['accuracy'] if origin_result else 0.0
+
     # 按准确率排序
     sorted_results = sorted(results, key=lambda x: x['accuracy'], reverse=True)
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("Grid Search Results (sorted by accuracy)")
-    print("=" * 80)
-    print(f"{'Rank':<5} {'Accuracy':<12} {'Kept':<12} {'Thresholds'}")
-    print("-" * 80)
+    if origin_result:
+        print(f"Origin Baseline: {origin_acc:.2%} ({origin_result['correct']}/{origin_result['total']})")
+    print("=" * 90)
+    print(f"{'Rank':<5} {'Accuracy':<10} {'Rel Acc':<10} {'Kept':<10} {'Thresholds'}")
+    print("-" * 90)
 
-    for i, r in enumerate(sorted_results[:10]):
+    for i, r in enumerate(sorted_results[:20]):
+        rel_acc = r['accuracy'] / origin_acc if origin_acc > 0 else 0
         thresh_str = ', '.join(f"L{l}={r['thresholds'][l]:.2f}" for l in pruning_layers)
-        print(f"{i+1:<5} {r['accuracy']:.4f}       {r['avg_kept_ratio']:.4f}       {thresh_str}")
+        print(f"{i+1:<5} {r['accuracy']:.4f}     {rel_acc:.4f}     {r['avg_kept_ratio']:.4f}     {thresh_str}")
 
     # 最佳配置
     best = sorted_results[0]
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("Best Configuration")
-    print("=" * 80)
+    print("=" * 90)
     print(f"Accuracy: {best['accuracy']:.4f} ({best['correct']}/{best['total']})")
+    if origin_acc > 0:
+        print(f"Relative Accuracy: {best['accuracy'] / origin_acc:.4f}")
     print(f"Kept Ratio: {best['avg_kept_ratio']:.4f}")
     print("\nConfig (copy to yaml):")
     print("pruner_thresholds:")
@@ -353,6 +402,31 @@ def main():
             if logger:
                 logger.info(f"Grid search values: {threshold_values}")
 
+            # 先评估 origin 作为 baseline（缓存，只需计算一次）
+            if logger:
+                logger.info("Evaluating origin mode as baseline...")
+            if is_main_process():
+                print("\n" + "=" * 60)
+                print("Evaluating Origin Baseline (cached for grid search)")
+                print("=" * 60)
+
+            origin_result = evaluate(
+                model=model,
+                processor=processor,
+                dataset=eval_dataset,
+                judge=judge,
+                config=config,
+                device=device,
+                max_samples=max_samples,
+                mode='origin',
+                distributed=distributed,
+            )
+
+            if is_main_process():
+                print(f"Origin Accuracy: {origin_result['accuracy']:.2%} ({origin_result['correct']}/{origin_result['total']})")
+                print("=" * 60)
+
+            # 执行网格搜索
             grid_results = run_grid_search(
                 model=model,
                 processor=processor,
@@ -364,10 +438,11 @@ def main():
                 pruning_layers=pruning_layers,
                 threshold_values=threshold_values,
                 distributed=distributed,
+                origin_result=origin_result,
             )
 
             if is_main_process():
-                print_grid_search_results(grid_results, pruning_layers)
+                print_grid_search_results(grid_results, pruning_layers, origin_result)
         else:
             # 普通评估
             if is_main_process():
