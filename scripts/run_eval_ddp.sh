@@ -14,13 +14,11 @@
 #   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt --mode origin hard
 #   ./scripts/run_eval_ddp.sh 4 --max_samples 5000
 #
-#   # 网格搜索阈值（阈值在配置文件 evaluation_settings.grid_search 中设置）
-#   ./scripts/run_eval_ddp.sh 4 --grid_search
+# 网格搜索：在配置文件中设置 evaluation_settings.grid_search.enable: true
 #
 # 单卡评估（不使用 torchrun）:
 #   python eval_acp_ddp.py
 #   python eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
-#   python eval_acp_ddp.py --grid_search
 
 set -e
 
