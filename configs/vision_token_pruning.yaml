@@ -29,7 +29,7 @@ trainer_settings:
         lr: 2.0e-04
     print_loss_every_batches: 50
     eval_every_batches: 2000
-    eval_max_samples: 5000
+    eval_max_samples: 2000000
     save_every_batches: 2000
     grad_clip_max_norm: null
 
@@ -37,13 +37,13 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: "all"
-    test: 5000
+    test: "all"
   fast_load_no_random: false
   category_priority:
     enable: true
     values:
       - {train: 'mean'}    # 训练集均衡各类别数量（防止过拟合到高频类别）
-      - {test: 'mean'}   # 测试集保持原始比例
+      # - {test: 'mean'}   # 测试集保持原始比例
 
 backbone_settings:
   name: "llava-1.5-7b"
@@ -64,9 +64,9 @@ method_settings:
   # 0.5 = 与训练时行为一致
   # 0.6 = 更严格（保留更少），0.4 = 更宽松（保留更多）
   pruner_thresholds:
-    4: 0.3
-    14: 0.3
-    24: 0.3
+    4: 0.37
+    14: 0.37
+    24: 0.4
 
   # 推理模式配置
   # - threshold: 使用 sigmoid(logits) > threshold 判断
@@ -76,9 +76,9 @@ method_settings:
   # topk 模式下每层保留的 token 数量
   # 根据训练时的统计结果设置，训练结束时会输出建议值
   pruner_topk_ks:
-    4: 360    # 示例值，需根据训练统计调整
-    14: 230
-    24: 144
+    4: 151    # 示例值，需根据训练统计调整
+    14: 211
+    24: 284
 
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
@@ -133,10 +133,10 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard"]
+  eval_mode: ["hard"]
 
   # 网格搜索配置（用于搜索最优阈值）
   grid_search:
-    enable: true  # 是否启用网格搜索
+    enable: false  # 是否启用网格搜索
     # 搜索的阈值列表（每层独立搜索，笛卡尔积）
-    threshold_values: [0.3, 0.4, 0.5, 0.6]
+    threshold_values: [0.3, 0.4, 0.5]
