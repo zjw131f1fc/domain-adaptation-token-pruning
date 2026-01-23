@@ -450,12 +450,11 @@ def main():
                 print("Evaluation Results")
                 print("=" * 60)
 
-            # 如果评估 hard 模式，先评估 origin 作为 baseline
+            # 如果 mode 包含 origin，先评估并缓存（用于后续 hard 模式的相对准确率）
             origin_result = None
-            if 'hard' in args.mode:
-                # 先评估 origin（如果不在列表中也要评估作为 baseline）
+            if 'origin' in args.mode:
                 if logger:
-                    logger.info("Evaluating 'origin' mode as baseline...")
+                    logger.info("Evaluating 'origin' mode...")
 
                 origin_result = evaluate(
                     model=model,
@@ -470,12 +469,12 @@ def main():
                 )
 
                 if is_main_process():
-                    print(f"\n[ORIGIN] (baseline)")
+                    print(f"\n[ORIGIN]")
                     print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result['correct']}/{origin_result['total']})")
 
             # 评估其他模式（跳过已评估的 origin）
             for eval_mode in args.mode:
-                if eval_mode == 'origin' and origin_result is not None:
+                if eval_mode == 'origin':
                     # 已经评估过了，跳过
                     continue
 
@@ -498,7 +497,7 @@ def main():
                     print(f"\n[{eval_mode.upper()}]")
                     print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result['correct']}/{eval_result['total']})")
 
-                    # 显示相对准确率
+                    # 显示相对准确率（仅当 origin 也被评估时）
                     if origin_result is not None and origin_result['accuracy'] > 0:
                         rel_acc = eval_result['accuracy'] / origin_result['accuracy']
                         print(f"  Relative Accuracy: {rel_acc:.2%}")
