@@ -2,19 +2,29 @@
 # DDP 分布式训练启动脚本
 #
 # 使用方法:
-#   ./scripts/run_ddp.sh [GPU数量] [配置文件]
+#   ./scripts/run_ddp.sh [GPU列表] [配置文件]
 #
 # 示例:
-#   ./scripts/run_ddp.sh 4                                      # 使用 4 GPU，默认配置
-#   ./scripts/run_ddp.sh 2 configs/vision_token_pruning.yaml    # 使用 2 GPU，指定配置
+#   ./scripts/run_ddp.sh 0,1,2,3                                # 使用 GPU 0,1,2,3，默认配置
+#   ./scripts/run_ddp.sh 4,5 configs/vision_token_pruning.yaml  # 使用 GPU 4,5，指定配置
 #   ./scripts/run_ddp.sh                                        # 使用所有可用 GPU
 
 set -e
 
 
 # 参数解析
-NUM_GPUS=${1:-$(nvidia-smi -L | wc -l)}  # 默认使用所有可用 GPU
+GPU_IDS=${1:-""}  # GPU ID 列表，如 "0,1,2,3"
 CONFIG=${2:-"configs/vision_token_pruning.yaml"}
+
+# 计算 GPU 数量并设置 CUDA_VISIBLE_DEVICES
+if [ -z "$GPU_IDS" ]; then
+    # 未指定时使用所有可用 GPU
+    NUM_GPUS=$(nvidia-smi -L | wc -l)
+else
+    export CUDA_VISIBLE_DEVICES=$GPU_IDS
+    # 计算逗号分隔的 GPU 数量
+    NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
+fi
 
 # 创建日志目录
 LOG_DIR="logs/ddp_runs"
@@ -27,6 +37,7 @@ LOG_FILE="$LOG_DIR/train_${TIMESTAMP}.log"
 echo "=============================================="
 echo "DDP Training Configuration"
 echo "=============================================="
+echo "GPU IDs: ${GPU_IDS:-all}"
 echo "Number of GPUs: $NUM_GPUS"
 echo "Config file: $CONFIG"
 echo "Log file: $LOG_FILE"

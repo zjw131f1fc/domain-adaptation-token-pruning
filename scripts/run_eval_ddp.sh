@@ -2,17 +2,17 @@
 # DDP 分布式评估启动脚本
 #
 # 使用方法:
-#   ./scripts/run_eval_ddp.sh [GPU数量] [其他参数...]
+#   ./scripts/run_eval_ddp.sh [GPU列表] [其他参数...]
 #
 # 示例:
 #   # 使用配置文件中的 checkpoint
 #   ./scripts/run_eval_ddp.sh
-#   ./scripts/run_eval_ddp.sh 4
+#   ./scripts/run_eval_ddp.sh 0,1,2,3
 #
 #   # 命令行指定 checkpoint（覆盖配置）
-#   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt
-#   ./scripts/run_eval_ddp.sh 4 --checkpoint outputs/checkpoints/checkpoint_final.pt --mode origin hard
-#   ./scripts/run_eval_ddp.sh 4 --max_samples 5000
+#   ./scripts/run_eval_ddp.sh 4,5,6,7 --checkpoint outputs/checkpoints/checkpoint_final.pt
+#   ./scripts/run_eval_ddp.sh 0,1 --checkpoint outputs/checkpoints/checkpoint_final.pt --mode origin hard
+#   ./scripts/run_eval_ddp.sh 2,3 --max_samples 5000
 #
 # 网格搜索：在配置文件中设置 evaluation_settings.grid_search.enable: true
 #
@@ -22,12 +22,22 @@
 
 set -e
 
-# 检查第一个参数是否是数字（GPU数量）
-if [[ $1 =~ ^[0-9]+$ ]]; then
-    NUM_GPUS=$1
+# 检查第一个参数是否是 GPU 列表（包含数字和逗号）
+if [[ $1 =~ ^[0-9,]+$ ]]; then
+    GPU_IDS=$1
     shift
 else
-    NUM_GPUS=$(nvidia-smi -L | wc -l)  # 默认使用所有可用 GPU
+    GPU_IDS=""
+fi
+
+# 计算 GPU 数量并设置 CUDA_VISIBLE_DEVICES
+if [ -z "$GPU_IDS" ]; then
+    # 未指定时使用所有可用 GPU
+    NUM_GPUS=$(nvidia-smi -L | wc -l)
+else
+    export CUDA_VISIBLE_DEVICES=$GPU_IDS
+    # 计算逗号分隔的 GPU 数量
+    NUM_GPUS=$(echo "$GPU_IDS" | tr ',' '\n' | wc -l)
 fi
 
 # 剩余参数传递给 Python 脚本
@@ -47,6 +57,7 @@ LOG_FILE="$LOG_DIR/eval_${TIMESTAMP}.log"
 echo "=============================================="
 echo "DDP Evaluation Configuration"
 echo "=============================================="
+echo "GPU IDs: ${GPU_IDS:-all}"
 echo "Number of GPUs: $NUM_GPUS"
 echo "Config file: $CONFIG"
 echo "Extra args: $EXTRA_ARGS"
