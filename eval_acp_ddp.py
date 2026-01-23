@@ -14,16 +14,15 @@
     torchrun --nproc_per_node=4 eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
 
     # 指定评估模式和样本数
-    torchrun --nproc_per_node=4 eval_acp_ddp.py \
-        --checkpoint outputs/checkpoints/checkpoint_final.pt \
-        --mode origin hard \
+    torchrun --nproc_per_node=4 eval_acp_ddp.py \\
+        --checkpoint outputs/checkpoints/checkpoint_final.pt \\
+        --mode origin hard \\
         --max_samples 5000
 
     # 覆盖配置中的阈值
     python eval_acp_ddp.py --thresholds 4:0.5 14:0.5 24:0.5
 
-    # 网格搜索阈值（阈值范围在配置文件 evaluation_settings.grid_search 中设置）
-    python eval_acp_ddp.py --grid_search
+网格搜索：在配置文件中设置 evaluation_settings.grid_search.enable: true
 """
 
 import os
@@ -231,10 +230,6 @@ def main():
     parser.add_argument('--topk_ks', type=str, nargs='*', default=None,
                         help='Override topk k values: 4:360 14:230 24:144')
 
-    # 网格搜索
-    parser.add_argument('--grid_search', action='store_true',
-                        help='Enable grid search (config: evaluation_settings.grid_search)')
-
     args = parser.parse_args()
 
     # 检测分布式环境
@@ -248,20 +243,25 @@ def main():
         distributed = False
 
     try:
-        if is_main_process():
-            print("=" * 60)
-            print("Attention Consistency Pruning - Evaluation")
-            if distributed:
-                print(f"Distributed mode: world_size={world_size}")
-            if args.grid_search:
-                print("Mode: Grid Search")
-            print("=" * 60)
-
         # 加载配置
         config = load_config(override_file=args.config)
         if not is_main_process():
             config.logger = None
         logger = config.logger
+
+        # 检查是否启用网格搜索
+        eval_cfg = config.evaluation_settings
+        grid_cfg = eval_cfg.get('grid_search', {})
+        grid_search_enabled = grid_cfg.get('enable', False)
+
+        if is_main_process():
+            print("=" * 60)
+            print("Attention Consistency Pruning - Evaluation")
+            if distributed:
+                print(f"Distributed mode: world_size={world_size}")
+            if grid_search_enabled:
+                print("Mode: Grid Search")
+            print("=" * 60)
 
         # 确定 checkpoint
         checkpoint_path = args.checkpoint or config.global_settings.get('checkpoint')
@@ -346,10 +346,8 @@ def main():
             dist.barrier()
 
         # 网格搜索或普通评估
-        if args.grid_search:
+        if grid_search_enabled:
             # 从配置读取阈值列表
-            eval_cfg = config.evaluation_settings
-            grid_cfg = eval_cfg.get('grid_search', {})
             threshold_values = grid_cfg.get('threshold_values', [0.2, 0.3, 0.4, 0.5, 0.6])
 
             if logger:
