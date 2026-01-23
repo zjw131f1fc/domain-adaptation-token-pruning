@@ -20,9 +20,11 @@
         --max_samples 5000
 
     # 覆盖配置中的阈值
-    torchrun --nproc_per_node=4 eval_acp_ddp.py \
-        --checkpoint outputs/checkpoints/checkpoint_final.pt \
-        --thresholds 4:0.5 14:0.5 24:0.5
+    python eval_acp_ddp.py --thresholds 4:0.5 14:0.5 24:0.5
+
+    # 网格搜索阈值（每层独立搜索，笛卡尔积）
+    python eval_acp_ddp.py --grid_search --grid_range 0.3:0.6:0.1
+    python eval_acp_ddp.py --grid_search --grid_range 0.2,0.3,0.4,0.5
 """
 
 import os
@@ -37,6 +39,8 @@ import torch
 import torch.distributed as dist
 from pathlib import Path
 from typing import Dict, Any, List
+from itertools import product
+from tqdm import tqdm
 
 # 添加项目根目录
 project_root = Path(__file__).parent
@@ -61,50 +65,27 @@ def load_checkpoint(
     device: torch.device,
     logger=None
 ) -> Dict[str, Any]:
-    """加载 checkpoint 到模型
-
-    参数:
-        model: PrunableLlavaForConditionalGeneration 模型
-        checkpoint_path: checkpoint 文件路径
-        device: 设备
-        logger: 日志器（仅主进程有效）
-
-    返回:
-        checkpoint 字典（包含 step 等元数据）
-    """
+    """加载 checkpoint 到模型"""
     if logger:
         logger.info(f"Loading checkpoint from {checkpoint_path}...")
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # 加载 pruner 状态
     if 'pruner_state_dict' in checkpoint:
         model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
         if logger:
             logger.info("  Loaded pruner_manager state")
-    else:
-        if logger:
-            logger.warning("  No pruner_state_dict found in checkpoint")
 
-    # 加载 adapter 状态
     if 'adapter_state_dict' in checkpoint:
         model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
         if logger:
             logger.info("  Loaded adapter_manager state")
-    else:
-        if logger:
-            logger.warning("  No adapter_state_dict found in checkpoint")
 
-    # 加载 discriminator 状态（评估时可选，但保持一致性）
     if 'disc_state_dict' in checkpoint:
         model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
         if logger:
             logger.info("  Loaded disc_manager state")
-    else:
-        if logger:
-            logger.warning("  No disc_state_dict found in checkpoint")
 
-    # 打印 checkpoint 信息
     if logger:
         if 'step' in checkpoint:
             logger.info(f"  Checkpoint from step {checkpoint['step']}")
@@ -129,6 +110,128 @@ def parse_thresholds(threshold_strs: List[str]) -> Dict[int, float]:
     return thresholds
 
 
+def parse_grid_range(range_str: str) -> List[float]:
+    """解析网格搜索范围
+
+    格式: "start:end:step" 或 "0.2,0.3,0.4,0.5"
+    """
+    if ',' in range_str:
+        return [float(x.strip()) for x in range_str.split(',')]
+    else:
+        parts = range_str.split(':')
+        if len(parts) == 3:
+            start, end, step = float(parts[0]), float(parts[1]), float(parts[2])
+            values = []
+            v = start
+            while v <= end + 1e-9:
+                values.append(round(v, 4))
+                v += step
+            return values
+        elif len(parts) == 1:
+            return [float(parts[0])]
+        else:
+            raise ValueError(f"Invalid grid range format: {range_str}")
+
+
+def run_grid_search(
+    model,
+    processor,
+    eval_dataset,
+    judge,
+    config,
+    device: torch.device,
+    max_samples: int,
+    pruning_layers: List[int],
+    threshold_values: List[float],
+    distributed: bool,
+    logger=None,
+) -> List[Dict[str, Any]]:
+    """执行网格搜索（笛卡尔积，每层阈值可不同）"""
+    results = []
+
+    # 生成所有组合
+    combinations = list(product(threshold_values, repeat=len(pruning_layers)))
+
+    if is_main_process():
+        print(f"\nGrid search: {len(combinations)} combinations")
+        print(f"Layers: {pruning_layers}")
+        print(f"Values: {threshold_values}")
+
+    pbar = tqdm(combinations, desc="Grid search", disable=not is_main_process())
+
+    for combo in pbar:
+        # 构建阈值字典
+        thresholds = {layer: t for layer, t in zip(pruning_layers, combo)}
+
+        # 设置阈值
+        model.pruner_manager.set_thresholds(thresholds)
+
+        # 评估
+        eval_result = evaluate(
+            model=model,
+            processor=processor,
+            dataset=eval_dataset,
+            judge=judge,
+            config=config,
+            device=device,
+            max_samples=max_samples,
+            mode='hard',
+            distributed=distributed,
+        )
+
+        result_entry = {
+            'thresholds': thresholds.copy(),
+            'accuracy': eval_result['accuracy'],
+            'avg_kept_ratio': eval_result.get('avg_kept_ratio', 0),
+            'correct': eval_result['correct'],
+            'total': eval_result['total'],
+        }
+        results.append(result_entry)
+
+        # 更新进度条
+        if is_main_process():
+            thresh_str = '/'.join(f"{t:.2f}" for t in combo)
+            pbar.set_postfix({
+                'thresh': thresh_str,
+                'acc': f"{eval_result['accuracy']:.2%}",
+                'kept': f"{eval_result.get('avg_kept_ratio', 0):.2%}"
+            })
+
+    return results
+
+
+def print_grid_search_results(results: List[Dict[str, Any]], pruning_layers: List[int]):
+    """打印网格搜索结果"""
+    if not results:
+        print("No results.")
+        return
+
+    # 按准确率排序
+    sorted_results = sorted(results, key=lambda x: x['accuracy'], reverse=True)
+
+    print("\n" + "=" * 80)
+    print("Grid Search Results (sorted by accuracy)")
+    print("=" * 80)
+    print(f"{'Rank':<5} {'Accuracy':<12} {'Kept':<12} {'Thresholds'}")
+    print("-" * 80)
+
+    for i, r in enumerate(sorted_results[:10]):
+        thresh_str = ', '.join(f"L{l}={r['thresholds'][l]:.2f}" for l in pruning_layers)
+        print(f"{i+1:<5} {r['accuracy']:.4f}       {r['avg_kept_ratio']:.4f}       {thresh_str}")
+
+    # 最佳配置
+    best = sorted_results[0]
+    print("\n" + "=" * 80)
+    print("Best Configuration")
+    print("=" * 80)
+    print(f"Accuracy: {best['accuracy']:.4f} ({best['correct']}/{best['total']})")
+    print(f"Kept Ratio: {best['avg_kept_ratio']:.4f}")
+    print("\nConfig (copy to yaml):")
+    print("pruner_thresholds:")
+    for layer in pruning_layers:
+        print(f"  {layer}: {best['thresholds'][layer]}")
+
+
 def main():
     import argparse
 
@@ -136,33 +239,36 @@ def main():
     parser.add_argument('--config', type=str, default='configs/vision_token_pruning.yaml',
                         help='Path to config file')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to checkpoint file (overrides config, required if not in config)')
+                        help='Path to checkpoint file (overrides config)')
     parser.add_argument('--mode', type=str, nargs='+', default=['hard'],
                         choices=['origin', 'hard'],
-                        help='Evaluation mode(s): origin (no pruning), hard (with pruning)')
+                        help='Evaluation mode(s)')
     parser.add_argument('--max_samples', type=int, default=None,
-                        help='Maximum number of samples to evaluate (default: use config value)')
+                        help='Maximum samples to evaluate')
     parser.add_argument('--split', type=str, default='test',
                         choices=['train', 'test', 'val'],
-                        help='Dataset split to evaluate on')
+                        help='Dataset split')
     parser.add_argument('--thresholds', type=str, nargs='*', default=None,
-                        help='Override pruning thresholds, format: 4:0.5 14:0.5 24:0.5')
+                        help='Override thresholds: 4:0.5 14:0.5 24:0.5')
     parser.add_argument('--inference_mode', type=str, default=None,
                         choices=['threshold', 'topk'],
-                        help='Override inference mode (threshold or topk)')
+                        help='Override inference mode')
     parser.add_argument('--topk_ks', type=str, nargs='*', default=None,
-                        help='Override topk k values, format: 4:360 14:230 24:144')
+                        help='Override topk k values: 4:360 14:230 24:144')
+
+    # 网格搜索
+    parser.add_argument('--grid_search', action='store_true',
+                        help='Enable grid search for thresholds')
+    parser.add_argument('--grid_range', type=str, default='0.2:0.6:0.1',
+                        help='Threshold range: start:end:step or comma-separated')
 
     args = parser.parse_args()
 
-    # 检测是否在分布式环境中
+    # 检测分布式环境
     if 'LOCAL_RANK' in os.environ:
-        # 分布式模式
-        rank, world_size, local_rank, device = setup_distributed()
+        _, world_size, local_rank, device = setup_distributed()
         distributed = True
     else:
-        # 单卡模式
-        rank = 0
         world_size = 1
         local_rank = 0
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -174,43 +280,29 @@ def main():
             print("Attention Consistency Pruning - Evaluation")
             if distributed:
                 print(f"Distributed mode: world_size={world_size}")
-            else:
-                print("Single GPU mode")
+            if args.grid_search:
+                print("Mode: Grid Search")
             print("=" * 60)
 
         # 加载配置
         config = load_config(override_file=args.config)
-
-        # 非主进程禁用 logger
         if not is_main_process():
             config.logger = None
-
         logger = config.logger
 
-        # 确定 checkpoint 路径（命令行优先，否则从配置读取）
-        checkpoint_path = args.checkpoint
+        # 确定 checkpoint
+        checkpoint_path = args.checkpoint or config.global_settings.get('checkpoint')
         if checkpoint_path is None:
-            checkpoint_path = config.global_settings.get('checkpoint', None)
-
-        # 评估必须有 checkpoint
-        if checkpoint_path is None:
-            error_msg = (
-                "Error: No checkpoint specified.\n"
-                "Please provide checkpoint via:\n"
-                "  1. Command line: --checkpoint <path>\n"
-                "  2. Config file: global_settings.checkpoint: <path>"
-            )
             if is_main_process():
-                print(error_msg)
+                print("Error: No checkpoint specified.")
+                print("Use --checkpoint or set global_settings.checkpoint in config.")
             if distributed:
                 cleanup_distributed()
             sys.exit(1)
 
-        # 检查 checkpoint 文件是否存在
         if not Path(checkpoint_path).exists():
-            error_msg = f"Error: Checkpoint file not found: {checkpoint_path}"
             if is_main_process():
-                print(error_msg)
+                print(f"Error: Checkpoint not found: {checkpoint_path}")
             if distributed:
                 cleanup_distributed()
             sys.exit(1)
@@ -218,170 +310,132 @@ def main():
         if logger:
             logger.info(f"Checkpoint: {checkpoint_path}")
 
-        # 获取剪枝层配置
+        # 获取配置
         method_cfg = config.method_settings
         pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
 
-        # 处理命令行阈值覆盖
+        # 处理阈值覆盖
         if args.thresholds:
             override_thresholds = parse_thresholds(args.thresholds)
-            # 更新配置
             if 'pruner_thresholds' not in method_cfg:
                 method_cfg['pruner_thresholds'] = {}
             method_cfg['pruner_thresholds'].update(override_thresholds)
             if logger:
                 logger.info(f"Override thresholds: {override_thresholds}")
 
-        # 处理推理模式覆盖
         if args.inference_mode:
             method_cfg['pruner_inference_mode'] = args.inference_mode
-            if logger:
-                logger.info(f"Override inference mode: {args.inference_mode}")
 
-        # 处理 topk_ks 覆盖
         if args.topk_ks:
-            override_topk = parse_thresholds(args.topk_ks)  # 复用解析函数
-            override_topk = {k: int(v) for k, v in override_topk.items()}
+            override_topk = {int(k): int(v) for k, v in parse_thresholds(args.topk_ks).items()}
             method_cfg['pruner_topk_ks'] = override_topk
-            if logger:
-                logger.info(f"Override topk_ks: {override_topk}")
 
         # 加载模型
         if logger:
             logger.info("Loading model...")
         model, processor = load_model(config, device, local_rank)
-
-        # 加载 checkpoint
         load_checkpoint(model, checkpoint_path, device, logger)
 
-        # 打印当前配置
         if logger:
-            logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
-
-            # 打印推理配置
-            inference_mode = method_cfg.get('pruner_inference_mode', 'threshold')
-            logger.info(f"Inference mode: {inference_mode}")
-
-            if inference_mode == 'threshold':
-                thresholds = method_cfg.get('pruner_thresholds', {})
-                if thresholds:
-                    thresh_str = ', '.join(f"L{k}={v}" for k, v in sorted(thresholds.items()))
-                    logger.info(f"Thresholds: {thresh_str}")
-            elif inference_mode == 'topk':
-                topk_ks = method_cfg.get('pruner_topk_ks', {})
-                if topk_ks:
-                    topk_str = ', '.join(f"L{k}={v}" for k, v in sorted(topk_ks.items()))
-                    logger.info(f"TopK values: {topk_str}")
+            logger.info(f"Pruning layers: {pruning_layers}")
 
         # 加载数据集
         if logger:
             logger.info("Loading dataset...")
-
-        # 临时保存原始 logger
         original_logger = config.logger
         if not is_main_process():
             config.logger = None
-
         from engine.datas.loader import load_dataset
         data_bundle = load_dataset(config)
-
-        # 恢复 logger
         config.logger = original_logger
 
-        # 选择数据集 split
-        if args.split in data_bundle['splits']:
-            eval_dataset = data_bundle['splits'][args.split]
-        else:
-            available_splits = list(data_bundle['splits'].keys())
+        if args.split not in data_bundle['splits']:
             if logger:
-                logger.error(f"Split '{args.split}' not found. Available splits: {available_splits}")
+                logger.error(f"Split '{args.split}' not found.")
             return
 
+        eval_dataset = data_bundle['splits'][args.split]
         judge = data_bundle['judge']
 
-        dataset_name = config.dataset_settings.get('name', 'unknown')
         if logger:
-            logger.info(f"Dataset: {dataset_name}")
-            logger.info(f"Evaluating on '{args.split}' split: {len(eval_dataset)} samples")
+            logger.info(f"Dataset: {config.dataset_settings.get('name', 'unknown')}")
+            logger.info(f"Split: {args.split}, samples: {len(eval_dataset)}")
 
-        # 确定评估样本数
-        if args.max_samples is not None:
-            max_samples = args.max_samples
-        else:
-            trainer_cfg = config.trainer_settings.get('dl_settings', {})
-            max_samples = trainer_cfg.get('eval_max_samples', 500)
-
+        # 确定样本数
+        max_samples = args.max_samples
+        if max_samples is None:
+            max_samples = config.trainer_settings.get('dl_settings', {}).get('eval_max_samples', 500)
         if logger:
             logger.info(f"Max samples: {max_samples}")
 
-        # 同步所有进程
+        # 同步
         if distributed:
             dist.barrier()
 
-        # 运行评估
-        if is_main_process():
-            print("\n" + "=" * 60)
-            print("Evaluation Results")
-            print("=" * 60)
-
-        results = {}
-        for eval_mode in args.mode:
+        # 网格搜索或普通评估
+        if args.grid_search:
+            threshold_values = parse_grid_range(args.grid_range)
             if logger:
-                logger.info(f"\nEvaluating in '{eval_mode}' mode...")
+                logger.info(f"Grid search values: {threshold_values}")
 
-            eval_result = evaluate(
+            grid_results = run_grid_search(
                 model=model,
                 processor=processor,
-                dataset=eval_dataset,
+                eval_dataset=eval_dataset,
                 judge=judge,
                 config=config,
                 device=device,
                 max_samples=max_samples,
-                mode=eval_mode,
+                pruning_layers=pruning_layers,
+                threshold_values=threshold_values,
                 distributed=distributed,
+                logger=logger,
             )
 
-            results[eval_mode] = eval_result
-
-            # 打印结果（只在主进程）
             if is_main_process():
-                print(f"\n[{eval_mode.upper()}] Results:")
-                print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result['correct']}/{eval_result['total']})")
+                print_grid_search_results(grid_results, pruning_layers)
+        else:
+            # 普通评估
+            if is_main_process():
+                print("\n" + "=" * 60)
+                print("Evaluation Results")
+                print("=" * 60)
 
-                if 'avg_kept_ratio' in eval_result:
-                    print(f"  Avg kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+            for eval_mode in args.mode:
+                if logger:
+                    logger.info(f"\nEvaluating '{eval_mode}' mode...")
 
-                    # 打印每层保留率
-                    layer_ratios = []
-                    for layer_idx in pruning_layers:
-                        kept_key = f'L{layer_idx}_kept'
-                        n_kept_key = f'L{layer_idx}_n_kept'
-                        if kept_key in eval_result:
-                            if n_kept_key in eval_result:
-                                layer_ratios.append(
-                                    f"L{layer_idx}={eval_result[kept_key]:.2%}({int(eval_result[n_kept_key])})"
-                                )
-                            else:
+                eval_result = evaluate(
+                    model=model,
+                    processor=processor,
+                    dataset=eval_dataset,
+                    judge=judge,
+                    config=config,
+                    device=device,
+                    max_samples=max_samples,
+                    mode=eval_mode,
+                    distributed=distributed,
+                )
+
+                if is_main_process():
+                    print(f"\n[{eval_mode.upper()}]")
+                    print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result['correct']}/{eval_result['total']})")
+                    if 'avg_kept_ratio' in eval_result:
+                        print(f"  Kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+                        layer_ratios = []
+                        for layer_idx in pruning_layers:
+                            kept_key = f'L{layer_idx}_kept'
+                            if kept_key in eval_result:
                                 layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                        if layer_ratios:
+                            print(f"  Per-layer: [{', '.join(layer_ratios)}]")
 
-                    if layer_ratios:
-                        print(f"  Per-layer kept: [{', '.join(layer_ratios)}]")
-
-        if is_main_process():
-            print("\n" + "=" * 60)
-            print("Evaluation completed.")
-            print("=" * 60)
-
-            # 输出结果摘要（方便复制）
-            print("\nSummary (for copy):")
-            for eval_mode, result in results.items():
-                summary_parts = [f"{eval_mode}: acc={result['accuracy']:.4f}"]
-                if 'avg_kept_ratio' in result:
-                    summary_parts.append(f"kept={result['avg_kept_ratio']:.4f}")
-                print("  " + ", ".join(summary_parts))
+            if is_main_process():
+                print("\n" + "=" * 60)
+                print("Evaluation completed.")
+                print("=" * 60)
 
     finally:
-        # 清理分布式环境
         if distributed:
             cleanup_distributed()
 
