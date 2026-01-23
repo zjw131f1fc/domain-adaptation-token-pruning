@@ -22,9 +22,8 @@
     # 覆盖配置中的阈值
     python eval_acp_ddp.py --thresholds 4:0.5 14:0.5 24:0.5
 
-    # 网格搜索阈值（每层独立搜索，笛卡尔积）
-    python eval_acp_ddp.py --grid_search --grid_range 0.3:0.6:0.1
-    python eval_acp_ddp.py --grid_search --grid_range 0.2,0.3,0.4,0.5
+    # 网格搜索阈值（阈值范围在配置文件 evaluation_settings.grid_search 中设置）
+    python eval_acp_ddp.py --grid_search
 """
 
 import os
@@ -110,29 +109,6 @@ def parse_thresholds(threshold_strs: List[str]) -> Dict[int, float]:
     return thresholds
 
 
-def parse_grid_range(range_str: str) -> List[float]:
-    """解析网格搜索范围
-
-    格式: "start:end:step" 或 "0.2,0.3,0.4,0.5"
-    """
-    if ',' in range_str:
-        return [float(x.strip()) for x in range_str.split(',')]
-    else:
-        parts = range_str.split(':')
-        if len(parts) == 3:
-            start, end, step = float(parts[0]), float(parts[1]), float(parts[2])
-            values = []
-            v = start
-            while v <= end + 1e-9:
-                values.append(round(v, 4))
-                v += step
-            return values
-        elif len(parts) == 1:
-            return [float(parts[0])]
-        else:
-            raise ValueError(f"Invalid grid range format: {range_str}")
-
-
 def run_grid_search(
     model,
     processor,
@@ -144,7 +120,6 @@ def run_grid_search(
     pruning_layers: List[int],
     threshold_values: List[float],
     distributed: bool,
-    logger=None,
 ) -> List[Dict[str, Any]]:
     """执行网格搜索（笛卡尔积，每层阈值可不同）"""
     results = []
@@ -258,9 +233,7 @@ def main():
 
     # 网格搜索
     parser.add_argument('--grid_search', action='store_true',
-                        help='Enable grid search for thresholds')
-    parser.add_argument('--grid_range', type=str, default='0.2:0.6:0.1',
-                        help='Threshold range: start:end:step or comma-separated')
+                        help='Enable grid search (config: evaluation_settings.grid_search)')
 
     args = parser.parse_args()
 
@@ -374,7 +347,11 @@ def main():
 
         # 网格搜索或普通评估
         if args.grid_search:
-            threshold_values = parse_grid_range(args.grid_range)
+            # 从配置读取阈值列表
+            eval_cfg = config.evaluation_settings
+            grid_cfg = eval_cfg.get('grid_search', {})
+            threshold_values = grid_cfg.get('threshold_values', [0.2, 0.3, 0.4, 0.5, 0.6])
+
             if logger:
                 logger.info(f"Grid search values: {threshold_values}")
 
@@ -389,7 +366,6 @@ def main():
                 pruning_layers=pruning_layers,
                 threshold_values=threshold_values,
                 distributed=distributed,
-                logger=logger,
             )
 
             if is_main_process():
