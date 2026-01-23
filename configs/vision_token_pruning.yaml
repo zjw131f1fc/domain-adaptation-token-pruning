@@ -10,6 +10,10 @@ global_settings:
   hf_cache_dir: "/data/users/zjw/huggingface_cache"
   save_dir: "./outputs/checkpoints"
   log_dir: "./outputs/logs"
+  # Checkpoint 路径（用于恢复训练或评估）
+  # 训练时：如果指定则从该 checkpoint 恢复训练
+  # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
+  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
@@ -60,9 +64,9 @@ method_settings:
   # 0.5 = 与训练时行为一致
   # 0.6 = 更严格（保留更少），0.4 = 更宽松（保留更多）
   pruner_thresholds:
-    4: 0.4
-    14: 0.4
-    24: 0.4
+    4: 0.3
+    14: 0.3
+    24: 0.3
 
   # 推理模式配置
   # - threshold: 使用 sigmoid(logits) > threshold 判断

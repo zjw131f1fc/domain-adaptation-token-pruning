@@ -4,7 +4,10 @@
 加载已训练的模型 checkpoint 并进行分布式评估。
 
 启动方式：
-    # 单卡评估
+    # 单卡评估（使用配置文件中的 checkpoint）
+    python eval_acp_ddp.py
+
+    # 单卡评估（命令行指定 checkpoint）
     python eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
 
     # 多卡分布式评估
@@ -33,7 +36,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.distributed as dist
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 # 添加项目根目录
 project_root = Path(__file__).parent
@@ -48,7 +51,6 @@ from main_acp_ddp import (
     cleanup_distributed,
     is_main_process,
     load_model,
-    preprocess_batch,
     evaluate,
 )
 
@@ -133,8 +135,8 @@ def main():
     parser = argparse.ArgumentParser(description="Attention Consistency Pruning Evaluation (DDP)")
     parser.add_argument('--config', type=str, default='configs/vision_token_pruning.yaml',
                         help='Path to config file')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint file')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to checkpoint file (overrides config, required if not in config)')
     parser.add_argument('--mode', type=str, nargs='+', default=['hard'],
                         choices=['origin', 'hard'],
                         help='Evaluation mode(s): origin (no pruning), hard (with pruning)')
@@ -185,6 +187,37 @@ def main():
 
         logger = config.logger
 
+        # 确定 checkpoint 路径（命令行优先，否则从配置读取）
+        checkpoint_path = args.checkpoint
+        if checkpoint_path is None:
+            checkpoint_path = config.global_settings.get('checkpoint', None)
+
+        # 评估必须有 checkpoint
+        if checkpoint_path is None:
+            error_msg = (
+                "Error: No checkpoint specified.\n"
+                "Please provide checkpoint via:\n"
+                "  1. Command line: --checkpoint <path>\n"
+                "  2. Config file: global_settings.checkpoint: <path>"
+            )
+            if is_main_process():
+                print(error_msg)
+            if distributed:
+                cleanup_distributed()
+            sys.exit(1)
+
+        # 检查 checkpoint 文件是否存在
+        if not Path(checkpoint_path).exists():
+            error_msg = f"Error: Checkpoint file not found: {checkpoint_path}"
+            if is_main_process():
+                print(error_msg)
+            if distributed:
+                cleanup_distributed()
+            sys.exit(1)
+
+        if logger:
+            logger.info(f"Checkpoint: {checkpoint_path}")
+
         # 获取剪枝层配置
         method_cfg = config.method_settings
         pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
@@ -219,7 +252,7 @@ def main():
         model, processor = load_model(config, device, local_rank)
 
         # 加载 checkpoint
-        checkpoint = load_checkpoint(model, args.checkpoint, device, logger)
+        load_checkpoint(model, checkpoint_path, device, logger)
 
         # 打印当前配置
         if logger:
