@@ -14,16 +14,40 @@
   - 加载 MME 原始数据 (使用 datasets.load_dataset)
   - 将其转换为标准字段结构
   - 调用父类准备流程并输出结果
+
+性能优化:
+  - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
+  - 大幅提升加载速度，减少内存占用
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 import random
 
 
 class MMEDataset(BsesDataset):
-    pass
+    """MME 数据集，支持延迟图像加载"""
+
+    def __init__(self, samples: List[Dict[str, Any]], hf_dataset=None):
+        super().__init__(samples)
+        self._hf_dataset = hf_dataset
+
+    def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """延迟加载：返回样本时才加载图像"""
+        # 处理切片操作
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(len(self.samples)))
+            return [self[i] for i in indices]
+
+        sample = self.samples[idx].copy()
+
+        # 如果 image 字段是整数索引，则延迟加载
+        if isinstance(sample.get('image'), int) and self._hf_dataset is not None:
+            hf_idx = sample['image']
+            sample['image'] = self._hf_dataset[hf_idx]['image']
+
+        return sample
 
 
 class MMEPreparer(BasePreparer):
@@ -31,14 +55,16 @@ class MMEPreparer(BasePreparer):
         super().__init__(config)
         self.has_category = True  # 明确声明具备类别
         self.field_map = {}  # 可由外部 config 指定, 默认空
+        self._hf_dataset = None  # 保存 HuggingFace dataset 引用用于延迟加载
 
     def _load_all(self) -> List[Dict[str, Any]]:
         ds = load_dataset("lmms-lab/MME", split="test")
+        self._hf_dataset = ds  # 保存引用
         out: List[Dict[str, Any]] = []
         for i in range(len(ds)):
             item = ds[i]
             out.append({
-                "image": item["image"],
+                "image": i,  # 存储索引而非图像（延迟加载）
                 "question": item["question"],
                 "answer": item["answer"],
                 "category": item["category"],
@@ -53,7 +79,11 @@ class MMEPreparer(BasePreparer):
         # 字段映射
         applied_map = self.apply_field_map(samples)
         # 根据配置拆分 (单一列表)
-        splits, placeholder = self.split_from_single(samples)
+        base_splits, placeholder = self.split_from_single(samples)
+        # 转换为 MMEDataset（支持延迟加载）
+        splits: Dict[str, MMEDataset] = {}
+        for name, ds in base_splits.items():
+            splits[name] = MMEDataset(ds.samples, self._hf_dataset)
         # 构建 meta
         meta = self.build_meta(samples, splits, applied_map, placeholder)
         # judge

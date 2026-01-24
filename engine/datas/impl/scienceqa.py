@@ -8,6 +8,10 @@
  3. 使用 task 作为 category; 原 task 字段仍保留
  4. skill 字段原样保留 (若为 list 合并为分号分隔字符串)
 
+性能优化:
+  - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
+  - 大幅提升加载速度，减少内存占用
+
 拆分: 直接利用 HF 官方 split (train / validation / test)。若配置里使用 'val' 作为键则映射到 'validation'。
 支持 category_priority (需 enable: True) / 占位 split / all split 等 BasePreparer 机制。
 
@@ -18,23 +22,48 @@ judge: 支持以下预测格式之一：
     - 完整选项文本 (大小写与首尾空白忽略)
 内部统一对齐到索引比较。
 """
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 from PIL import Image  # type: ignore
 
 
 class ScienceQADataset(BsesDataset):
-    pass
+    """ScienceQA 数据集，支持延迟图像加载"""
+
+    def __init__(self, samples: List[Dict[str, Any]], hf_datasets: Dict[str, Any] = None):
+        super().__init__(samples)
+        # hf_datasets: {split_name: dataset} 映射
+        self._hf_datasets = hf_datasets or {}
+
+    def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """延迟加载：返回样本时才加载图像"""
+        # 处理切片操作
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(len(self.samples)))
+            return [self[i] for i in indices]
+
+        sample = self.samples[idx].copy()
+
+        # 如果 image 字段是 (split, index) 元组，则延迟加载
+        if isinstance(sample.get('image'), tuple) and self._hf_datasets:
+            split_name, hf_idx = sample['image']
+            if split_name in self._hf_datasets:
+                sample['image'] = self._hf_datasets[split_name][hf_idx]['image']
+
+        return sample
 
 
 class ScienceQAPreparer(BasePreparer):
     def __init__(self, config):
         super().__init__(config)
         self.has_category = True  # 使用 task 作为 category
+        # 保存 HuggingFace dataset 引用用于延迟加载
+        self._hf_datasets: Dict[str, Any] = {}
 
     def _load_split(self, split: str) -> List[Dict[str, Any]]:
         ds = load_dataset("derek-thomas/ScienceQA", split=split)
+        self._hf_datasets[split] = ds  # 保存引用
         out: List[Dict[str, Any]] = []
         skipped_no_image = 0
         for i in range(len(ds)):
@@ -65,7 +94,7 @@ class ScienceQAPreparer(BasePreparer):
             header_block = "\n".join(header_lines)
             full_q = header_block + "\n" + question + "\n" + "\n".join(opt_lines) + f"\n{instr}"
             sample = {
-                'image': img,
+                'image': (split, i),  # 存储 (split, index) 而非图像
                 'question': full_q,
                 'raw_question': question,
                 'choices': choices,
@@ -103,18 +132,16 @@ class ScienceQAPreparer(BasePreparer):
         all_samples: List[Dict[str, Any]] = []
         for lst in presplits.values():
             all_samples.extend(lst)
-        # 额外安全过滤 (防止上游未来改动导致 None 泄漏)
-        before_total = len(all_samples)
-        all_samples = [s for s in all_samples if isinstance(s.get('image'), Image.Image)]
-        after_total = len(all_samples)
-        leak_filtered = before_total - after_total
-        if leak_filtered > 0:
-            logger = getattr(self.config, 'logger', None)
-            if logger is not None:
-                logger.warning(f"[ScienceQA] Post-load safeguard filtered {leak_filtered} leaked samples with invalid image; final total {after_total}.")
+        # 注意：延迟加载模式下，安全过滤需要调整
+        # 由于此时 image 是元组而非 PIL.Image，跳过 safeguard 检查
+        # 原始的 _load_split 已经做了过滤
         self.detect_category(all_samples)
         applied_map = self.apply_field_map(all_samples)
-        splits, placeholder = self.split_from_presplits(presplits)
+        base_splits, placeholder = self.split_from_presplits(presplits)
+        # 转换为 ScienceQADataset（支持延迟加载）
+        splits: Dict[str, ScienceQADataset] = {}
+        for name, ds in base_splits.items():
+            splits[name] = ScienceQADataset(ds.samples, self._hf_datasets)
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
         judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta) # type: ignore
         bundle = {'splits': splits, 'meta': meta, 'judge': judge}

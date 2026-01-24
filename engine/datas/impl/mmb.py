@@ -14,6 +14,10 @@
 拆分策略: 与 MME 相同，按 config.dataset_settings['split'] 进行:
   - 支持 float / int / -1 / 'all' 及 category_priority (需 enable: True)
 
+性能优化:
+  - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
+  - 大幅提升加载速度，减少内存占用
+
 judge 逻辑 (单选):
   - 单条: pred 若是字符串，归一化大写后与正确选项字母完全相同视为 1，否则 0
     * 若 pred 给出的是选项完整文本，将尝试匹配 A/B/C/D 文本 (归一化) 定位到其字母
@@ -27,14 +31,37 @@ judge 逻辑 (单选):
 无 try/except 包装，配置 / 数据异常直接抛出。
 """
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union, Tuple
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 import pandas as pd
 
 
 class MMBDataset(BsesDataset):
-    pass
+    """MMBench 数据集，支持延迟图像加载"""
+
+    def __init__(self, samples: List[Dict[str, Any]], hf_datasets: Dict[Tuple[str, str], Any] = None):
+        super().__init__(samples)
+        # hf_datasets: {(subset, split): dataset} 映射
+        self._hf_datasets = hf_datasets or {}
+
+    def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """延迟加载：返回样本时才加载图像"""
+        # 处理切片操作
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(len(self.samples)))
+            return [self[i] for i in indices]
+
+        sample = self.samples[idx].copy()
+
+        # 如果 image 字段是 (subset, split, index) 元组，则延迟加载
+        if isinstance(sample.get('image'), tuple) and self._hf_datasets:
+            subset, split, hf_idx = sample['image']
+            key = (subset, split)
+            if key in self._hf_datasets:
+                sample['image'] = self._hf_datasets[key][hf_idx]['image']
+
+        return sample
 
 
 class MMBenchPreparer(BasePreparer):
@@ -43,6 +70,8 @@ class MMBenchPreparer(BasePreparer):
         # 明确存在 category 字段
         self.has_category = True
         # 可通过 dataset_settings['field_map'] 自定义映射，这里不强制
+        # 保存 HuggingFace dataset 引用用于延迟加载
+        self._hf_datasets: Dict[Tuple[str, str], Any] = {}
 
     # --- 预拆分加载：dev -> train, test -> test ---
     def _load_dev(self) -> List[Dict[str, Any]]:
@@ -51,6 +80,7 @@ class MMBenchPreparer(BasePreparer):
         merged: List[Dict[str, Any]] = []
         for sub in subsets:
             ds = load_dataset("lmms-lab/MMBench", sub, split="dev")
+            self._hf_datasets[(sub, 'dev')] = ds  # 保存引用
             for i in range(len(ds)):
                 item = ds[i]
                 base_cat = item['category']
@@ -65,7 +95,7 @@ class MMBenchPreparer(BasePreparer):
                 instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
                 full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
                 merged.append({
-                    'image': item['image'],
+                    'image': (sub, 'dev', i),  # 存储 (subset, split, index) 而非图像
                     'question': full_q,
                     'A': item['A'],
                     'B': item['B'],
@@ -84,6 +114,7 @@ class MMBenchPreparer(BasePreparer):
         merged: List[Dict[str, Any]] = []
         for sub in subsets:
             ds = load_dataset("lmms-lab/MMBench", sub, split="test")
+            self._hf_datasets[(sub, 'test')] = ds  # 保存引用
             for i in range(len(ds)):
                 item = ds[i]
                 base_cat = item['category']
@@ -98,7 +129,7 @@ class MMBenchPreparer(BasePreparer):
                 instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
                 full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
                 merged.append({
-                    'image': item['image'],
+                    'image': (sub, 'test', i),  # 存储 (subset, split, index) 而非图像
                     'question': full_q,
                     'A': item['A'],
                     'B': item['B'],
@@ -128,7 +159,11 @@ class MMBenchPreparer(BasePreparer):
             all_samples.extend(lst)
         self.detect_category(all_samples)
         applied_map = self.apply_field_map(all_samples)
-        splits, placeholder = self.split_from_presplits(presplits)
+        base_splits, placeholder = self.split_from_presplits(presplits)
+        # 转换为 MMBDataset（支持延迟加载）
+        splits: Dict[str, MMBDataset] = {}
+        for name, ds in base_splits.items():
+            splits[name] = MMBDataset(ds.samples, self._hf_datasets)
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
         judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta)
         bundle = {'splits': splits, 'meta': meta, 'judge': judge}

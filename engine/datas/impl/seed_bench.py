@@ -1,6 +1,6 @@
 """SEED-Bench 数据集准备器
 
-目标: 
+目标:
   - 从 HuggingFace lmms-lab/SEED-Bench 加载 text split
   - 使用父类提供的分片方法（像 MME 那样）
   - 处理多选问题，将选项包装到问题里
@@ -10,20 +10,48 @@
   - 原始数据: {"answer": "A", "choice_a": "...", "choice_b": "...", "choice_c": "...", "choice_d": "...", "question": "...", "image": PIL.Image}
   - 处理后: {"image": PIL.Image, "question": "问题\n(A) 选项A\n(B) 选项B\n(C) 选项C\n(D) 选项D\n请选择正确答案的字母(A/B/C/D):", "answer": "A", "choices": ["选项A", "选项B", "选项C", "选项D"]}
 
+性能优化:
+  - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
+  - 大幅提升加载速度，减少内存占用
+
 评估方式:
   - 支持 A/B/C/D 字母答案
   - 支持数字索引答案 (0/1/2/3)
   - 支持完整选项文本匹配
 """
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 from tqdm import tqdm
 
 
 class SEEDBenchDataset(BsesDataset):
-    pass
+    """SEED-Bench 数据集，支持延迟图像加载"""
+
+    def __init__(self, samples: List[Dict[str, Any]], hf_dataset=None):
+        super().__init__(samples)
+        self._hf_dataset = hf_dataset
+
+    def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """延迟加载：返回样本时才加载图像"""
+        # 处理切片操作
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(len(self.samples)))
+            return [self[i] for i in indices]
+
+        sample = self.samples[idx].copy()
+
+        # 如果 image 字段是整数索引，则延迟加载
+        if isinstance(sample.get('image'), int) and self._hf_dataset is not None:
+            hf_idx = sample['image']
+            image_data = self._hf_dataset[hf_idx]['image']
+            # 处理列表情况
+            if isinstance(image_data, list) and len(image_data) == 1:
+                image_data = image_data[0]
+            sample['image'] = image_data
+
+        return sample
 
 
 class SEEDBenchPreparer(BasePreparer):
@@ -34,13 +62,16 @@ class SEEDBenchPreparer(BasePreparer):
         # 仅在 int/ -1 / 0 时生效; 比例 (float) 或 'all' 无法在未知总数前确定数量 => 回退为完整加载
         ds_cfg = self.config.dataset_settings
         self.fast_load_no_random = ds_cfg['fast_load_no_random']
+        # 保存 HuggingFace dataset 引用用于延迟加载
+        self._hf_dataset = None
 
     def _load_all(self) -> List[Dict[str, Any]]:
         """加载 SEED-Bench text split 数据"""
         ds = load_dataset("lmms-lab/SEED-Bench", split="test")
+        self._hf_dataset = ds  # 保存引用
         samples: List[Dict[str, Any]] = []
         filtered_count = 0  # 记录过滤掉的数据数量
-        
+
         # 计算 fast load 限额 - 考虑所有split的总和
         limit = None
         if self.fast_load_no_random:
@@ -55,51 +86,48 @@ class SEEDBenchPreparer(BasePreparer):
                 else:
                     total_needed = None
                     break
-            
+
             if total_needed is not None and total_needed > 0:
                 limit = total_needed
-        
+
         for i in tqdm(range(len(ds)), desc="Loading SEED-Bench"):
             if limit is not None and len(samples) >= limit:
                 break
             item = ds[i]
-            
+
             # 检查image字段是否为列表，且列表长度不为1
             image_data = item["image"]
             if isinstance(image_data, list):
                 if len(image_data) != 1:
                     filtered_count += 1
                     continue  # 跳过这个样本
-                else:
-                    # 提取列表中的单个图片
-                    image_data = image_data[0]
-            
+
             # 提取选项
             choices = [
                 item["choice_a"],
-                item["choice_b"], 
+                item["choice_b"],
                 item["choice_c"],
                 item["choice_d"]
             ]
-            
+
             # 构建完整问题，包含选项和提示
             opt_lines = []
             for idx, choice in enumerate(choices):
                 letter = chr(ord('A') + idx)
                 opt_lines.append(f"({letter}) {choice}")
-            
+
             # 添加英文提示词让AI回答字母
             instruction = "Please select the correct answer letter (A/B/C/D):"
             full_question = item["question"] + "\n" + "\n".join(opt_lines) + f"\n{instruction}"
-            
+
             samples.append({
-                "image": image_data,  # 直接使用单个图片
+                "image": i,  # 存储索引而非图像（延迟加载）
                 "question": full_question,
                 "raw_question": item["question"],
                 "answer": item["answer"],  # A/B/C/D 格式
                 "choices": choices,
             })
-        
+
         # 保存过滤统计信息到实例变量
         self.filtered_count = filtered_count
         return samples
@@ -111,7 +139,11 @@ class SEEDBenchPreparer(BasePreparer):
         # 字段映射
         applied_map = self.apply_field_map(samples)
         # 根据配置拆分（单一列表，像 MME 那样）
-        splits, placeholder = self.split_from_single(samples)
+        base_splits, placeholder = self.split_from_single(samples)
+        # 转换为 SEEDBenchDataset（支持延迟加载）
+        splits: Dict[str, SEEDBenchDataset] = {}
+        for name, ds in base_splits.items():
+            splits[name] = SEEDBenchDataset(ds.samples, self._hf_dataset)
         # 构建 meta
         meta = self.build_meta(samples, splits, applied_map, placeholder)
         # judge
