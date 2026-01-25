@@ -81,9 +81,9 @@ class ScienceQAPreparer(BasePreparer):
             letter = chr(ord('A') + ans_index)
             opt_lines = []
             for idx, opt in enumerate(choices):
-                opt_lines.append(f"({idx}) {opt}")
+                opt_lines.append(f"({chr(ord('A') + idx)}) {opt}")
             total_opts = len(choices)
-            instr = f"Only output the numeric index of the correct option (0~{total_opts-1}). Return only the number (do not output text)."
+            instr = f"Answer with the option letter (A, B, C, or D) at the end."
             skill_val = item['skill']
             if isinstance(skill_val, list):
                 skill_norm = '; '.join(str(s) for s in skill_val)
@@ -208,28 +208,50 @@ class ScienceQAPreparer(BasePreparer):
 
     def _build_judge(self, meta: Dict[str, Any], splits: Dict[str, ScienceQADataset]):
         def _parse(pred_raw: Any, sample: Dict[str, Any]) -> int:
-            # 尝试: 纯数字 -> 在字符串中抓第一个数字 (Answer: 2) -> 完整选项文本匹配
+            """解析预测结果，支持多种格式：
+            - 字母 (A/B/C/D)
+            - 数字 (0/1/2/3)
+            - 文本中提取最后出现的字母/数字
+            """
             if isinstance(pred_raw, int):
                 return pred_raw
             text = str(pred_raw).strip()
-            # 仅允许 ASCII 数字 0-9；忽略其他 Unicode 数字 (如 ①②③)
-            if text and all('0' <= ch <= '9' for ch in text):
+            if not text:
+                return -999
+
+            # 1. 尝试从末尾提取字母答案 (A/B/C/D)
+            # 常见格式: "The answer is A", "...so the answer is (B)", "A", "Answer: C"
+            import re
+            # 从后往前找最后一个独立的 A/B/C/D
+            # 匹配: 句末的字母、括号内的字母、"answer is X" 等
+            letter_patterns = [
+                r'[(\[]\s*([A-Da-d])\s*[)\]]',  # (A), [B]
+                r'(?:answer|option|choice)(?:\s+is)?[:\s]+([A-Da-d])\b',  # answer is A, answer: B
+                r'\b([A-Da-d])\s*[.。]?\s*$',  # 句末的字母
+                r'^([A-Da-d])$',  # 只有一个字母
+            ]
+            for pattern in letter_patterns:
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                if matches:
+                    letter = matches[-1].group(1).upper()
+                    return ord(letter) - ord('A')
+
+            # 2. 尝试纯数字
+            if text.isdigit():
                 return int(text)
-            # 抓取第一个连续 ASCII 数字序列
-            num_buf = ''
-            for ch in text:
-                if '0' <= ch <= '9':
-                    num_buf += ch
-                elif num_buf:
-                    break
-            if num_buf and all('0' <= ch <= '9' for ch in num_buf):
-                return int(num_buf)
-            # 完整文本匹配
-            choices = sample['choices'] if sample is not None and 'choices' in sample else []
+
+            # 3. 从文本中提取第一个数字
+            num_match = re.search(r'\d+', text)
+            if num_match:
+                return int(num_match.group())
+
+            # 4. 完整选项文本匹配
+            choices = sample.get('choices', []) if sample else []
             low = text.lower()
             for idx, opt in enumerate(choices):
                 if low == str(opt).strip().lower():
                     return idx
+
             return -999
         def _judge(pred, ref, sample=None, split_name: str = 'val'):
             def _single(p_raw, r_raw, smp):
