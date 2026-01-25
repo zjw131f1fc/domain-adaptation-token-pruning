@@ -282,6 +282,8 @@ def evaluate_no_image_samples(
         inputs = processor.tokenizer(
             prompt,
             return_tensors="pt",
+            truncation=True,
+            max_length=2048,
         ).to(device)
 
         with torch.no_grad():
