@@ -287,6 +287,8 @@ def preprocess_batch(
         images=images,
         return_tensors="pt",
         padding=True,
+        truncation=True,
+        max_length=max_length,
     ).to(device)
 
     input_ids = inputs['input_ids']
@@ -687,6 +689,8 @@ def evaluate(
                 text=prompt,
                 images=sample['image'],
                 return_tensors="pt",
+                truncation=True,
+                max_length=2048,
             ).to(device)
 
             output_ids = model.generate(
