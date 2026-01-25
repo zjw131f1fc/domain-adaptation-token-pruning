@@ -90,11 +90,26 @@ class ScienceQAPreparer(BasePreparer):
             else:
                 skill_norm = skill_val if skill_val is not None else ''
             task = item['task']
-            header_lines = [f"Task: {task}"]
-            if skill_norm:
-                header_lines.append(f"Skill: {skill_norm}")
-            header_block = "\n".join(header_lines)
-            full_q = header_block + "\n" + question + "\n" + "\n".join(opt_lines) + f"\n{instr}"
+            hint = item.get('hint', '') or ''
+            lecture = item.get('lecture', '') or ''
+
+            # 构建 prompt：包含背景知识和提示
+            prompt_parts = []
+
+            # 背景知识（lecture）放在最前面
+            if lecture.strip():
+                prompt_parts.append(f"Background: {lecture.strip()}")
+
+            # 提示信息
+            if hint.strip():
+                prompt_parts.append(f"Hint: {hint.strip()}")
+
+            # 问题和选项
+            prompt_parts.append(question)
+            prompt_parts.append("\n".join(opt_lines))
+            prompt_parts.append(instr)
+
+            full_q = "\n".join(prompt_parts)
             sample = {
                 'image': (split, i) if has_image else None,  # 无图样本存 None
                 'question': full_q,
