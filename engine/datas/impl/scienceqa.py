@@ -61,18 +61,20 @@ class ScienceQAPreparer(BasePreparer):
         # 保存 HuggingFace dataset 引用用于延迟加载
         self._hf_datasets: Dict[str, Any] = {}
 
-    def _load_split(self, split: str) -> List[Dict[str, Any]]:
+    def _load_split(self, split: str) -> tuple:
+        """加载指定 split 的数据
+
+        Returns:
+            tuple: (有图样本列表, 无图样本列表)
+        """
         ds = load_dataset("derek-thomas/ScienceQA", split=split)
         self._hf_datasets[split] = ds  # 保存引用
         out: List[Dict[str, Any]] = []
-        skipped_no_image = 0
+        no_image_samples: List[Dict[str, Any]] = []
         for i in range(len(ds)):
             item = ds[i]
             img = item['image']
-            # 过滤掉 image 为空或类型异常的样本（评估阶段要求为 PIL.Image.Image）
-            if not isinstance(img, Image.Image):
-                skipped_no_image += 1
-                continue
+            has_image = isinstance(img, Image.Image)
             question = item['question']
             choices = item['choices']
             ans_index = item['answer']  # 保留 0-based
@@ -94,7 +96,7 @@ class ScienceQAPreparer(BasePreparer):
             header_block = "\n".join(header_lines)
             full_q = header_block + "\n" + question + "\n" + "\n".join(opt_lines) + f"\n{instr}"
             sample = {
-                'image': (split, i),  # 存储 (split, index) 而非图像
+                'image': (split, i) if has_image else None,  # 无图样本存 None
                 'question': full_q,
                 'raw_question': question,
                 'choices': choices,
@@ -107,28 +109,43 @@ class ScienceQAPreparer(BasePreparer):
                 'solution': item['solution'],
                 'skill': skill_norm,
             }
-            out.append(sample)
+            if has_image:
+                out.append(sample)
+            else:
+                no_image_samples.append(sample)
         logger = getattr(self.config, 'logger', None)
         if logger is not None:
-            logger.info(f"[ScienceQA] Split '{split}': filtered {skipped_no_image} samples with no/invalid image; kept {len(out)}.")
-        return out
+            logger.info(f"[ScienceQA] Split '{split}': {len(no_image_samples)} samples with no/invalid image; {len(out)} with image.")
+        return out, no_image_samples
 
-    def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
+    def _load_presplits(self) -> tuple:
+        """加载预拆分数据
+
+        Returns:
+            tuple: (有图样本字典, 无图样本字典)
+        """
         pres: Dict[str, List[Dict[str, Any]]] = {}
+        no_image_pres: Dict[str, List[Dict[str, Any]]] = {}
         requested = set(self.split_cfg.keys())
         # train
         if 'train' in requested:
-            pres['train'] = self._load_split('train')
+            samples, no_image = self._load_split('train')
+            pres['train'] = samples
+            no_image_pres['train'] = no_image
         # validation (config 可用 'val' 或 'validation')
         if 'val' in requested or 'validation' in requested:
-            pres['val'] = self._load_split('validation')
+            samples, no_image = self._load_split('validation')
+            pres['val'] = samples
+            no_image_pres['val'] = no_image
         # test
         if 'test' in requested:
-            pres['test'] = self._load_split('test')
-        return pres
+            samples, no_image = self._load_split('test')
+            pres['test'] = samples
+            no_image_pres['test'] = no_image
+        return pres, no_image_pres
 
     def get(self) -> Dict[str, Any]:
-        presplits = self._load_presplits()
+        presplits, no_image_presplits = self._load_presplits()
         all_samples: List[Dict[str, Any]] = []
         for lst in presplits.values():
             all_samples.extend(lst)
@@ -143,6 +160,8 @@ class ScienceQAPreparer(BasePreparer):
         for name, ds in base_splits.items():
             splits[name] = ScienceQADataset(ds.samples, self._hf_datasets)
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
+        # 将无图样本按 split 存入 meta（供评估时使用）
+        meta['no_image_samples'] = no_image_presplits
         judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta) # type: ignore
         bundle = {'splits': splits, 'meta': meta, 'judge': judge}
         if True:

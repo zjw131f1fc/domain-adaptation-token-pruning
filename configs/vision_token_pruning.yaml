@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: /data/users/zjw/projects/domain-adaptation-token-pruning/outputs/checkpoints/vqav2-144-20260122-1712_vqa-vqav2_llava157b_6ccb/checkpoints/checkpoint_step26000.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: /data/users/zjw/projects/domain-adaptation-token-pruning/outputs/checkpoints/gqa/checkpoint_step2400.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
@@ -29,15 +29,15 @@ trainer_settings:
         lr: 2.0e-04
     print_loss_every_batches: 50  # 隔多久打印一次损失
     eval_every_batches: 2000  # 隔多久评估一次
-    eval_max_samples: 1000 # 每次评估使用多少数据
+    eval_max_samples: 1000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
 dataset_settings:
-  name: "vqa-vqav2"
+  name: "vqa-sqa"
   split:
     train: "all"
-    test: 1000
+    test: 60000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -64,9 +64,9 @@ method_settings:
   # 0.5 = 与训练时行为一致
   # 0.6 = 更严格（保留更少），0.4 = 更宽松（保留更多）
   pruner_thresholds:
-    4: 0.6
-    14: 0.6
-    24: 0.6
+    4: 0.3
+    14: 0.3
+    24: 0.3
 
   # 推理模式配置
   # - threshold: 使用 sigmoid(logits) > threshold 判断
@@ -133,10 +133,10 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard"]
+  eval_mode: ["origin"]
 
   # 网格搜索配置（用于搜索最优阈值）
   grid_search:
-    enable: true  # 是否启用网格搜索
+    enable: false  # 是否启用网格搜索
     # 搜索的阈值列表（每层独立搜索，笛卡尔积）
     threshold_values: [0.6, 0.5, 0.7]
