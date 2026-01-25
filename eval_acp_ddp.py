@@ -285,7 +285,7 @@ def evaluate_no_image_samples(
         ).to(device)
 
         with torch.no_grad():
-            output_ids = model.base_model.language_model.generate(
+            output_ids = model.base_model.generate(
                 input_ids=inputs['input_ids'],
                 attention_mask=inputs.get('attention_mask'),
                 max_new_tokens=32,
