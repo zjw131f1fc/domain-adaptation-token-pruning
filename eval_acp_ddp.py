@@ -241,6 +241,7 @@ def evaluate_no_image_samples(
     judge,
     device: torch.device,
     max_samples: int,
+    max_length: int,
     distributed: bool,
 ) -> Dict[str, Any]:
     """评估无图样本（纯文本问答）
@@ -252,6 +253,7 @@ def evaluate_no_image_samples(
         judge: 评判函数
         device: 设备
         max_samples: 最大样本数
+        max_length: 序列最大长度
         distributed: 是否分布式
 
     Returns:
@@ -283,7 +285,7 @@ def evaluate_no_image_samples(
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=2048,
+            max_length=max_length,
         ).to(device)
 
         with torch.no_grad():
@@ -471,8 +473,10 @@ def main():
 
         # 确定样本数（从配置文件读取）
         max_samples = config.trainer_settings.get('dl_settings', {}).get('eval_max_samples', 500)
+        max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
         if logger:
             logger.info(f"Max samples: {max_samples}")
+            logger.info(f"Max length: {max_length}")
 
         # 同步
         if distributed:
@@ -580,6 +584,7 @@ def main():
                         judge=judge,
                         device=device,
                         max_samples=no_image_max_samples,
+                        max_length=max_length,
                         distributed=distributed,
                     )
                     origin_result = merge_eval_results(origin_result, no_image_result)
@@ -623,6 +628,7 @@ def main():
                         judge=judge,
                         device=device,
                         max_samples=no_image_max_samples,
+                        max_length=max_length,
                         distributed=distributed,
                     )
                     eval_result = merge_eval_results(eval_result, no_image_result)
