@@ -4,25 +4,20 @@
 加载已训练的模型 checkpoint 并进行分布式评估。
 
 启动方式：
-    # 单卡评估（使用配置文件中的 checkpoint）
-    python eval_acp_ddp.py
+    # 使用默认配置和 checkpoint
+    ./scripts/run_eval_ddp.sh
 
-    # 单卡评估（命令行指定 checkpoint）
-    python eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
+    # 指定 GPU
+    ./scripts/run_eval_ddp.sh 0,1,2,3
 
-    # 多卡分布式评估
-    torchrun --nproc_per_node=4 eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
+    # 命令行指定 checkpoint（覆盖配置）
+    ./scripts/run_eval_ddp.sh 4,5,6,7 --checkpoint outputs/checkpoints/checkpoint_final.pt
 
-    # 指定评估模式和样本数
-    torchrun --nproc_per_node=4 eval_acp_ddp.py \\
-        --checkpoint outputs/checkpoints/checkpoint_final.pt \\
-        --mode origin hard \\
-        --max_samples 5000
-
-    # 覆盖配置中的阈值
-    python eval_acp_ddp.py --thresholds 4:0.5 14:0.5 24:0.5
-
-网格搜索：在配置文件中设置 evaluation_settings.grid_search.enable: true
+配置说明：
+    - eval_mode: 在配置文件 evaluation_settings.eval_mode 中设置，如 ["origin", "hard"]
+    - max_samples: 在配置文件 trainer_settings.dl_settings.eval_max_samples 中设置
+    - 阈值: 在配置文件 method_settings.pruner_thresholds 中设置
+    - 网格搜索: 在配置文件 evaluation_settings.grid_search.enable 中设置
 """
 
 import os
@@ -91,22 +86,6 @@ def load_checkpoint(
         logger.info("Checkpoint loaded successfully.")
 
     return checkpoint
-
-
-def parse_thresholds(threshold_strs: List[str]) -> Dict[int, float]:
-    """解析命令行阈值参数
-
-    格式: ["4:0.5", "14:0.5", "24:0.5"]
-    返回: {4: 0.5, 14: 0.5, 24: 0.5}
-    """
-    thresholds = {}
-    for s in threshold_strs:
-        parts = s.split(':')
-        if len(parts) == 2:
-            layer_idx = int(parts[0])
-            threshold = float(parts[1])
-            thresholds[layer_idx] = threshold
-    return thresholds
 
 
 def print_grid_search_progress(
@@ -255,6 +234,132 @@ def print_grid_search_results(
         print(f"  {layer}: {best['thresholds'][layer]}")
 
 
+def evaluate_no_image_samples(
+    model,
+    processor,
+    no_image_samples: List[Dict[str, Any]],
+    judge,
+    device: torch.device,
+    max_samples: int,
+    distributed: bool,
+) -> Dict[str, Any]:
+    """评估无图样本（纯文本问答）
+
+    Args:
+        model: 模型
+        processor: processor
+        no_image_samples: 无图样本列表
+        judge: 评判函数
+        device: 设备
+        max_samples: 最大样本数
+        distributed: 是否分布式
+
+    Returns:
+        评估结果字典
+    """
+    model.eval()
+    n_samples = min(len(no_image_samples), max_samples)
+
+    # 分布式评估：每个 rank 处理一部分数据
+    if distributed and dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        indices = list(range(n_samples))
+        local_indices = indices[rank::world_size]
+    else:
+        local_indices = list(range(n_samples))
+
+    predictions = []
+    references = []
+
+    show_progress = is_main_process()
+
+    for i in tqdm(local_indices, desc="Evaluating (no-image)", disable=not show_progress):
+        sample = no_image_samples[i]
+
+        # 纯文本模式：不传入图像
+        prompt = f"USER: {sample['question']}\nASSISTANT:"
+        inputs = processor.tokenizer(
+            prompt,
+            return_tensors="pt",
+        ).to(device)
+
+        with torch.no_grad():
+            output_ids = model.base_model.language_model.generate(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs.get('attention_mask'),
+                max_new_tokens=32,
+                do_sample=False,
+            )
+
+        generated = processor.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        if "ASSISTANT:" in generated:
+            pred = generated.split("ASSISTANT:")[-1].strip()
+        else:
+            pred = generated.strip()
+
+        predictions.append(pred)
+
+        if 'answers' in sample:
+            references.append(sample['answers'])
+        else:
+            references.append(sample['answer'])
+
+    # 分布式评估：收集所有 rank 的结果
+    if distributed and dist.is_initialized():
+        all_predictions = [None] * dist.get_world_size()
+        all_references = [None] * dist.get_world_size()
+        dist.all_gather_object(all_predictions, predictions)
+        dist.all_gather_object(all_references, references)
+
+        predictions = []
+        references = []
+        for preds, refs in zip(all_predictions, all_references):
+            predictions.extend(preds)
+            references.extend(refs)
+
+    result = judge(predictions, references)
+    return {
+        'accuracy': result['accuracy'],
+        'correct': result['correct'],
+        'total': result['total'],
+    }
+
+
+def merge_eval_results(
+    image_result: Dict[str, Any],
+    no_image_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """合并有图和无图样本的评估结果
+
+    Args:
+        image_result: 有图样本评估结果
+        no_image_result: 无图样本评估结果
+
+    Returns:
+        合并后的评估结果
+    """
+    total_correct = image_result['correct'] + no_image_result['correct']
+    total_samples = image_result['total'] + no_image_result['total']
+    merged = {
+        'accuracy': total_correct / total_samples if total_samples > 0 else 0.0,
+        'correct': total_correct,
+        'total': total_samples,
+        'image_accuracy': image_result['accuracy'],
+        'image_correct': image_result['correct'],
+        'image_total': image_result['total'],
+        'no_image_accuracy': no_image_result['accuracy'],
+        'no_image_correct': no_image_result['correct'],
+        'no_image_total': no_image_result['total'],
+    }
+    # 保留有图样本的 kept_ratio 等信息
+    for key in image_result:
+        if key not in merged:
+            merged[key] = image_result[key]
+    return merged
+
+
 def main():
     import argparse
 
@@ -263,21 +368,6 @@ def main():
                         help='Path to config file')
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Path to checkpoint file (overrides config)')
-    parser.add_argument('--mode', type=str, nargs='+', default=['hard'],
-                        choices=['origin', 'hard'],
-                        help='Evaluation mode(s)')
-    parser.add_argument('--max_samples', type=int, default=None,
-                        help='Maximum samples to evaluate')
-    parser.add_argument('--split', type=str, default='test',
-                        choices=['train', 'test', 'val'],
-                        help='Dataset split')
-    parser.add_argument('--thresholds', type=str, nargs='*', default=None,
-                        help='Override thresholds: 4:0.5 14:0.5 24:0.5')
-    parser.add_argument('--inference_mode', type=str, default=None,
-                        choices=['threshold', 'topk'],
-                        help='Override inference mode')
-    parser.add_argument('--topk_ks', type=str, nargs='*', default=None,
-                        help='Override topk k values: 4:360 14:230 24:144')
 
     args = parser.parse_args()
 
@@ -336,22 +426,6 @@ def main():
         method_cfg = config.method_settings
         pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
 
-        # 处理阈值覆盖
-        if args.thresholds:
-            override_thresholds = parse_thresholds(args.thresholds)
-            if 'pruner_thresholds' not in method_cfg:
-                method_cfg['pruner_thresholds'] = {}
-            method_cfg['pruner_thresholds'].update(override_thresholds)
-            if logger:
-                logger.info(f"Override thresholds: {override_thresholds}")
-
-        if args.inference_mode:
-            method_cfg['pruner_inference_mode'] = args.inference_mode
-
-        if args.topk_ks:
-            override_topk = {int(k): int(v) for k, v in parse_thresholds(args.topk_ks).items()}
-            method_cfg['pruner_topk_ks'] = override_topk
-
         # 加载模型
         if logger:
             logger.info("Loading model...")
@@ -371,22 +445,30 @@ def main():
         data_bundle = load_dataset(config)
         config.logger = original_logger
 
-        if args.split not in data_bundle['splits']:
+        # 默认使用 test 分割
+        eval_split = 'test'
+        if eval_split not in data_bundle['splits']:
             if logger:
-                logger.error(f"Split '{args.split}' not found.")
+                logger.error(f"Split '{eval_split}' not found.")
             return
 
-        eval_dataset = data_bundle['splits'][args.split]
+        eval_dataset = data_bundle['splits'][eval_split]
         judge = data_bundle['judge']
+
+        # 检查是否有无图样本
+        meta = data_bundle.get('meta', {})
+        no_image_samples_dict = meta.get('no_image_samples', {})
+        no_image_samples = no_image_samples_dict.get(eval_split, [])
+        has_no_image_samples = len(no_image_samples) > 0
 
         if logger:
             logger.info(f"Dataset: {config.dataset_settings.get('name', 'unknown')}")
-            logger.info(f"Split: {args.split}, samples: {len(eval_dataset)}")
+            logger.info(f"Split: {eval_split}, samples with image: {len(eval_dataset)}")
+            if has_no_image_samples:
+                logger.info(f"Split: {eval_split}, samples without image: {len(no_image_samples)}")
 
-        # 确定样本数
-        max_samples = args.max_samples
-        if max_samples is None:
-            max_samples = config.trainer_settings.get('dl_settings', {}).get('eval_max_samples', 500)
+        # 确定样本数（从配置文件读取）
+        max_samples = config.trainer_settings.get('dl_settings', {}).get('eval_max_samples', 500)
         if logger:
             logger.info(f"Max samples: {max_samples}")
 
@@ -445,14 +527,31 @@ def main():
                 print_grid_search_results(grid_results, pruning_layers, origin_result)
         else:
             # 普通评估
+            # 从配置文件读取评估模式
+            eval_modes = eval_cfg.get('eval_mode', ['hard'])
+            if isinstance(eval_modes, str):
+                eval_modes = [eval_modes]
+
             if is_main_process():
                 print("\n" + "=" * 60)
                 print("Evaluation Results")
                 print("=" * 60)
 
+            # 计算无图样本的 max_samples（按比例分配）
+            if has_no_image_samples:
+                total_samples = len(eval_dataset) + len(no_image_samples)
+                no_image_ratio = len(no_image_samples) / total_samples
+                no_image_max_samples = int(max_samples * no_image_ratio)
+                image_max_samples = max_samples - no_image_max_samples
+                if logger:
+                    logger.info(f"Samples allocation: {image_max_samples} with image, {no_image_max_samples} without image")
+            else:
+                image_max_samples = max_samples
+                no_image_max_samples = 0
+
             # 如果 mode 包含 origin，先评估并缓存（用于后续 hard 模式的相对准确率）
             origin_result = None
-            if 'origin' in args.mode:
+            if 'origin' in eval_modes:
                 if logger:
                     logger.info("Evaluating 'origin' mode...")
 
@@ -463,17 +562,35 @@ def main():
                     judge=judge,
                     config=config,
                     device=device,
-                    max_samples=max_samples,
+                    max_samples=image_max_samples,
                     mode='origin',
                     distributed=distributed,
                 )
 
+                # 评估无图样本并合并
+                if has_no_image_samples and no_image_max_samples > 0:
+                    if logger:
+                        logger.info("Evaluating no-image samples...")
+                    no_image_result = evaluate_no_image_samples(
+                        model=model,
+                        processor=processor,
+                        no_image_samples=no_image_samples,
+                        judge=judge,
+                        device=device,
+                        max_samples=no_image_max_samples,
+                        distributed=distributed,
+                    )
+                    origin_result = merge_eval_results(origin_result, no_image_result)
+
                 if is_main_process():
                     print(f"\n[ORIGIN]")
                     print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result['correct']}/{origin_result['total']})")
+                    if has_no_image_samples and 'image_accuracy' in origin_result:
+                        print(f"    - with image: {origin_result['image_accuracy']:.2%} ({origin_result['image_correct']}/{origin_result['image_total']})")
+                        print(f"    - no image:   {origin_result['no_image_accuracy']:.2%} ({origin_result['no_image_correct']}/{origin_result['no_image_total']})")
 
             # 评估其他模式（跳过已评估的 origin）
-            for eval_mode in args.mode:
+            for eval_mode in eval_modes:
                 if eval_mode == 'origin':
                     # 已经评估过了，跳过
                     continue
@@ -488,14 +605,32 @@ def main():
                     judge=judge,
                     config=config,
                     device=device,
-                    max_samples=max_samples,
+                    max_samples=image_max_samples,
                     mode=eval_mode,
                     distributed=distributed,
                 )
 
+                # 评估无图样本并合并
+                if has_no_image_samples and no_image_max_samples > 0:
+                    if logger:
+                        logger.info("Evaluating no-image samples...")
+                    no_image_result = evaluate_no_image_samples(
+                        model=model,
+                        processor=processor,
+                        no_image_samples=no_image_samples,
+                        judge=judge,
+                        device=device,
+                        max_samples=no_image_max_samples,
+                        distributed=distributed,
+                    )
+                    eval_result = merge_eval_results(eval_result, no_image_result)
+
                 if is_main_process():
                     print(f"\n[{eval_mode.upper()}]")
                     print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result['correct']}/{eval_result['total']})")
+                    if has_no_image_samples and 'image_accuracy' in eval_result:
+                        print(f"    - with image: {eval_result['image_accuracy']:.2%} ({eval_result['image_correct']}/{eval_result['image_total']})")
+                        print(f"    - no image:   {eval_result['no_image_accuracy']:.2%} ({eval_result['no_image_correct']}/{eval_result['no_image_total']})")
 
                     # 显示相对准确率（仅当 origin 也被评估时）
                     if origin_result is not None and origin_result['accuracy'] > 0:
