@@ -23,9 +23,31 @@ judge: 支持以下预测格式之一：
 内部统一对齐到索引比较。
 """
 from typing import Dict, Any, List, Union
+from io import BytesIO
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 from PIL import Image  # type: ignore
+
+
+def _ensure_pil_image(img: Any) -> Image.Image | None:
+    """确保图像是 PIL Image 格式
+
+    处理 HuggingFace datasets 可能返回的多种格式：
+    - PIL.Image: 直接返回
+    - dict with 'bytes': 从 bytes 解码
+    - dict with 'path': 从路径加载
+    - None: 返回 None
+    """
+    if img is None:
+        return None
+    if isinstance(img, Image.Image):
+        return img
+    if isinstance(img, dict):
+        if 'bytes' in img and img['bytes'] is not None:
+            return Image.open(BytesIO(img['bytes']))
+        if 'path' in img and img['path'] is not None:
+            return Image.open(img['path'])
+    return None
 
 
 class ScienceQADataset(BsesDataset):
@@ -49,7 +71,9 @@ class ScienceQADataset(BsesDataset):
         if isinstance(sample.get('image'), tuple) and self._hf_datasets:
             split_name, hf_idx = sample['image']
             if split_name in self._hf_datasets:
-                sample['image'] = self._hf_datasets[split_name][hf_idx]['image']
+                raw_img = self._hf_datasets[split_name][hf_idx]['image']
+                # 确保转换为 PIL Image（处理 dict 格式）
+                sample['image'] = _ensure_pil_image(raw_img)
 
         return sample
 
@@ -71,10 +95,24 @@ class ScienceQAPreparer(BasePreparer):
         self._hf_datasets[split] = ds  # 保存引用
         out: List[Dict[str, Any]] = []
         no_image_samples: List[Dict[str, Any]] = []
+
+        # 调试：统计图像类型
+        image_type_stats: Dict[str, int] = {}
+        sample_by_type: Dict[str, Any] = {}
+
         for i in range(len(ds)):
             item = ds[i]
             img = item['image']
-            has_image = isinstance(img, Image.Image)
+
+            # 记录图像类型
+            img_type = type(img).__name__
+            image_type_stats[img_type] = image_type_stats.get(img_type, 0) + 1
+            if img_type not in sample_by_type and img is not None:
+                sample_by_type[img_type] = (i, img)
+
+            # 检查是否有有效图像（支持 PIL Image 和 dict 格式）
+            pil_img = _ensure_pil_image(img)
+            has_image = pil_img is not None
             question = item['question']
             choices = item['choices']
             ans_index = item['answer']  # 保留 0-based
@@ -115,8 +153,9 @@ class ScienceQAPreparer(BasePreparer):
                 'question': full_q,
                 'raw_question': question,
                 'choices': choices,
-                'answer': ans_index,          # 0-based
-                'answer_letter': letter,      # 冗余字母
+                'answer': letter,             # 字母形式 (A/B/C/D)，供训练 loss 使用
+                'answer_index': ans_index,    # 0-based 索引，供评估 judge 使用
+                'answer_letter': letter,      # 冗余字母（兼容）
                 'category': task,
                 'task': task,
                 'hint': item['hint'],
@@ -128,9 +167,14 @@ class ScienceQAPreparer(BasePreparer):
                 out.append(sample)
             else:
                 no_image_samples.append(sample)
+
         logger = getattr(self.config, 'logger', None)
         if logger is not None:
             logger.info(f"[ScienceQA] Split '{split}': {len(no_image_samples)} samples with no/invalid image; {len(out)} with image.")
+            # 输出图像类型统计，帮助诊断 HuggingFace datasets 解码问题
+            if image_type_stats:
+                type_info = ", ".join(f"{k}: {v}" for k, v in sorted(image_type_stats.items()))
+                logger.info(f"[ScienceQA] Split '{split}' image type distribution: {type_info}")
         return out, no_image_samples
 
     def _load_presplits(self) -> tuple:
@@ -254,8 +298,20 @@ class ScienceQAPreparer(BasePreparer):
 
             return -999
         def _judge(pred, ref, sample=None, split_name: str = 'val'):
+            def _get_ref_index(r_raw) -> int:
+                """将 reference 转换为 0-based 索引"""
+                if isinstance(r_raw, int):
+                    return r_raw
+                r_str = str(r_raw).strip().upper()
+                # 处理字母形式 A/B/C/D
+                if len(r_str) == 1 and r_str in 'ABCD':
+                    return ord(r_str) - ord('A')
+                # 尝试数字
+                if r_str.isdigit():
+                    return int(r_str)
+                return -999
             def _single(p_raw, r_raw, smp):
-                ref_index = r_raw if isinstance(r_raw, int) else int(r_raw)
+                ref_index = _get_ref_index(r_raw)
                 pred_index = _parse(p_raw, smp)
                 # print(f"[ScienceQA Judge] pred_raw: {p_raw} -> pred_index: {pred_index}; ref_index: {ref_index}")
                 return 1 if pred_index == ref_index else 0
