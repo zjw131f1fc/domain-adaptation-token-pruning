@@ -428,7 +428,8 @@ def train_step(
     model.set_temperature(current_temp)
 
     # === 预处理 ===
-    prep = preprocess_batch(batch, processor, device)
+    max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
+    prep = preprocess_batch(batch, processor, device, max_length=max_length)
     inputs = prep['inputs']
 
     # === Forward ===
@@ -608,6 +609,9 @@ def evaluate(
     inference_mode = method_cfg.get('pruner_inference_mode', 'threshold')
     model.pruner_manager.set_inference_mode(inference_mode)
 
+    # 获取 max_length 配置
+    max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
+
     if inference_mode == 'topk':
         topk_ks_raw = method_cfg.get('pruner_topk_ks', {})
         topk_ks = {int(k): int(v) for k, v in topk_ks_raw.items()} if topk_ks_raw else {}
@@ -655,6 +659,7 @@ def evaluate(
                 batch=[sample],
                 processor=processor,
                 device=device,
+                max_length=max_length,
                 mode="inference"
             )
             inputs = preprocessed['inputs']
@@ -690,7 +695,7 @@ def evaluate(
                 images=sample['image'],
                 return_tensors="pt",
                 truncation=True,
-                max_length=2048,
+                max_length=max_length,
             ).to(device)
 
             output_ids = model.generate(
