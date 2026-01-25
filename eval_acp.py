@@ -78,9 +78,9 @@ def main():
                         help='Path to config file')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file')
-    parser.add_argument('--mode', type=str, nargs='+', default=['hard'],
+    parser.add_argument('--mode', type=str, nargs='+', default=None,
                         choices=['origin', 'hard'],
-                        help='Evaluation mode(s): origin (no pruning), hard (with pruning)')
+                        help='Evaluation mode(s): origin (no pruning), hard (with pruning). If not specified, uses config evaluation_settings.eval_mode')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Maximum number of samples to evaluate (default: use config value)')
     parser.add_argument('--split', type=str, default='test',
@@ -96,6 +96,16 @@ def main():
     # 加载配置
     config = load_config(override_file=args.config)
     logger = config.logger
+
+    # 确定评估模式：命令行 > 配置文件 > 默认值
+    if args.mode is not None:
+        eval_modes = args.mode
+    else:
+        eval_cfg = getattr(config, 'evaluation_settings', {}) or {}
+        eval_modes = eval_cfg.get('eval_mode', ['hard'])
+        if isinstance(eval_modes, str):
+            eval_modes = [eval_modes]
+    logger.info(f"Evaluation modes: {eval_modes}")
 
     # 获取剪枝层配置
     method_cfg = config.method_settings
@@ -145,7 +155,7 @@ def main():
     print("Evaluation Results")
     print("=" * 60)
 
-    for eval_mode in args.mode:
+    for eval_mode in eval_modes:
         logger.info(f"\nEvaluating in '{eval_mode}' mode...")
 
         eval_result = evaluate(
