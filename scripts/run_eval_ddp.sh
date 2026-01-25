@@ -2,7 +2,7 @@
 # DDP 分布式评估启动脚本
 #
 # 使用方法:
-#   ./scripts/run_eval_ddp.sh [GPU列表] [其他参数...]
+#   ./scripts/run_eval_ddp.sh [GPU列表] [--checkpoint <path>]
 #
 # 示例:
 #   # 使用配置文件中的 checkpoint
@@ -11,14 +11,12 @@
 #
 #   # 命令行指定 checkpoint（覆盖配置）
 #   ./scripts/run_eval_ddp.sh 4,5,6,7 --checkpoint outputs/checkpoints/checkpoint_final.pt
-#   ./scripts/run_eval_ddp.sh 0,1 --checkpoint outputs/checkpoints/checkpoint_final.pt --mode origin hard
-#   ./scripts/run_eval_ddp.sh 2,3 --max_samples 5000
 #
-# 网格搜索：在配置文件中设置 evaluation_settings.grid_search.enable: true
-#
-# 单卡评估（不使用 torchrun）:
-#   python eval_acp_ddp.py
-#   python eval_acp_ddp.py --checkpoint outputs/checkpoints/checkpoint_final.pt
+# 配置说明：
+#   - eval_mode: 在配置文件 evaluation_settings.eval_mode 中设置
+#   - max_samples: 在配置文件 trainer_settings.dl_settings.eval_max_samples 中设置
+#   - 阈值: 在配置文件 method_settings.pruner_thresholds 中设置
+#   - 网格搜索: 在配置文件 evaluation_settings.grid_search.enable 中设置
 
 set -e
 
