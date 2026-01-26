@@ -646,15 +646,17 @@ def evaluate(
     show_progress = is_main_process()
 
     # 中间统计日志间隔（按全局步数计算）
-    # 聚合评估模式下跳过中间统计（无法增量计算）
+    # 确保 local_log_interval 不超过每卡实际处理的样本数，否则日志永不触发
     log_interval = 500
+    local_samples = len(local_indices)
     if distributed and dist.is_initialized():
         world_size = dist.get_world_size()
         # 每个 rank 处理 local_log_interval 个样本时，全局约处理 log_interval 个
-        local_log_interval = max(1, log_interval // world_size)
+        # 同时确保至少打印 4 次中间日志（如果样本数足够）
+        local_log_interval = max(1, min(log_interval // world_size, local_samples // 4))
     else:
         world_size = 1
-        local_log_interval = log_interval
+        local_log_interval = max(1, min(log_interval, local_samples // 4))
 
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
