@@ -15,119 +15,13 @@
   - 大幅提升加载速度，减少内存占用
 
 评估方式:
-  - 使用 Simple Accuracy（与 LAVIS/BLIP 评估方式一致）
-  - 预处理：数字词转数字、移除冠词、处理缩写
-  - 精确匹配：pred == gt_answer
-  - 参考：https://github.com/salesforce/LAVIS/blob/main/lavis/tasks/vqa.py
+  - 使用 Balanced Accuracy（按答案类别均衡计算）
+  - 必须使用 aggregate_judge 进行聚合评估，不支持逐条评估
 """
 
-import re
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
-
-
-class VQAEval:
-    """VQA 评估预处理工具
-
-    参考 LAVIS 实现：https://github.com/salesforce/LAVIS/blob/main/lavis/tasks/vqa.py
-    """
-
-    def __init__(self):
-        self.contractions = {
-            "aint": "ain't", "arent": "aren't", "cant": "can't",
-            "couldve": "could've", "couldnt": "couldn't",
-            "couldn'tve": "couldn't've", "couldnt've": "couldn't've",
-            "didnt": "didn't", "doesnt": "doesn't", "dont": "don't",
-            "hadnt": "hadn't", "hadnt've": "hadn't've", "hadn'tve": "hadn't've",
-            "hasnt": "hasn't", "havent": "haven't", "hed": "he'd",
-            "hed've": "he'd've", "he'dve": "he'd've", "hes": "he's",
-            "howd": "how'd", "howll": "how'll", "hows": "how's",
-            "Id've": "I'd've", "I'dve": "I'd've", "Im": "I'm", "Ive": "I've",
-            "isnt": "isn't", "itd": "it'd", "itd've": "it'd've",
-            "it'dve": "it'd've", "itll": "it'll", "let's": "let's",
-            "maam": "ma'am", "mightnt": "mightn't", "mightnt've": "mightn't've",
-            "mightn'tve": "mightn't've", "mightve": "might've",
-            "mustnt": "mustn't", "mustve": "must've", "neednt": "needn't",
-            "notve": "not've", "oclock": "o'clock", "oughtnt": "oughtn't",
-            "ow's'at": "'ow's'at", "'ows'at": "'ow's'at", "'ow'sat": "'ow's'at",
-            "shant": "shan't", "shed've": "she'd've", "she'dve": "she'd've",
-            "she's": "she's", "shouldve": "should've", "shouldnt": "shouldn't",
-            "shouldnt've": "shouldn't've", "shouldn'tve": "shouldn't've",
-            "somebody'd": "somebodyd", "somebodyd've": "somebody'd've",
-            "somebody'dve": "somebody'd've", "somebodyll": "somebody'll",
-            "somebodys": "somebody's", "someoned": "someone'd",
-            "someoned've": "someone'd've", "someone'dve": "someone'd've",
-            "someonell": "someone'll", "someones": "someone's",
-            "somethingd": "something'd", "somethingd've": "something'd've",
-            "something'dve": "something'd've", "somethingll": "something'll",
-            "thats": "that's", "thered": "there'd", "thered've": "there'd've",
-            "there'dve": "there'd've", "therere": "there're", "theres": "there's",
-            "theyd": "they'd", "theyd've": "they'd've", "they'dve": "they'd've",
-            "theyll": "they'll", "theyre": "they're", "theyve": "they've",
-            "twas": "'twas", "wasnt": "wasn't", "wed've": "we'd've",
-            "we'dve": "we'd've", "weve": "we've", "werent": "weren't",
-            "whatll": "what'll", "whatre": "what're", "whats": "what's",
-            "whatve": "what've", "whens": "when's", "whered": "where'd",
-            "wheres": "where's", "whereve": "where've", "whod": "who'd",
-            "whod've": "who'd've", "who'dve": "who'd've", "wholl": "who'll",
-            "whos": "who's", "whove": "who've", "whyll": "why'll",
-            "whyre": "why're", "whys": "why's", "wont": "won't",
-            "wouldve": "would've", "wouldnt": "wouldn't",
-            "wouldnt've": "wouldn't've", "wouldn'tve": "wouldn't've",
-            "yall": "y'all", "yall'll": "y'all'll", "y'allll": "y'all'll",
-            "yall'd've": "y'all'd've", "y'alld've": "y'all'd've",
-            "y'all'dve": "y'all'd've", "youd": "you'd", "youd've": "you'd've",
-            "you'dve": "you'd've", "youll": "you'll", "youre": "you're",
-            "youve": "you've",
-        }
-        self.manualMap = {
-            "none": "0", "zero": "0", "one": "1", "two": "2", "three": "3",
-            "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
-            "nine": "9", "ten": "10",
-        }
-        self.articles = ["a", "an", "the"]
-        self.periodStrip = re.compile(r"(?!<=\d)(\.)(?!\d)")
-        self.commaStrip = re.compile(r"(\d)(,)(\d)")
-        self.punct = [
-            ";", r"/", "[", "]", '"', "{", "}", "(", ")", "=", "+", "\\",
-            "_", "-", ">", "<", "@", "`", ",", "?", "!",
-        ]
-
-    def processPunctuation(self, inText: str) -> str:
-        """处理标点符号"""
-        outText = inText
-        for p in self.punct:
-            if (p + " " in inText or " " + p in inText) or (
-                re.search(self.commaStrip, inText) is not None
-            ):
-                outText = outText.replace(p, "")
-            else:
-                outText = outText.replace(p, " ")
-        outText = self.periodStrip.sub("", outText)
-        return outText
-
-    def processDigitArticle(self, inText: str) -> str:
-        """处理数字词和冠词"""
-        outText = []
-        tempText = inText.lower().split()
-        for word in tempText:
-            word = self.manualMap.get(word, word)
-            if word not in self.articles:
-                outText.append(word)
-        for wordId, word in enumerate(outText):
-            if word in self.contractions:
-                outText[wordId] = self.contractions[word]
-        return " ".join(outText)
-
-    def process(self, text: str) -> str:
-        """完整预处理流程"""
-        if text is None:
-            return ""
-        text = str(text).strip()
-        text = self.processPunctuation(text)
-        text = self.processDigitArticle(text)
-        return text
 
 
 class GQADataset(BsesDataset):
@@ -234,14 +128,20 @@ class GQAPreparer(BasePreparer):
             splits[name] = GQADataset(ds.samples, self._hf_datasets)
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
 
+        # 标记需要聚合评估
+        meta['requires_aggregate_eval'] = True
+
         judge = self._build_judge()
+        aggregate_judge = self._build_aggregate_judge()
 
         bundle = {
             'splits': splits,
             'meta': meta,
             'judge': judge,
+            'aggregate_judge': aggregate_judge
         }
-        self.print_report(bundle)
+        if True:
+            self.print_report(bundle)
         return bundle
 
     def print_report(self, prepared: Dict[str, Any]):
@@ -249,57 +149,113 @@ class GQAPreparer(BasePreparer):
         logger = getattr(self.config, 'logger', None)
         if logger is None:
             return
-
+        
         self.base_report(meta)
         logger.info('[GQA] Presplit: True (train使用train_balanced，test使用val_balanced)')
         logger.info(f"[GQA] Loaded Samples: {meta['total']}")
-
+        
         # 统计每个 split 的样本数量
         for name, ds in meta['split_sizes'].items():
             logger.info(f"[GQA] Split '{name}': {ds} samples")
 
     def _build_judge(self):
-        """构建 judge 函数 - 使用 VQA 标准评估方式
+        """构建 judge 函数 - GQA 不支持逐条评估，调用时报错"""
 
-        参考 LAVIS 实现：
-        1. 预处理：标点、数字词转换、移除冠词
-        2. 精确匹配：processed_pred == processed_answer
-        """
-        vqa_eval = VQAEval()
-
-        def _judge(pred: str, ref: str, sample=None, split_name: str = 'test') -> Dict[str, Any]:
-            """单样本评估"""
-            # 预处理预测和参考答案
-            pred_processed = vqa_eval.process(pred)
-            ref_processed = vqa_eval.process(ref)
-
-            # 精确匹配
-            is_correct = pred_processed == ref_processed
-
-            return {
-                'correct': 1 if is_correct else 0,
-                'total': 1,
-                'accuracy': 1.0 if is_correct else 0.0,
-            }
-
-        # 添加批量评估方法
-        def judge_batch(predictions: List[str], references: List[str]) -> Dict[str, Any]:
-            """批量评估"""
-            total_correct = 0
-            for pred, ref in zip(predictions, references):
-                pred_processed = vqa_eval.process(pred)
-                ref_processed = vqa_eval.process(ref)
-                if pred_processed == ref_processed:
-                    total_correct += 1
-
-            accuracy = total_correct / len(predictions) if predictions else 0.0
-            return {
-                'correct': total_correct,
-                'total': len(predictions),
-                'accuracy': accuracy,
-            }
-
-        # 将批量方法绑定到 judge 函数
-        _judge.batch = judge_batch
+        def _judge(pred, ref, sample=None, split_name: str = 'test'):
+            raise NotImplementedError(
+                "GQA 数据集需要使用聚合评估（aggregate_judge），不支持逐条评估。"
+                "请在所有样本预测完成后调用 aggregate_judge(predictions, references, samples)。"
+            )
 
         return _judge
+
+    def _build_aggregate_judge(self):
+        """构建 GQA 聚合评估函数 - 计算 Balanced Accuracy
+
+        Balanced Accuracy 计算方式：
+        1. 按答案值（answer）分组
+        2. 对每个答案类别计算准确率：correct / total
+        3. 对所有类别的准确率取平均
+
+        这样可以避免高频答案（yes/no、常见颜色等）主导评估结果。
+        """
+
+        def _normalize(s: Any) -> str:
+            if s is None:
+                return ''
+            text = str(s).strip().lower()
+            punct_table = str.maketrans({c: ' ' for c in "!?,.:;\"'`~()[]{}<>"})
+            text = text.translate(punct_table)
+            parts = [p for p in text.split() if p]
+            return ' '.join(parts)
+
+        def _is_match(pred_norm: str, ref_norm: str) -> bool:
+            """词级精确匹配：ref 作为完整词出现在 pred 中"""
+            if not ref_norm:
+                return False
+            pred_words = set(pred_norm.split())
+            ref_words = ref_norm.split()
+            # 单词答案：检查是否在 pred 词集合中
+            if len(ref_words) == 1:
+                return ref_words[0] in pred_words
+            # 多词答案：检查是否作为连续子序列出现
+            return ref_norm in pred_norm
+
+        def _aggregate_judge(
+            predictions: List[str],
+            references: List[str],
+            samples: List[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+            """
+            聚合评估函数
+
+            Args:
+                predictions: 所有预测结果
+                references: 所有参考答案
+                samples: 所有原始样本
+
+            Returns:
+                包含 balanced_accuracy 等指标的字典
+            """
+            if len(predictions) != len(references):
+                raise ValueError(f"predictions ({len(predictions)}) 和 references ({len(references)}) 长度不一致")
+
+            # 按答案值分组统计
+            answer_groups: Dict[str, Dict[str, int]] = {}  # {answer: {'correct': n, 'total': n}}
+
+            total_correct = 0
+            for pred, ref in zip(predictions, references):
+                ref_norm = _normalize(ref)
+                pred_norm = _normalize(pred)
+
+                if ref_norm not in answer_groups:
+                    answer_groups[ref_norm] = {'correct': 0, 'total': 0}
+
+                answer_groups[ref_norm]['total'] += 1
+
+                if _is_match(pred_norm, ref_norm):
+                    answer_groups[ref_norm]['correct'] += 1
+                    total_correct += 1
+
+            # 计算每个答案类别的准确率
+            category_accs = []
+            for answer_val, stats in answer_groups.items():
+                if stats['total'] > 0:
+                    acc = stats['correct'] / stats['total']
+                    category_accs.append(acc)
+
+            # Balanced Accuracy = 所有类别准确率的平均
+            balanced_accuracy = sum(category_accs) / len(category_accs) if category_accs else 0.0
+
+            # 普通准确率（作为参考）
+            simple_accuracy = total_correct / len(predictions) if predictions else 0.0
+
+            return {
+                'balanced_accuracy': balanced_accuracy,
+                'simple_accuracy': simple_accuracy,
+                'num_answer_categories': len(answer_groups),
+                'total_samples': len(predictions),
+                'total_correct': total_correct,
+            }
+
+        return _aggregate_judge
