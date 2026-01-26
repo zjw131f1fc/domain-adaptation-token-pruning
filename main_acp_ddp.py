@@ -724,9 +724,13 @@ def evaluate(
         else:
             references.append(sample['answer'])
 
-        # 聚合评估需要保留样本信息
+        # 聚合评估需要保留样本信息（只保留必要字段，不保留图像以避免显存累积）
         if requires_aggregate_eval:
-            samples_for_aggregate.append(sample)
+            sample_info = {
+                'answer': sample.get('answer'),
+                'category': sample.get('category'),  # MME 需要
+            }
+            samples_for_aggregate.append(sample_info)
 
         # 每 local_log_interval 步打印中间统计
         if step_idx % local_log_interval == 0:
