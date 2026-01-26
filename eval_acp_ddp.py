@@ -126,6 +126,8 @@ def run_grid_search(
     threshold_values: List[float],
     distributed: bool,
     origin_result: Optional[Dict[str, Any]] = None,
+    aggregate_judge=None,
+    requires_aggregate_eval: bool = False,
 ) -> List[Dict[str, Any]]:
     """执行网格搜索（笛卡尔积，每层阈值可不同，随机顺序）"""
     results = []
@@ -163,14 +165,16 @@ def run_grid_search(
             max_samples=max_samples,
             mode='hard',
             distributed=distributed,
+            aggregate_judge=aggregate_judge,
+            requires_aggregate_eval=requires_aggregate_eval,
         )
 
         result_entry = {
             'thresholds': thresholds.copy(),
             'accuracy': eval_result['accuracy'],
             'avg_kept_ratio': eval_result.get('avg_kept_ratio', 0),
-            'correct': eval_result['correct'],
-            'total': eval_result['total'],
+            'correct': eval_result.get('correct', 0),
+            'total': eval_result.get('total', 0),
         }
         results.append(result_entry)
 
@@ -459,8 +463,12 @@ def main():
         eval_dataset = data_bundle['splits'][eval_split]
         judge = data_bundle['judge']
 
-        # 检查是否有无图样本
+        # 提取聚合评估相关信息
         meta = data_bundle.get('meta', {})
+        aggregate_judge = data_bundle.get('aggregate_judge')
+        requires_aggregate_eval = meta.get('requires_aggregate_eval', False)
+
+        # 检查是否有无图样本
         no_image_samples_dict = meta.get('no_image_samples', {})
         no_image_samples = no_image_samples_dict.get(eval_split, [])
         has_no_image_samples = len(no_image_samples) > 0
@@ -470,6 +478,8 @@ def main():
             logger.info(f"Split: {eval_split}, samples with image: {len(eval_dataset)}")
             if has_no_image_samples:
                 logger.info(f"Split: {eval_split}, samples without image: {len(no_image_samples)}")
+            if requires_aggregate_eval:
+                logger.info("Aggregate evaluation mode enabled (MME/GQA style)")
 
         # 确定样本数（从配置文件读取）
         max_samples = config.trainer_settings.get('dl_settings', {}).get('eval_max_samples', 500)
@@ -508,10 +518,12 @@ def main():
                 max_samples=max_samples,
                 mode='origin',
                 distributed=distributed,
+                aggregate_judge=aggregate_judge,
+                requires_aggregate_eval=requires_aggregate_eval,
             )
 
             if is_main_process():
-                print(f"Origin Accuracy: {origin_result['accuracy']:.2%} ({origin_result['correct']}/{origin_result['total']})")
+                print(f"Origin Accuracy: {origin_result['accuracy']:.2%} ({origin_result.get('correct', 'N/A')}/{origin_result.get('total', 'N/A')})")
                 print("=" * 60)
 
             # 执行网格搜索
@@ -527,6 +539,8 @@ def main():
                 threshold_values=threshold_values,
                 distributed=distributed,
                 origin_result=origin_result,
+                aggregate_judge=aggregate_judge,
+                requires_aggregate_eval=requires_aggregate_eval,
             )
 
             if is_main_process():
@@ -571,10 +585,12 @@ def main():
                     max_samples=image_max_samples,
                     mode='origin',
                     distributed=distributed,
+                    aggregate_judge=aggregate_judge,
+                    requires_aggregate_eval=requires_aggregate_eval,
                 )
 
-                # 评估无图样本并合并
-                if has_no_image_samples and no_image_max_samples > 0:
+                # 评估无图样本并合并（仅非聚合评估模式）
+                if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
                     if logger:
                         logger.info("Evaluating no-image samples...")
                     no_image_result = evaluate_no_image_samples(
@@ -591,10 +607,23 @@ def main():
 
                 if is_main_process():
                     print(f"\n[ORIGIN]")
-                    print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result['correct']}/{origin_result['total']})")
-                    if has_no_image_samples and 'image_accuracy' in origin_result:
-                        print(f"    - with image: {origin_result['image_accuracy']:.2%} ({origin_result['image_correct']}/{origin_result['image_total']})")
-                        print(f"    - no image:   {origin_result['no_image_accuracy']:.2%} ({origin_result['no_image_correct']}/{origin_result['no_image_total']})")
+                    # 根据数据集类型打印不同指标
+                    if 'total_score' in origin_result:
+                        # MME
+                        print(f"  MME Total Score: {origin_result['total_score']:.1f}")
+                        print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
+                        print(f"  Categories: {origin_result.get('num_categories', 0)}")
+                    elif 'balanced_accuracy' in origin_result:
+                        # GQA
+                        print(f"  Balanced Accuracy: {origin_result['balanced_accuracy']:.2%}")
+                        print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
+                        print(f"  Answer Categories: {origin_result.get('num_answer_categories', 0)}")
+                    else:
+                        # 普通数据集
+                        print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result.get('correct', 'N/A')}/{origin_result.get('total', 'N/A')})")
+                        if has_no_image_samples and 'image_accuracy' in origin_result:
+                            print(f"    - with image: {origin_result['image_accuracy']:.2%} ({origin_result['image_correct']}/{origin_result['image_total']})")
+                            print(f"    - no image:   {origin_result['no_image_accuracy']:.2%} ({origin_result['no_image_correct']}/{origin_result['no_image_total']})")
 
             # 评估其他模式（跳过已评估的 origin）
             for eval_mode in eval_modes:
@@ -615,10 +644,12 @@ def main():
                     max_samples=image_max_samples,
                     mode=eval_mode,
                     distributed=distributed,
+                    aggregate_judge=aggregate_judge,
+                    requires_aggregate_eval=requires_aggregate_eval,
                 )
 
-                # 评估无图样本并合并
-                if has_no_image_samples and no_image_max_samples > 0:
+                # 评估无图样本并合并（仅非聚合评估模式）
+                if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
                     if logger:
                         logger.info("Evaluating no-image samples...")
                     no_image_result = evaluate_no_image_samples(
@@ -635,10 +666,23 @@ def main():
 
                 if is_main_process():
                     print(f"\n[{eval_mode.upper()}]")
-                    print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result['correct']}/{eval_result['total']})")
-                    if has_no_image_samples and 'image_accuracy' in eval_result:
-                        print(f"    - with image: {eval_result['image_accuracy']:.2%} ({eval_result['image_correct']}/{eval_result['image_total']})")
-                        print(f"    - no image:   {eval_result['no_image_accuracy']:.2%} ({eval_result['no_image_correct']}/{eval_result['no_image_total']})")
+                    # 根据数据集类型打印不同指标
+                    if 'total_score' in eval_result:
+                        # MME
+                        print(f"  MME Total Score: {eval_result['total_score']:.1f}")
+                        print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
+                        print(f"  Categories: {eval_result.get('num_categories', 0)}")
+                    elif 'balanced_accuracy' in eval_result:
+                        # GQA
+                        print(f"  Balanced Accuracy: {eval_result['balanced_accuracy']:.2%}")
+                        print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
+                        print(f"  Answer Categories: {eval_result.get('num_answer_categories', 0)}")
+                    else:
+                        # 普通数据集
+                        print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result.get('correct', 'N/A')}/{eval_result.get('total', 'N/A')})")
+                        if has_no_image_samples and 'image_accuracy' in eval_result:
+                            print(f"    - with image: {eval_result['image_accuracy']:.2%} ({eval_result['image_correct']}/{eval_result['image_total']})")
+                            print(f"    - no image:   {eval_result['no_image_accuracy']:.2%} ({eval_result['no_image_correct']}/{eval_result['no_image_total']})")
 
                     # 显示相对准确率（仅当 origin 也被评估时）
                     if origin_result is not None and origin_result['accuracy'] > 0:

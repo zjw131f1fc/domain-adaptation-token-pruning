@@ -1,4 +1,4 @@
-"""MME 数据集准备器 (进一步精简)
+"""MME 数据集准备器
 
 目标: 子类只做最少工作:
   - 标记: 有类别 (has_category = True)
@@ -18,6 +18,12 @@
 性能优化:
   - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
   - 大幅提升加载速度，减少内存占用
+
+评估方式:
+  - 使用 MME 官方评分公式：min(Acc_p, Acc_n) × 100
+  - 每个子任务（category）分别计算 Positive (Yes) 和 Negative (No) 准确率
+  - 取两者最小值作为子任务得分，防止模型投机
+  - 必须使用 aggregate_judge 进行聚合评估，不支持逐条评估
 """
 
 from typing import List, Dict, Any, Union
@@ -86,9 +92,19 @@ class MMEPreparer(BasePreparer):
             splits[name] = MMEDataset(ds.samples, self._hf_dataset)
         # 构建 meta
         meta = self.build_meta(samples, splits, applied_map, placeholder)
-        # judge
-        judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta)
-        bundle = {"splits": splits, "meta": meta, "judge": judge}
+
+        # 标记需要聚合评估
+        meta['requires_aggregate_eval'] = True
+
+        judge = self._build_judge()
+        aggregate_judge = self._build_aggregate_judge()
+
+        bundle = {
+            "splits": splits,
+            "meta": meta,
+            "judge": judge,
+            "aggregate_judge": aggregate_judge
+        }
         self.print_report(bundle)
         return bundle
 
@@ -121,9 +137,29 @@ class MMEPreparer(BasePreparer):
                 logger.info(f"[MME] Split '{name}' Categories: " + ", ".join(f"{c}:{n}" for c, n in sorted(cat_stat.items(), key=lambda x: (-x[1], str(x[0])))))
 
     # ----- judge 构建 -----
-    def _build_judge(self, meta: Dict[str, Any], splits: Dict[str, BsesDataset]):
-        # 宽松评估：大小写忽略 + 去标点 + 多候选答案拆分 + 编辑距离相似度 + Jaccard 词集合相似度 + 子串匹配
-        # 支持可选阈值: dataset_settings['lenient_edit_sim'], ['lenient_jaccard']
+    def _build_judge(self):
+        """构建 judge 函数 - MME 不支持逐条评估，调用时报错"""
+
+        def _judge(pred, ref, sample=None, split_name: str = 'test'):
+            raise NotImplementedError(
+                "MME 数据集需要使用聚合评估（aggregate_judge），不支持逐条评估。"
+                "请在所有样本预测完成后调用 aggregate_judge(predictions, references, samples)。"
+            )
+
+        return _judge
+
+    def _build_aggregate_judge(self):
+        """构建 MME 聚合评估函数 - 使用官方评分公式
+
+        MME 评分公式：
+        1. 按 category（子任务）分组
+        2. 每个 category 内按 answer 分为 Positive (Yes) 和 Negative (No)
+        3. 计算 Acc_p（Positive 准确率）和 Acc_n（Negative 准确率）
+        4. 子任务得分 = min(Acc_p, Acc_n) × 100
+        5. 总分 = 所有子任务得分之和
+
+        这种设计强制模型必须同时做好正负两类，防止投机取巧。
+        """
 
         def _normalize(s: Any) -> str:
             if s is None:
@@ -133,25 +169,102 @@ class MMEPreparer(BasePreparer):
             text = text.translate(punct_table)
             parts = [p for p in text.split() if p]
             return ' '.join(parts)
-        def _judge(pred, ref, sample=None, split_name: str = 'test'):
-            # 批量: ref_norm 必须是 p_norm 的子串
-            if isinstance(pred, list):
-                if not isinstance(ref, list):
-                    raise TypeError("批量判定时 ref 也应为列表")
-                total = len(pred)
-                if len(ref) != total:
-                    raise ValueError("pred/ref 长度不一致")
-                correct = 0
-                for p_raw, r_raw in zip(pred, ref):
-                    p_norm = _normalize(p_raw)
-                    r_norm = _normalize(r_raw)
-                    if r_norm and r_norm in p_norm:
-                        correct += 1
-                return {"correct": correct, "total": total, "accuracy": (correct / total) if total > 0 else 0.0}
-            # 单条: 只允许答案在模型输出中出现
-            p_norm = _normalize(pred)
-            r_norm = _normalize(ref)
-            is_correct = 1 if (r_norm and r_norm in p_norm) else 0
-            return {"correct": is_correct, "total": 1, "accuracy": float(is_correct)}
-        return _judge
+
+        def _is_match(pred_norm: str, ref_norm: str) -> bool:
+            """检查预测是否正确：ref 作为完整词出现在 pred 中"""
+            if not ref_norm:
+                return False
+            pred_words = set(pred_norm.split())
+            return ref_norm in pred_words
+
+        def _aggregate_judge(
+            predictions: List[str],
+            references: List[str],
+            samples: List[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+            """
+            MME 聚合评估函数
+
+            Args:
+                predictions: 所有预测结果
+                references: 所有参考答案
+                samples: 所有原始样本（必须包含 category 和 answer 字段）
+
+            Returns:
+                包含 total_score、per_category 等指标的字典
+            """
+            if len(predictions) != len(references) or len(predictions) != len(samples):
+                raise ValueError(
+                    f"长度不一致: predictions={len(predictions)}, "
+                    f"references={len(references)}, samples={len(samples)}"
+                )
+
+            # 按 category 分组，统计 Positive/Negative 的正确数和总数
+            # category_stats[cat] = {'pos_correct': n, 'pos_total': n, 'neg_correct': n, 'neg_total': n}
+            category_stats: Dict[str, Dict[str, int]] = {}
+
+            total_correct = 0
+            for pred, ref, sample in zip(predictions, references, samples):
+                category = sample.get('category', 'unknown')
+                ref_norm = _normalize(ref)
+                pred_norm = _normalize(pred)
+
+                if category not in category_stats:
+                    category_stats[category] = {
+                        'pos_correct': 0, 'pos_total': 0,
+                        'neg_correct': 0, 'neg_total': 0
+                    }
+
+                # 判断是 Positive (Yes) 还是 Negative (No)
+                is_positive = ref_norm == 'yes'
+                is_correct = _is_match(pred_norm, ref_norm)
+
+                if is_positive:
+                    category_stats[category]['pos_total'] += 1
+                    if is_correct:
+                        category_stats[category]['pos_correct'] += 1
+                        total_correct += 1
+                else:
+                    category_stats[category]['neg_total'] += 1
+                    if is_correct:
+                        category_stats[category]['neg_correct'] += 1
+                        total_correct += 1
+
+            # 计算每个 category 的得分
+            per_category: Dict[str, Dict[str, Any]] = {}
+            total_score = 0.0
+
+            for category, stats in category_stats.items():
+                # 计算 Acc_p 和 Acc_n
+                acc_p = stats['pos_correct'] / stats['pos_total'] if stats['pos_total'] > 0 else 0.0
+                acc_n = stats['neg_correct'] / stats['neg_total'] if stats['neg_total'] > 0 else 0.0
+
+                # MME 核心公式：Score = min(Acc_p, Acc_n) × 100
+                score = min(acc_p, acc_n) * 100
+
+                per_category[category] = {
+                    'acc_p': acc_p,
+                    'acc_n': acc_n,
+                    'score': score,
+                    'pos_correct': stats['pos_correct'],
+                    'pos_total': stats['pos_total'],
+                    'neg_correct': stats['neg_correct'],
+                    'neg_total': stats['neg_total'],
+                }
+
+                total_score += score
+
+            # 普通准确率（作为参考）
+            simple_accuracy = total_correct / len(predictions) if predictions else 0.0
+
+            return {
+                'total_score': total_score,
+                'simple_accuracy': simple_accuracy,
+                'num_categories': len(category_stats),
+                'total_samples': len(predictions),
+                'total_correct': total_correct,
+                'per_category': per_category,
+            }
+
+        return _aggregate_judge
 

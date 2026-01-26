@@ -596,11 +596,15 @@ def evaluate(
     max_samples: int = 500,
     mode: str = "origin",
     distributed: bool = False,
+    aggregate_judge=None,
+    requires_aggregate_eval: bool = False,
 ) -> Dict[str, float]:
     """评估模型
 
     Args:
         distributed: 是否使用分布式评估（所有 rank 参与）
+        aggregate_judge: 聚合评估函数（用于 MME/GQA 等需要全量评估的数据集）
+        requires_aggregate_eval: 是否需要聚合评估
     """
     model.eval()
 
@@ -632,6 +636,7 @@ def evaluate(
 
     predictions = []
     references = []
+    samples_for_aggregate = []  # 用于聚合评估
     kept_ratios = []
     layer_kept_ratios = {}
 
@@ -642,6 +647,7 @@ def evaluate(
     show_progress = is_main_process()
 
     # 中间统计日志间隔（按全局步数计算）
+    # 聚合评估模式下跳过中间统计（无法增量计算）
     log_interval = 500
     if distributed and dist.is_initialized():
         world_size = dist.get_world_size()
@@ -718,8 +724,13 @@ def evaluate(
         else:
             references.append(sample['answer'])
 
+        # 聚合评估需要保留样本信息
+        if requires_aggregate_eval:
+            samples_for_aggregate.append(sample)
+
         # 每 local_log_interval 步打印中间统计
-        if step_idx % local_log_interval == 0:
+        # 聚合评估模式下跳过（无法增量计算 balanced_accuracy / MME score）
+        if step_idx % local_log_interval == 0 and not requires_aggregate_eval:
             if distributed and dist.is_initialized():
                 # 分布式模式：收集所有 rank 的数据
                 all_predictions = [None] * world_size
@@ -779,6 +790,11 @@ def evaluate(
         all_layer_kept_ratios = [None] * dist.get_world_size()
         dist.all_gather_object(all_layer_kept_ratios, layer_kept_ratios)
 
+        # 收集 samples_for_aggregate（如果需要聚合评估）
+        if requires_aggregate_eval:
+            all_samples = [None] * dist.get_world_size()
+            dist.all_gather_object(all_samples, samples_for_aggregate)
+
         # 在所有 rank 上合并结果（保证一致性）
         predictions = []
         references = []
@@ -800,14 +816,33 @@ def evaluate(
 
         layer_kept_ratios = merged_layer_kept_ratios
 
-    result = judge(predictions, references)
+        # 合并 samples_for_aggregate
+        if requires_aggregate_eval:
+            samples_for_aggregate = []
+            for samples in all_samples:
+                samples_for_aggregate.extend(samples)
 
+    # 根据是否需要聚合评估调用不同的 judge
+    if requires_aggregate_eval and aggregate_judge is not None:
+        result = aggregate_judge(predictions, references, samples_for_aggregate)
+    else:
+        result = judge(predictions, references)
+
+    # 构建返回结果
     eval_result = {
-        'accuracy': result['accuracy'],
-        'correct': result['correct'],
-        'total': result['total'],
         'mode': mode,
     }
+
+    # 合并 judge 返回的所有字段
+    eval_result.update(result)
+
+    # 兼容旧接口：如果没有 accuracy 字段但有其他主指标，添加 accuracy 别名
+    if 'accuracy' not in eval_result:
+        if 'balanced_accuracy' in eval_result:
+            eval_result['accuracy'] = eval_result['balanced_accuracy']
+        elif 'total_score' in eval_result:
+            # MME: 将 total_score 归一化为 0-1 范围作为 accuracy（假设满分 1400）
+            eval_result['accuracy'] = eval_result['total_score'] / 1400.0
 
     if kept_ratios:
         eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)
