@@ -20,9 +20,12 @@
   - 大幅提升加载速度，减少内存占用
 
 评估方式:
-  - 使用 MME 官方评分公式：min(Acc_p, Acc_n) × 100
-  - 每个子任务（category）分别计算 Positive (Yes) 和 Negative (No) 准确率
-  - 取两者最小值作为子任务得分，防止模型投机
+  - 使用 MME 官方评分公式
+  - 每张图有两个问题（一个 Yes，一个 No），通过 question_id 配对
+  - acc = (TP + TN) / 任务问题数
+  - acc_plus = 一张图两问均对数 / 图片数
+  - score = acc × 100 + acc_plus × 100
+  - 每个子任务最高 200 分
   - 必须使用 aggregate_judge 进行聚合评估，不支持逐条评估
 """
 
@@ -74,6 +77,7 @@ class MMEPreparer(BasePreparer):
                 "question": item["question"],
                 "answer": item["answer"],
                 "category": item["category"],
+                "question_id": item["question_id"],  # 用于配对同一张图的两个问题
             })
         random.shuffle(out)
         return out
@@ -152,13 +156,11 @@ class MMEPreparer(BasePreparer):
         """构建 MME 聚合评估函数 - 使用官方评分公式
 
         MME 评分公式：
-        1. 按 category（子任务）分组
-        2. 每个 category 内按 answer 分为 Positive (Yes) 和 Negative (No)
-        3. 计算 Acc_p（Positive 准确率）和 Acc_n（Negative 准确率）
-        4. 子任务得分 = min(Acc_p, Acc_n) × 100
-        5. 总分 = 所有子任务得分之和
-
-        这种设计强制模型必须同时做好正负两类，防止投机取巧。
+        1. 每张图有两个问题（通过 question_id 配对）
+        2. acc = (TP + TN) / 任务问题数
+        3. acc_plus = 一张图两问均对数 / 图片数
+        4. score = acc × 100 + acc_plus × 100
+        5. 每个子任务最高 200 分
         """
 
         def _normalize(s: Any) -> str:
@@ -188,7 +190,7 @@ class MMEPreparer(BasePreparer):
             Args:
                 predictions: 所有预测结果
                 references: 所有参考答案
-                samples: 所有原始样本（必须包含 category 和 answer 字段）
+                samples: 所有原始样本（必须包含 category, answer, question_id 字段）
 
             Returns:
                 包含 total_score、per_category 等指标的字典
@@ -199,57 +201,61 @@ class MMEPreparer(BasePreparer):
                     f"references={len(references)}, samples={len(samples)}"
                 )
 
-            # 按 category 分组，统计 Positive/Negative 的正确数和总数
-            # category_stats[cat] = {'pos_correct': n, 'pos_total': n, 'neg_correct': n, 'neg_total': n}
-            category_stats: Dict[str, Dict[str, int]] = {}
+            # 按 category 和 question_id 分组
+            # category_data[cat][qid] = [(pred, ref, is_correct), ...]
+            category_data: Dict[str, Dict[str, List[bool]]] = {}
 
             total_correct = 0
             for pred, ref, sample in zip(predictions, references, samples):
                 category = sample.get('category', 'unknown')
+                question_id = sample.get('question_id', 'unknown')
                 ref_norm = _normalize(ref)
                 pred_norm = _normalize(pred)
 
-                if category not in category_stats:
-                    category_stats[category] = {
-                        'pos_correct': 0, 'pos_total': 0,
-                        'neg_correct': 0, 'neg_total': 0
-                    }
-
-                # 判断是 Positive (Yes) 还是 Negative (No)
-                is_positive = ref_norm == 'yes'
                 is_correct = _is_match(pred_norm, ref_norm)
+                if is_correct:
+                    total_correct += 1
 
-                if is_positive:
-                    category_stats[category]['pos_total'] += 1
-                    if is_correct:
-                        category_stats[category]['pos_correct'] += 1
-                        total_correct += 1
-                else:
-                    category_stats[category]['neg_total'] += 1
-                    if is_correct:
-                        category_stats[category]['neg_correct'] += 1
-                        total_correct += 1
+                if category not in category_data:
+                    category_data[category] = {}
+                if question_id not in category_data[category]:
+                    category_data[category][question_id] = []
+                category_data[category][question_id].append(is_correct)
 
             # 计算每个 category 的得分
             per_category: Dict[str, Dict[str, Any]] = {}
             total_score = 0.0
 
-            for category, stats in category_stats.items():
-                # 计算 Acc_p 和 Acc_n
-                acc_p = stats['pos_correct'] / stats['pos_total'] if stats['pos_total'] > 0 else 0.0
-                acc_n = stats['neg_correct'] / stats['neg_total'] if stats['neg_total'] > 0 else 0.0
+            for category, qid_data in category_data.items():
+                # 统计该 category 的问题数和图片数
+                total_questions = 0
+                correct_questions = 0
+                total_images = 0
+                both_correct_images = 0
 
-                # MME 核心公式：Score = min(Acc_p, Acc_n) × 100
-                score = min(acc_p, acc_n) * 100
+                for qid, correct_list in qid_data.items():
+                    total_questions += len(correct_list)
+                    correct_questions += sum(correct_list)
+                    total_images += 1
+                    # 如果该 question_id 的所有问题都答对（通常是 2 个）
+                    if all(correct_list):
+                        both_correct_images += 1
+
+                # acc = 普通准确率
+                acc = correct_questions / total_questions if total_questions > 0 else 0.0
+                # acc_plus = 双对率（图片级别）
+                acc_plus = both_correct_images / total_images if total_images > 0 else 0.0
+                # score = acc * 100 + acc_plus * 100，最高 200 分
+                score = acc * 100 + acc_plus * 100
 
                 per_category[category] = {
-                    'acc_p': acc_p,
-                    'acc_n': acc_n,
+                    'acc': acc,
+                    'acc_plus': acc_plus,
                     'score': score,
-                    'pos_correct': stats['pos_correct'],
-                    'pos_total': stats['pos_total'],
-                    'neg_correct': stats['neg_correct'],
-                    'neg_total': stats['neg_total'],
+                    'total_questions': total_questions,
+                    'correct_questions': correct_questions,
+                    'total_images': total_images,
+                    'both_correct_images': both_correct_images,
                 }
 
                 total_score += score
@@ -260,11 +266,10 @@ class MMEPreparer(BasePreparer):
             return {
                 'total_score': total_score,
                 'simple_accuracy': simple_accuracy,
-                'num_categories': len(category_stats),
+                'num_categories': len(category_data),
                 'total_samples': len(predictions),
                 'total_correct': total_correct,
                 'per_category': per_category,
             }
 
         return _aggregate_judge
-
