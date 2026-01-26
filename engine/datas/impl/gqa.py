@@ -15,11 +15,11 @@
   - 大幅提升加载速度，减少内存占用
 
 评估方式:
-  - 使用 Balanced Accuracy（按答案类别均衡计算）
-  - 必须使用 aggregate_judge 进行聚合评估，不支持逐条评估
+  - 使用 Simple Accuracy（逐条评估）
+  - 词级精确匹配：答案作为完整词出现在预测中即为正确
 """
 
-from typing import List, Dict, Any, Union, Tuple
+from typing import List, Dict, Any, Union
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
 
@@ -128,20 +128,14 @@ class GQAPreparer(BasePreparer):
             splits[name] = GQADataset(ds.samples, self._hf_datasets)
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
 
-        # 标记需要聚合评估
-        meta['requires_aggregate_eval'] = True
-
         judge = self._build_judge()
-        aggregate_judge = self._build_aggregate_judge()
 
         bundle = {
             'splits': splits,
             'meta': meta,
             'judge': judge,
-            'aggregate_judge': aggregate_judge
         }
-        if True:
-            self.print_report(bundle)
+        self.print_report(bundle)
         return bundle
 
     def print_report(self, prepared: Dict[str, Any]):
@@ -149,35 +143,21 @@ class GQAPreparer(BasePreparer):
         logger = getattr(self.config, 'logger', None)
         if logger is None:
             return
-        
+
         self.base_report(meta)
         logger.info('[GQA] Presplit: True (train使用train_balanced，test使用val_balanced)')
         logger.info(f"[GQA] Loaded Samples: {meta['total']}")
-        
+
         # 统计每个 split 的样本数量
         for name, ds in meta['split_sizes'].items():
             logger.info(f"[GQA] Split '{name}': {ds} samples")
 
     def _build_judge(self):
-        """构建 judge 函数 - GQA 不支持逐条评估，调用时报错"""
+        """构建 judge 函数 - 词级精确匹配
 
-        def _judge(pred, ref, sample=None, split_name: str = 'test'):
-            raise NotImplementedError(
-                "GQA 数据集需要使用聚合评估（aggregate_judge），不支持逐条评估。"
-                "请在所有样本预测完成后调用 aggregate_judge(predictions, references, samples)。"
-            )
-
-        return _judge
-
-    def _build_aggregate_judge(self):
-        """构建 GQA 聚合评估函数 - 计算 Balanced Accuracy
-
-        Balanced Accuracy 计算方式：
-        1. 按答案值（answer）分组
-        2. 对每个答案类别计算准确率：correct / total
-        3. 对所有类别的准确率取平均
-
-        这样可以避免高频答案（yes/no、常见颜色等）主导评估结果。
+        匹配规则：
+        - 单词答案：答案作为完整词出现在预测中
+        - 多词答案：答案作为连续子串出现在预测中
         """
 
         def _normalize(s: Any) -> str:
@@ -201,61 +181,16 @@ class GQAPreparer(BasePreparer):
             # 多词答案：检查是否作为连续子序列出现
             return ref_norm in pred_norm
 
-        def _aggregate_judge(
-            predictions: List[str],
-            references: List[str],
-            samples: List[Dict[str, Any]]
-        ) -> Dict[str, Any]:
-            """
-            聚合评估函数
-
-            Args:
-                predictions: 所有预测结果
-                references: 所有参考答案
-                samples: 所有原始样本
-
-            Returns:
-                包含 balanced_accuracy 等指标的字典
-            """
-            if len(predictions) != len(references):
-                raise ValueError(f"predictions ({len(predictions)}) 和 references ({len(references)}) 长度不一致")
-
-            # 按答案值分组统计
-            answer_groups: Dict[str, Dict[str, int]] = {}  # {answer: {'correct': n, 'total': n}}
-
-            total_correct = 0
-            for pred, ref in zip(predictions, references):
-                ref_norm = _normalize(ref)
-                pred_norm = _normalize(pred)
-
-                if ref_norm not in answer_groups:
-                    answer_groups[ref_norm] = {'correct': 0, 'total': 0}
-
-                answer_groups[ref_norm]['total'] += 1
-
-                if _is_match(pred_norm, ref_norm):
-                    answer_groups[ref_norm]['correct'] += 1
-                    total_correct += 1
-
-            # 计算每个答案类别的准确率
-            category_accs = []
-            for answer_val, stats in answer_groups.items():
-                if stats['total'] > 0:
-                    acc = stats['correct'] / stats['total']
-                    category_accs.append(acc)
-
-            # Balanced Accuracy = 所有类别准确率的平均
-            balanced_accuracy = sum(category_accs) / len(category_accs) if category_accs else 0.0
-
-            # 普通准确率（作为参考）
-            simple_accuracy = total_correct / len(predictions) if predictions else 0.0
+        def _judge(pred: str, ref: str, sample=None, split_name: str = 'test') -> Dict[str, Any]:
+            """单样本评估"""
+            pred_norm = _normalize(pred)
+            ref_norm = _normalize(ref)
+            is_correct = _is_match(pred_norm, ref_norm)
 
             return {
-                'balanced_accuracy': balanced_accuracy,
-                'simple_accuracy': simple_accuracy,
-                'num_answer_categories': len(answer_groups),
-                'total_samples': len(predictions),
-                'total_correct': total_correct,
+                'correct': 1 if is_correct else 0,
+                'total': 1,
+                'accuracy': 1.0 if is_correct else 0.0,
             }
 
-        return _aggregate_judge
+        return _judge
