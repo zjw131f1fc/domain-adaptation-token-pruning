@@ -729,8 +729,7 @@ def evaluate(
             samples_for_aggregate.append(sample)
 
         # 每 local_log_interval 步打印中间统计
-        # 聚合评估模式下跳过（无法增量计算 balanced_accuracy / MME score）
-        if step_idx % local_log_interval == 0 and not requires_aggregate_eval:
+        if step_idx % local_log_interval == 0:
             if distributed and dist.is_initialized():
                 # 分布式模式：收集所有 rank 的数据
                 all_predictions = [None] * world_size
@@ -751,28 +750,46 @@ def evaluate(
                     merged_kept.extend(k)
 
                 if is_main_process():
-                    interim_result = judge(merged_preds, merged_refs)
-                    interim_acc = interim_result['accuracy']
-                    interim_correct = interim_result['correct']
-                    interim_total = interim_result['total']
-
-                    if merged_kept:
-                        interim_kept = sum(merged_kept) / len(merged_kept)
-                        print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                    interim_total = len(merged_preds)
+                    if requires_aggregate_eval:
+                        # 聚合评估模式：只打印进度和 kept ratio（无法增量计算 accuracy）
+                        if merged_kept:
+                            interim_kept = sum(merged_kept) / len(merged_kept)
+                            print(f"\n[Step {interim_total}] Processed: {interim_total}, Kept: {interim_kept:.2%}")
+                        else:
+                            print(f"\n[Step {interim_total}] Processed: {interim_total}")
                     else:
-                        print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
+                        # 普通模式：打印 accuracy
+                        interim_result = judge(merged_preds, merged_refs)
+                        interim_acc = interim_result['accuracy']
+                        interim_correct = interim_result['correct']
+
+                        if merged_kept:
+                            interim_kept = sum(merged_kept) / len(merged_kept)
+                            print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                        else:
+                            print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
             else:
                 # 单卡模式
-                interim_result = judge(predictions, references)
-                interim_acc = interim_result['accuracy']
-                interim_correct = interim_result['correct']
-                interim_total = interim_result['total']
-
-                if kept_ratios:
-                    interim_kept = sum(kept_ratios) / len(kept_ratios)
-                    print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                interim_total = len(predictions)
+                if requires_aggregate_eval:
+                    # 聚合评估模式：只打印进度和 kept ratio
+                    if kept_ratios:
+                        interim_kept = sum(kept_ratios) / len(kept_ratios)
+                        print(f"\n[Step {interim_total}] Processed: {interim_total}, Kept: {interim_kept:.2%}")
+                    else:
+                        print(f"\n[Step {interim_total}] Processed: {interim_total}")
                 else:
-                    print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
+                    # 普通模式：打印 accuracy
+                    interim_result = judge(predictions, references)
+                    interim_acc = interim_result['accuracy']
+                    interim_correct = interim_result['correct']
+
+                    if kept_ratios:
+                        interim_kept = sum(kept_ratios) / len(kept_ratios)
+                        print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                    else:
+                        print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
 
     # 分布式评估：收集所有 rank 的结果
     if distributed and dist.is_initialized():
