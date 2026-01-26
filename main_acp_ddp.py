@@ -272,7 +272,8 @@ def preprocess_batch(
         answers = [sample['answer'] for sample in batch]
         prompts = []
         for q, a in zip(questions, answers):
-            prompt = f"USER: <image>\n{q}\nASSISTANT: {a}"
+            # 答案首字母大写，与 compute_task_loss 中的处理保持一致
+            prompt = f"USER: <image>\n{q}\nASSISTANT: {a.capitalize()}"
             prompts.append(prompt)
     else:
         answers = None
