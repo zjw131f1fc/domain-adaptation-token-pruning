@@ -17,7 +17,6 @@ import os
 import sys
 
 # 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
-# os.environ["HF_HOME"] = "/root/autodl-tmp/huggingface_cache"
 os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
