@@ -158,6 +158,8 @@ class GQAPreparer(BasePreparer):
         匹配规则：
         - 单词答案：答案作为完整词出现在预测中
         - 多词答案：答案作为连续子串出现在预测中
+
+        支持单样本和批量评估两种模式。
         """
 
         def _normalize(s: Any) -> str:
@@ -181,8 +183,30 @@ class GQAPreparer(BasePreparer):
             # 多词答案：检查是否作为连续子序列出现
             return ref_norm in pred_norm
 
-        def _judge(pred: str, ref: str, sample=None, split_name: str = 'test') -> Dict[str, Any]:
-            """单样本评估"""
+        def _judge(pred, ref, sample=None, split_name: str = 'test') -> Dict[str, Any]:
+            """支持单样本和批量评估"""
+            # 批量评估模式
+            if isinstance(pred, list):
+                if not isinstance(ref, list):
+                    raise TypeError("批量评估时 ref 也应为列表")
+                if len(pred) != len(ref):
+                    raise ValueError(f"pred/ref 长度不一致: {len(pred)} vs {len(ref)}")
+
+                correct = 0
+                for p, r in zip(pred, ref):
+                    pred_norm = _normalize(p)
+                    ref_norm = _normalize(r)
+                    if _is_match(pred_norm, ref_norm):
+                        correct += 1
+
+                total = len(pred)
+                return {
+                    'correct': correct,
+                    'total': total,
+                    'accuracy': correct / total if total > 0 else 0.0,
+                }
+
+            # 单样本评估模式
             pred_norm = _normalize(pred)
             ref_norm = _normalize(ref)
             is_correct = _is_match(pred_norm, ref_norm)
