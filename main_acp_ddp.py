@@ -730,6 +730,7 @@ def evaluate(
             sample_info = {
                 'answer': sample.get('answer'),
                 'category': sample.get('category'),  # MME 需要
+                'question_id': sample.get('question_id'),  # MME 需要（配对同图问题）
             }
             samples_for_aggregate.append(sample_info)
 
