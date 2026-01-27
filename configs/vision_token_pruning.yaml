@@ -36,35 +36,53 @@ trainer_settings:
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
-dataset_settings:
-  # ==================== 单数据集模式（当前使用） ====================
-  name: "vqa-gqa"
-  split:
-    train: "all"
-    test: 5000
-  fast_load_no_random: false
-  category_priority:
-    enable: true
-    values:
-      - {train: 'mean'}    # 训练集均衡各类别数量（防止过拟合到高频类别）
-      # - {test: 'mean'}   # 测试集保持原始比例
+# dataset_settings:
+#   # ==================== 单数据集模式 ====================
+#   name: "vqa-gqa"
+#   split:
+#     train: "all"
+#     test: 5000
+#   fast_load_no_random: false
+#   category_priority:
+#     enable: true
+#     values:
+#       - {train: 'mean'}
 
-  # ==================== 多数据集模式（示例，取消注释启用） ====================
+# ==================== 多数据集模式 ====================
+dataset_settings:
   # 多数据集模式会混合训练数据，均衡采样
   # 评估时对每个数据集单独评估
-  # datasets:
-  #   - name: "vqa-vqav2"
-  #     split:
-  #       train: 10000      # 训练集取 10000 条
-  #       test: 1000        # 测试集取 1000 条
-  #   - name: "vqa-gqa"
-  #     split:
-  #       train: 10000
-  #       test: 1000
-  #   - name: "vqa-pope"
-  #     split:
-  #       train: -1         # -1 表示不用于训练
-  #       test: 1000        # 仅用于评估
+  datasets:
+    # === 有训练集的数据集 ===
+    - name: "vqa-vqav2"
+      split:
+        train: "all"
+        test: 2000
+    - name: "vqa-gqa"
+      split:
+        train: "all"
+        test: 2000
+    - name: "vqa-sqa"
+      split:
+        train: "all"
+        test: 2000
+    - name: "vqa-mmb"
+      split:
+        train: "all"
+        test: 2000
+    # === 仅用于评估的数据集 ===
+    - name: "vqa-pope"
+      split:
+        train: -1
+        test: 2000
+    - name: "vqa-mme"
+      split:
+        train: -1
+        test: 2000
+    - name: "vqa-seed"
+      split:
+        train: -1
+        test: 2000
 
 backbone_settings:
   name: "llava-1.5-7b"
