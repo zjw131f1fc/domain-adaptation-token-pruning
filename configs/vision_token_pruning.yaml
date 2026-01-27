@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: ./outputs/checkpoints/gqa/checkpoint_step2400.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
@@ -32,21 +32,39 @@ trainer_settings:
         lr: 2.0e-04
     print_loss_every_batches: 50  # 隔多久打印一次损失
     eval_every_batches: 2000  # 隔多久评估一次
-    eval_max_samples: 2000 # 每次评估使用多少数据
+    eval_max_samples: 2000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
 dataset_settings:
-  name: "vqa-vqav2"
+  # ==================== 单数据集模式（当前使用） ====================
+  name: "vqa-gqa"
   split:
     train: "all"
-    test: 2000
+    test: 5000
   fast_load_no_random: false
   category_priority:
     enable: true
     values:
       - {train: 'mean'}    # 训练集均衡各类别数量（防止过拟合到高频类别）
       # - {test: 'mean'}   # 测试集保持原始比例
+
+  # ==================== 多数据集模式（示例，取消注释启用） ====================
+  # 多数据集模式会混合训练数据，均衡采样
+  # 评估时对每个数据集单独评估
+  # datasets:
+  #   - name: "vqa-vqav2"
+  #     split:
+  #       train: 10000      # 训练集取 10000 条
+  #       test: 1000        # 测试集取 1000 条
+  #   - name: "vqa-gqa"
+  #     split:
+  #       train: 10000
+  #       test: 1000
+  #   - name: "vqa-pope"
+  #     split:
+  #       train: -1         # -1 表示不用于训练
+  #       test: 1000        # 仅用于评估
 
 backbone_settings:
   name: "llava-1.5-7b"
