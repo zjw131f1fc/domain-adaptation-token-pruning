@@ -1294,6 +1294,14 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             if is_main_process():
                 logger.info(f"Evaluating at step {global_step}...")
 
+            # 显存保护：申请占位张量防止被其他任务抢占
+            eval_memory_reserve_mb = trainer_cfg.get('eval_memory_reserve_mb', 0)
+            memory_placeholder = None
+            if eval_memory_reserve_mb > 0:
+                # 1 MB = 1024 * 1024 bytes, float32 = 4 bytes
+                n_elements = (eval_memory_reserve_mb * 1024 * 1024) // 4
+                memory_placeholder = torch.empty(n_elements, dtype=torch.float32, device=device)
+
             eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
 
             for ds_name, test_ds in test_datasets.items():
@@ -1345,6 +1353,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                                            f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
             model.train()
+
+            # 释放显存保护张量
+            if memory_placeholder is not None:
+                del memory_placeholder
+                torch.cuda.empty_cache()
 
         # 保存（只在主进程）
         if global_step % save_every == 0 and is_main_process():
