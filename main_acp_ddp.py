@@ -938,44 +938,100 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     if not is_main_process():
         config.logger = None
 
-    from engine.datas.loader import load_dataset
-    data_bundle = load_dataset(config)
+    from engine.datas.loader import load_dataset, load_multi_datasets, is_multi_dataset_mode
+
+    # 检测多数据集模式
+    multi_dataset_mode = is_multi_dataset_mode(config)
+
+    if multi_dataset_mode:
+        # 多数据集模式
+        multi_bundle = load_multi_datasets(config)
+        train_dataset = multi_bundle['train_dataset']
+        test_datasets = multi_bundle['test_datasets']  # Dict[str, dataset]
+        judges = multi_bundle['judges']  # Dict[str, judge]
+        aggregate_judges = multi_bundle.get('aggregate_judges', {})
+        dataset_names = multi_bundle['dataset_names']
+
+        # 兼容单数据集变量（用于后续代码兼容性）
+        test_dataset = None  # 多数据集模式下不使用单一 test_dataset
+        judge = None
+    else:
+        # 单数据集模式（原有逻辑）
+        data_bundle = load_dataset(config)
+        train_dataset = data_bundle['splits']['train']
+        test_dataset = data_bundle['splits'].get('test', None)
+        judge = data_bundle['judge']
+
+        # 兼容多数据集变量
+        test_datasets = {}
+        judges = {}
+        aggregate_judges = {}
+        dataset_names = []
+        ds_name = config.dataset_settings.get('name', 'unknown')
+        if test_dataset:
+            test_datasets[ds_name] = test_dataset
+            judges[ds_name] = judge
+            if 'aggregate_judge' in data_bundle:
+                aggregate_judges[ds_name] = data_bundle['aggregate_judge']
+            dataset_names.append(ds_name)
 
     # 恢复原始 logger
     config.logger = original_logger
 
-    train_dataset = data_bundle['splits']['train']
-    test_dataset = data_bundle['splits'].get('test', None)
-    judge = data_bundle['judge']
-
-    dataset_name = config.dataset_settings.get('name', 'unknown')
     if is_main_process():
-        logger.info(f"Dataset: {dataset_name}")
-        logger.info(f"Train samples: {len(train_dataset)}")
-        if test_dataset:
-            logger.info(f"Test samples: {len(test_dataset)}")
+        if multi_dataset_mode:
+            logger.info(f"Multi-dataset mode: {dataset_names}")
+            logger.info(f"Total train samples: {len(train_dataset)}")
+            for ds_name, ds in test_datasets.items():
+                logger.info(f"  [{ds_name}] test samples: {len(ds)}")
+        else:
+            dataset_name = config.dataset_settings.get('name', 'unknown')
+            logger.info(f"Dataset: {dataset_name}")
+            logger.info(f"Train samples: {len(train_dataset)}")
+            if test_dataset:
+                logger.info(f"Test samples: {len(test_dataset)}")
 
-    # 创建 DistributedSampler 和 DataLoader
-    train_wrapper = SimpleDataset(train_dataset)
-    train_sampler = DistributedSampler(
-        train_wrapper,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=seed,
-    )
-
+    # 创建 Sampler 和 DataLoader
     trainer_cfg = config.trainer_settings.get('dl_settings', {})
     batch_size = trainer_cfg.get('batch_size', 4)
 
-    train_loader = DataLoader(
-        train_wrapper,
-        batch_size=batch_size,
-        sampler=train_sampler,
-        collate_fn=collate_fn,
-        num_workers=0,  # 图像处理需要在主进程
-        pin_memory=True,
-    )
+    if multi_dataset_mode:
+        # 多数据集模式：使用均衡采样器
+        from engine.datas.mixed import BalancedMultiDatasetSampler
+        train_sampler = BalancedMultiDatasetSampler(
+            train_dataset,
+            batch_size=batch_size,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=True,
+        )
+    else:
+        # 单数据集模式：使用 DistributedSampler
+        train_wrapper = SimpleDataset(train_dataset)
+        train_sampler = DistributedSampler(
+            train_wrapper,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+        )
+        train_loader = DataLoader(
+            train_wrapper,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=True,
+        )
 
     # 创建优化器
     opt_cfg = trainer_cfg.get('optimizers', {})
@@ -1068,7 +1124,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     # 训练循环
     global_step = start_step
-    cached_origin_result = None
+    # 多数据集模式下，每个数据集独立缓存 origin 结果
+    cached_origin_results: Dict[str, Any] = {}  # {dataset_name: result}
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
@@ -1227,53 +1284,60 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
                     logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
 
-            # 分布式评估：所有 rank 都参与
-            if test_dataset and global_step % eval_every == 0:
+            # 分布式评估：所有 rank 都参与（支持多数据集）
+            if test_datasets and global_step % eval_every == 0:
                 if is_main_process():
                     logger.info(f"Evaluating at step {global_step}...")
 
                 eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
-                for eval_mode in eval_modes:
-                    if eval_mode == 'origin':
-                        if cached_origin_result is None:
+
+                for ds_name, test_ds in test_datasets.items():
+                    ds_judge = judges.get(ds_name)
+                    if ds_judge is None:
+                        continue
+
+                    for eval_mode in eval_modes:
+                        if eval_mode == 'origin':
+                            # 每个数据集独立缓存 origin 结果
+                            if ds_name not in cached_origin_results:
+                                eval_result = evaluate(
+                                    model, processor, test_ds, ds_judge, config, device,
+                                    max_samples=eval_max_samples,
+                                    mode=eval_mode,
+                                    distributed=True
+                                )
+                                cached_origin_results[ds_name] = eval_result
+                                if is_main_process():
+                                    logger.info(f"  [{ds_name}][{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                            else:
+                                eval_result = cached_origin_results[ds_name]
+                                if is_main_process():
+                                    logger.info(f"  [{ds_name}][{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
+                        else:
                             eval_result = evaluate(
-                                model, processor, test_dataset, judge, config, device,
+                                model, processor, test_ds, ds_judge, config, device,
                                 max_samples=eval_max_samples,
                                 mode=eval_mode,
                                 distributed=True
                             )
-                            cached_origin_result = eval_result
                             if is_main_process():
-                                logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
-                        else:
-                            eval_result = cached_origin_result
-                            if is_main_process():
-                                logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
-                    else:
-                        eval_result = evaluate(
-                            model, processor, test_dataset, judge, config, device,
-                            max_samples=eval_max_samples,
-                            mode=eval_mode,
-                            distributed=True
-                        )
-                        if is_main_process():
-                            logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
-                            if 'avg_kept_ratio' in eval_result:
-                                layer_ratios = []
-                                for layer_idx in pruning_layers:
-                                    kept_key = f'L{layer_idx}_kept'
-                                    n_kept_key = f'L{layer_idx}_n_kept'
-                                    if kept_key in eval_result:
-                                        if n_kept_key in eval_result:
-                                            layer_ratios.append(
-                                                f"L{layer_idx}={eval_result[kept_key]:.2%}"
-                                                f"({int(eval_result[n_kept_key])})"
-                                            )
-                                        else:
-                                            layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
-                                layer_str = ", ".join(layer_ratios)
-                                logger.info(f"  [{eval_mode}] Avg kept ratio: "
-                                           f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+                                logger.info(f"  [{ds_name}][{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
+                                if 'avg_kept_ratio' in eval_result:
+                                    layer_ratios = []
+                                    for layer_idx in pruning_layers:
+                                        kept_key = f'L{layer_idx}_kept'
+                                        n_kept_key = f'L{layer_idx}_n_kept'
+                                        if kept_key in eval_result:
+                                            if n_kept_key in eval_result:
+                                                layer_ratios.append(
+                                                    f"L{layer_idx}={eval_result[kept_key]:.2%}"
+                                                    f"({int(eval_result[n_kept_key])})"
+                                                )
+                                            else:
+                                                layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                                    layer_str = ", ".join(layer_ratios)
+                                    logger.info(f"  [{ds_name}][{eval_mode}] Avg kept ratio: "
+                                               f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
                 model.train()
 
@@ -1343,41 +1407,47 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             logger.info(f"    {layer_idx}: {k}")
         logger.info("=" * 60)
 
-    # 最终评估（所有 rank 都需要参与分布式评估）
-    if test_dataset:
+    # 最终评估（所有 rank 都需要参与分布式评估，支持多数据集）
+    if test_datasets:
         if is_main_process():
             logger.info("Final evaluation...")
         eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
-        for eval_mode in eval_modes:
-            if eval_mode == 'origin' and cached_origin_result is not None:
-                eval_result = cached_origin_result
-                if is_main_process():
-                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
-            else:
-                eval_result = evaluate(
-                    model, processor, test_dataset, judge, config, device,
-                    max_samples=eval_max_samples,
-                    mode=eval_mode,
-                    distributed=True
-                )
-                if is_main_process():
-                    logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
-                    if 'avg_kept_ratio' in eval_result:
-                        layer_ratios = []
-                        for layer_idx in pruning_layers:
-                            kept_key = f'L{layer_idx}_kept'
-                            n_kept_key = f'L{layer_idx}_n_kept'
-                            if kept_key in eval_result:
-                                if n_kept_key in eval_result:
-                                    layer_ratios.append(
-                                        f"L{layer_idx}={eval_result[kept_key]:.2%}"
-                                        f"({int(eval_result[n_kept_key])})"
-                                    )
-                                else:
-                                    layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
-                        layer_str = ", ".join(layer_ratios)
-                        logger.info(f"[{eval_mode}] Avg kept ratio: "
-                                   f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+
+        for ds_name, test_ds in test_datasets.items():
+            ds_judge = judges.get(ds_name)
+            if ds_judge is None:
+                continue
+
+            for eval_mode in eval_modes:
+                if eval_mode == 'origin' and ds_name in cached_origin_results:
+                    eval_result = cached_origin_results[ds_name]
+                    if is_main_process():
+                        logger.info(f"[{ds_name}][{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
+                else:
+                    eval_result = evaluate(
+                        model, processor, test_ds, ds_judge, config, device,
+                        max_samples=eval_max_samples,
+                        mode=eval_mode,
+                        distributed=True
+                    )
+                    if is_main_process():
+                        logger.info(f"[{ds_name}][{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
+                        if 'avg_kept_ratio' in eval_result:
+                            layer_ratios = []
+                            for layer_idx in pruning_layers:
+                                kept_key = f'L{layer_idx}_kept'
+                                n_kept_key = f'L{layer_idx}_n_kept'
+                                if kept_key in eval_result:
+                                    if n_kept_key in eval_result:
+                                        layer_ratios.append(
+                                            f"L{layer_idx}={eval_result[kept_key]:.2%}"
+                                            f"({int(eval_result[n_kept_key])})"
+                                        )
+                                    else:
+                                        layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                            layer_str = ", ".join(layer_ratios)
+                            logger.info(f"[{ds_name}][{eval_mode}] Avg kept ratio: "
+                                       f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
 
 # ============================================================
