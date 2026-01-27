@@ -1,46 +1,56 @@
-"""MME 数据集准备器
+"""MME 数据集准备器 (单选题)
 
-目标: 子类只做最少工作:
-  - 标记: 有类别 (has_category = True)
-    - 使用父类 split_from_single 对单一列表进行拆分
-  - 提供字段映射表 (例如 prompt -> question) 可由 config.dataset_settings['field_map'] 给出
-  - 实现 get() 与 print_report()
+仿照 MMBench 的实现风格，提供统一接口：
+  get() -> { 'splits': {name: Dataset}, 'meta': meta_dict, 'judge': callable }
 
-父类 BasePreparer 提供:
-  - 加载后的一致流程 (prepare): 类别检测 / 字段映射 / 自动切分
-  - 基础报告辅助方法 base_report()
+源数据: HuggingFace datasets -> "lmms-lab/MME"
+  - 包含两个子集: default, default (实际上是同一个)
+  - dev split: 有答案，用于本地评估
+  - test split: 需要提交到官网评测
 
-本文件只负责:
-  - 加载 MME 原始数据 (使用 datasets.load_dataset)
-  - 将其转换为标准字段结构
-  - 调用父类准备流程并输出结果
+注意：当前实现使用 dev split 进行本地评估。
+      最终评测请使用 test split 并提交到 MME 官网。
+
+数据集字段: question, A, B, C, D, answer, category, image
+  - A/B/C/D: 选项文本 (字符串)
+  - question: 问题文本
+  - answer: 正确答案选项字母 (A/B/C/D)
+  - category: 题目类别
+  - image: 图像对象
+
+拆分策略: 与 MMBench 相同，按 config.dataset_settings['split'] 进行:
+  - dev -> train (有答案，可本地评估)
+  - test -> test (需官网提交)
 
 性能优化:
   - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
   - 大幅提升加载速度，减少内存占用
 
-评估方式:
-  - 使用 MME 官方评分公式
-  - 每张图有两个问题（一个 Yes，一个 No），通过 question_id 配对
-  - acc = (TP + TN) / 任务问题数
-  - acc_plus = 一张图两问均对数 / 图片数
-  - score = acc × 100 + acc_plus × 100
-  - 每个子任务最高 200 分
-  - 必须使用 aggregate_judge 进行聚合评估，不支持逐条评估
+judge 逻辑 (单选):
+  - 单条: pred 归一化大写后与正确选项字母完全相同视为正确
+  - 若 pred 给出的是选项完整文本，将尝试匹配 A/B/C/D 文本定位到其字母
+  - 批量: 对齐 zip(pred, ref)，分别判定
+
+归一化规则:
+  - 去除首尾空白
+  - 大写化字母
+  - 仅保留首个非空 token (用于防止模型回答 "A. xxx")
+
+无 try/except 包装，配置 / 数据异常直接抛出。
 """
 
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 from ..base import BasePreparer, BsesDataset
 from datasets import load_dataset  # type: ignore
-import random
 
 
 class MMEDataset(BsesDataset):
     """MME 数据集，支持延迟图像加载"""
 
-    def __init__(self, samples: List[Dict[str, Any]], hf_dataset=None):
+    def __init__(self, samples: List[Dict[str, Any]], hf_datasets: Dict[str, Any] = None):
         super().__init__(samples)
-        self._hf_dataset = hf_dataset
+        # hf_datasets: {split: dataset} 映射
+        self._hf_datasets = hf_datasets or {}
 
     def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """延迟加载：返回样本时才加载图像"""
@@ -51,10 +61,11 @@ class MMEDataset(BsesDataset):
 
         sample = self.samples[idx].copy()
 
-        # 如果 image 字段是整数索引，则延迟加载
-        if isinstance(sample.get('image'), int) and self._hf_dataset is not None:
-            hf_idx = sample['image']
-            sample['image'] = self._hf_dataset[hf_idx]['image']
+        # 如果 image 字段是 (split, index) 元组，则延迟加载
+        if isinstance(sample.get('image'), tuple) and self._hf_datasets:
+            split, hf_idx = sample['image']
+            if split in self._hf_datasets:
+                sample['image'] = self._hf_datasets[split][hf_idx]['image']
 
         return sample
 
@@ -62,214 +73,152 @@ class MMEDataset(BsesDataset):
 class MMEPreparer(BasePreparer):
     def __init__(self, config):
         super().__init__(config)
-        self.has_category = True  # 明确声明具备类别
-        self.field_map = {}  # 可由外部 config 指定, 默认空
-        self._hf_dataset = None  # 保存 HuggingFace dataset 引用用于延迟加载
+        # 明确存在 category 字段
+        self.has_category = True
+        # 保存 HuggingFace dataset 引用用于延迟加载
+        self._hf_datasets: Dict[str, Any] = {}
 
-    def _load_all(self) -> List[Dict[str, Any]]:
-        ds = load_dataset("lmms-lab/MME", split="test")
-        self._hf_dataset = ds  # 保存引用
+    def _load_split(self, split: str) -> List[Dict[str, Any]]:
+        """加载指定 split 的数据
+
+        Args:
+            split: 'dev' 或 'test'
+
+        Returns:
+            样本列表
+        """
+        ds = load_dataset("lmms-lab/MME", split=split)
+        self._hf_datasets[split] = ds  # 保存引用
         out: List[Dict[str, Any]] = []
+
         for i in range(len(ds)):
             item = ds[i]
+            q_raw = item['question']
+            opt_lines = [
+                f"A. {item['A']}",
+                f"B. {item['B']}",
+                f"C. {item['C']}",
+                f"D. {item['D']}",
+            ]
+            instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
+            full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
             out.append({
-                "image": i,  # 存储索引而非图像（延迟加载）
-                "question": item["question"],
-                "answer": item["answer"],
-                "category": item["category"],
-                "question_id": item["question_id"],  # 用于配对同一张图的两个问题
+                'image': (split, i),  # 存储 (split, index) 而非图像
+                'question': full_q,
+                'A': item['A'],
+                'B': item['B'],
+                'C': item['C'],
+                'D': item['D'],
+                'answer': item['answer'],
+                'category': item['category'],
+                'raw_question': q_raw,
             })
-        random.shuffle(out)
         return out
 
+    def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
+        """加载预拆分数据"""
+        data: Dict[str, List[Dict[str, Any]]] = {}
+        # dev -> train (有答案，可本地评估)
+        data['train'] = self._load_split('dev')
+        # test 若在 split 配置中出现则加载
+        if 'test' in self.split_cfg:
+            data['test'] = self._load_split('test')
+        return data
+
     def get(self) -> Dict[str, Any]:
-        samples = self._load_all()
-        # 类别检测 (已设 True 但保持统一接口)
-        self.detect_category(samples)
-        # 字段映射
-        applied_map = self.apply_field_map(samples)
-        # 根据配置拆分 (单一列表)
-        base_splits, placeholder = self.split_from_single(samples)
+        presplits = self._load_presplits()
+        # 汇总所有样本用于统计
+        all_samples: List[Dict[str, Any]] = []
+        for lst in presplits.values():
+            all_samples.extend(lst)
+        self.detect_category(all_samples)
+        applied_map = self.apply_field_map(all_samples)
+        base_splits, placeholder = self.split_from_presplits(presplits)
         # 转换为 MMEDataset（支持延迟加载）
         splits: Dict[str, MMEDataset] = {}
         for name, ds in base_splits.items():
-            splits[name] = MMEDataset(ds.samples, self._hf_dataset)
-        # 构建 meta
-        meta = self.build_meta(samples, splits, applied_map, placeholder)
-
-        # 标记需要聚合评估
-        meta['requires_aggregate_eval'] = True
-
-        judge = self._build_judge()
-        aggregate_judge = self._build_aggregate_judge()
-
-        bundle = {
-            "splits": splits,
-            "meta": meta,
-            "judge": judge,
-            "aggregate_judge": aggregate_judge
-        }
-        self.print_report(bundle)
+            splits[name] = MMEDataset(ds.samples, self._hf_datasets)
+        meta = self.build_meta(all_samples, splits, applied_map, placeholder)
+        judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta)
+        bundle = {'splits': splits, 'meta': meta, 'judge': judge}
+        if True:
+            self.print_report(bundle)
         return bundle
 
     def print_report(self, prepared: Dict[str, Any]):
-        meta = prepared["meta"]
-        splits = prepared["splits"]
-        logger = getattr(self.config, "logger", None)
+        meta = prepared['meta']
+        splits = prepared['splits']
+        logger = getattr(self.config, 'logger', None)
         if logger is None:
             return
         self.base_report(meta)
-        logger.info('[MME] Presplit: False (单列表随机拆分)')
-        if meta["has_category"]:
+        logger.info('[MME] Presplit: True (dev/test)')
+        logger.info('[MME] 注意: 当前使用 dev split 进行本地评估，最终评测请使用 test split 提交到官网')
+        if meta['has_category']:
             total_cat: Dict[Any, int] = {}
             for ds in splits.values():
                 for i in range(len(ds)):
-                    c = ds[i]["category"]
+                    c = ds[i]['category']
                     if c in total_cat:
                         total_cat[c] += 1
                     else:
                         total_cat[c] = 1
             logger.info("[MME] Global Category Distribution: " + ", ".join(f"{c}:{n}" for c, n in sorted(total_cat.items(), key=lambda x: (-x[1], str(x[0])))))
-            for name, ds in splits.items():
-                cat_stat: Dict[Any, int] = {}
-                for i in range(len(ds)):
-                    c = ds[i]["category"]
-                    if c in cat_stat:
-                        cat_stat[c] += 1
-                    else:
-                        cat_stat[c] = 1
-                logger.info(f"[MME] Split '{name}' Categories: " + ", ".join(f"{c}:{n}" for c, n in sorted(cat_stat.items(), key=lambda x: (-x[1], str(x[0])))))
 
-    # ----- judge 构建 -----
-    def _build_judge(self):
-        """构建 judge 函数 - MME 不支持逐条评估，调用时报错"""
+    # ---- judge ----
+    def _build_judge(self, meta: Dict[str, Any], splits: Dict[str, MMEDataset]):
+        def _norm_option_key(s: str) -> str:
+            t = str(s).strip().upper()
+            if not t:
+                return ''
+            # 取第一个非分隔 token (防止模型输出 "A." / "A)" 等)
+            for sep in ['.', ')', ':']:
+                if sep in t:
+                    t = t.split(sep, 1)[0].strip()
+            # 若出现空格, 仅取首 token
+            if ' ' in t:
+                t = t.split()[0]
+            return t
+
+        def _map_full_text_to_letter(sample: Dict[str, Any], pred_text: str) -> str:
+            """如果 pred_text 与某个选项文本(归一化后)匹配, 返回其字母; 否则返回原归一化结果"""
+            pt = pred_text.strip().lower()
+            cand_map = {}
+            for k in ['A', 'B', 'C', 'D']:
+                cand_map[k] = str(sample.get(k, '')).strip().lower()
+            for letter, text in cand_map.items():
+                if pt == text:
+                    return letter
+            return _norm_option_key(pred_text)
 
         def _judge(pred, ref, sample=None, split_name: str = 'test'):
-            raise NotImplementedError(
-                "MME 数据集需要使用聚合评估（aggregate_judge），不支持逐条评估。"
-                "请在所有样本预测完成后调用 aggregate_judge(predictions, references, samples)。"
-            )
+            def _single(p_raw, r_raw, sample_item):
+                letter_ref = _norm_option_key(r_raw)
+                # 预测可能是字母或完整选项文本
+                letter_pred = _norm_option_key(p_raw)
+                # 若仍未直接是 A-D, 尝试匹配完整文本
+                if letter_pred not in ('A', 'B', 'C', 'D') and sample_item is not None:
+                    letter_pred = _map_full_text_to_letter(sample_item, str(p_raw))
+                is_correct = 1 if letter_pred == letter_ref and letter_ref in ('A', 'B', 'C', 'D') else 0
+                return is_correct
+
+            if isinstance(pred, list):
+                if not isinstance(ref, list):
+                    raise TypeError('批量判定时 ref 也应为列表')
+                total = len(pred)
+                if len(ref) != total:
+                    raise ValueError('pred/ref 长度不一致')
+                correct = 0
+                if sample is not None and isinstance(sample, list):
+                    for p, r, smp in zip(pred, ref, sample):
+                        correct += _single(p, r, smp)
+                else:
+                    for p, r in zip(pred, ref):
+                        correct += _single(p, r, None)
+                return {'correct': correct, 'total': total, 'accuracy': (correct / total) if total > 0 else 0.0}
+
+            # 单条
+            is_correct = _single(pred, ref, sample)
+            return {'correct': is_correct, 'total': 1, 'accuracy': float(is_correct)}
 
         return _judge
-
-    def _build_aggregate_judge(self):
-        """构建 MME 聚合评估函数 - 使用官方评分公式
-
-        MME 评分公式：
-        1. 每张图有两个问题（通过 question_id 配对）
-        2. acc = (TP + TN) / 任务问题数
-        3. acc_plus = 一张图两问均对数 / 图片数
-        4. score = acc × 100 + acc_plus × 100
-        5. 每个子任务最高 200 分
-        """
-
-        def _normalize(s: Any) -> str:
-            if s is None:
-                return ''
-            text = str(s).strip().lower()
-            punct_table = str.maketrans({c: ' ' for c in "!?,.:;\"'`~()[]{}<>"})
-            text = text.translate(punct_table)
-            parts = [p for p in text.split() if p]
-            return ' '.join(parts)
-
-        def _is_match(pred_norm: str, ref_norm: str) -> bool:
-            """检查预测是否正确：ref 作为完整词出现在 pred 中"""
-            if not ref_norm:
-                return False
-            pred_words = set(pred_norm.split())
-            return ref_norm in pred_words
-
-        def _aggregate_judge(
-            predictions: List[str],
-            references: List[str],
-            samples: List[Dict[str, Any]]
-        ) -> Dict[str, Any]:
-            """
-            MME 聚合评估函数
-
-            Args:
-                predictions: 所有预测结果
-                references: 所有参考答案
-                samples: 所有原始样本（必须包含 category, answer, question_id 字段）
-
-            Returns:
-                包含 total_score、per_category 等指标的字典
-            """
-            if len(predictions) != len(references) or len(predictions) != len(samples):
-                raise ValueError(
-                    f"长度不一致: predictions={len(predictions)}, "
-                    f"references={len(references)}, samples={len(samples)}"
-                )
-
-            # 按 category 和 question_id 分组
-            # category_data[cat][qid] = [(pred, ref, is_correct), ...]
-            category_data: Dict[str, Dict[str, List[bool]]] = {}
-
-            total_correct = 0
-            for pred, ref, sample in zip(predictions, references, samples):
-                category = sample.get('category', 'unknown')
-                question_id = sample.get('question_id', 'unknown')
-                ref_norm = _normalize(ref)
-                pred_norm = _normalize(pred)
-
-                is_correct = _is_match(pred_norm, ref_norm)
-                if is_correct:
-                    total_correct += 1
-
-                if category not in category_data:
-                    category_data[category] = {}
-                if question_id not in category_data[category]:
-                    category_data[category][question_id] = []
-                category_data[category][question_id].append(is_correct)
-
-            # 计算每个 category 的得分
-            per_category: Dict[str, Dict[str, Any]] = {}
-            total_score = 0.0
-
-            for category, qid_data in category_data.items():
-                # 统计该 category 的问题数和图片数
-                total_questions = 0
-                correct_questions = 0
-                total_images = 0
-                both_correct_images = 0
-
-                for qid, correct_list in qid_data.items():
-                    total_questions += len(correct_list)
-                    correct_questions += sum(correct_list)
-                    total_images += 1
-                    # 如果该 question_id 的所有问题都答对（通常是 2 个）
-                    if all(correct_list):
-                        both_correct_images += 1
-
-                # acc = 普通准确率
-                acc = correct_questions / total_questions if total_questions > 0 else 0.0
-                # acc_plus = 双对率（图片级别）
-                acc_plus = both_correct_images / total_images if total_images > 0 else 0.0
-                # score = acc * 100 + acc_plus * 100，最高 200 分
-                score = acc * 100 + acc_plus * 100
-
-                per_category[category] = {
-                    'acc': acc,
-                    'acc_plus': acc_plus,
-                    'score': score,
-                    'total_questions': total_questions,
-                    'correct_questions': correct_questions,
-                    'total_images': total_images,
-                    'both_correct_images': both_correct_images,
-                }
-
-                total_score += score
-
-            # 普通准确率（作为参考）
-            simple_accuracy = total_correct / len(predictions) if predictions else 0.0
-
-            return {
-                'total_score': total_score,
-                'simple_accuracy': simple_accuracy,
-                'num_categories': len(category_data),
-                'total_samples': len(predictions),
-                'total_correct': total_correct,
-                'per_category': per_category,
-            }
-
-        return _aggregate_judge
