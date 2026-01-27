@@ -17,7 +17,7 @@ global_settings:
 
 trainer_settings:
   dl_settings:
-    epochs: 1
+    total_steps: 10000  # 总训练步数
     batch_size: 2
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
@@ -57,32 +57,32 @@ dataset_settings:
     - name: "vqa-vqav2"
       split:
         train: "all"
-        test: 2000
+        test: 1000
     - name: "vqa-gqa"
       split:
         train: "all"
-        test: 2000
+        test: 1000
     - name: "vqa-sqa"
       split:
         train: "all"
-        test: 2000
+        test: 1000
     - name: "vqa-mmb"
       split:
         train: "all"
-        test: 2000
+        test: 1000
     # === 仅用于评估的数据集 ===
     - name: "vqa-pope"
       split:
         train: -1
-        test: 2000
+        test: 1000
     - name: "vqa-mme"
       split:
         train: -1
-        test: 2000
+        test: 1000
     - name: "vqa-seed"
       split:
         train: -1
-        test: 2000
+        test: 1000
 
 backbone_settings:
   name: "llava-1.5-7b"
@@ -141,7 +141,7 @@ method_settings:
   adapter_bottleneck: 512         # adapter 瓶颈维度
 
   # ==================== Pruner Warmup ====================
-  pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
+  pruner_warmup_steps: 500  # 前 500 步不做对抗训练
 
   # ==================== 剪枝目标 ====================
   target_token_num: 144  # 目标保留的 vision token 数量
@@ -150,7 +150,7 @@ method_settings:
   # Gumbel-Softmax 温度，控制决策的"软硬"程度
   temperature: 1.0
   temperature_min: 0.1
-  temperature_anneal_rate: 0.8
+  temperature_anneal_steps: 8000  # 前 8000 步进行温度退火
 
   # ==================== 损失权重 ====================
   # task_loss: Cross entropy on answer tokens
@@ -163,14 +163,14 @@ method_settings:
   sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
-  loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
+  loss_weight_warmup_steps: 0  # 0 表示不使用 warmup
   task_loss_weight_start: 1.0
   adv_loss_weight_start: 0.7
 
   # Sparsity warmup - 启用，逐渐增加 sparsity 约束
   sparsity_warmup_enable: false
-  sparsity_warmup_ratio: 0.3  # 前 30% 训练步数进行 warmup
-  sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
+  sparsity_warmup_steps: 3000  # 前 3000 步进行 sparsity warmup
+  sparsity_weight_max: 0.5   # warmup 结束后达到最大值
 
 evaluation_settings:
   eval_mode: ["origin"]
