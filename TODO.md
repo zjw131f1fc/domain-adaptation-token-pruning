@@ -4,8 +4,13 @@
 
 ### Adapter 设计
 - **已移除 query 参数**：Adapter 现在只使用 `mask` 进行 FiLM 调制，不再使用 `query`
+- **移除原因**：
+  - 推理时 query 的处理一直有问题（软剪枝 vs 硬剪枝导致 query 分布不一致）
+  - 实测发现推理时不使用 query 指标也不错
+  - 尚不明确训练时没有 query 会造成什么影响，需要进一步实验验证
 - **作用范围**：Adapter 对所有 token 起效
 - **设计含义**：对所有直接接触到剪枝后结果的 token，都施加修复
+- **简化空间**：既然不再使用 query，LightweightAdapter 的 `query_proj` 相关代码可以移除，简化 Adapter 设计
 
 ### Adversarial Loss 设计
 - **作用范围**：adv_loss 只应用于生成 answer token 的 token（即 answer 位置前一个位置的 hidden states）
