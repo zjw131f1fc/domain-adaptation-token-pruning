@@ -18,7 +18,7 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 2
+    batch_size: 7
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -30,9 +30,9 @@ trainer_settings:
       discriminator:
         type: "adam"
         lr: 2.0e-04
-    print_loss_every_batches: 50  # 隔多久打印一次损失
-    eval_every_batches: 2000  # 隔多久评估一次
-    eval_max_samples: 2000 # 每次评估使用多少数据
+    print_loss_every_batches: 100  # 隔多久打印一次损失
+    eval_every_batches: 40000  # 隔多久评估一次
+    eval_max_samples: 1000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
@@ -40,7 +40,7 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: "all"
-    test: 2000
+    test: 1000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -113,7 +113,7 @@ method_settings:
   # ==================== Temperature 配置 ====================
   # Gumbel-Softmax 温度，控制决策的"软硬"程度
   temperature: 1.0
-  temperature_min: 0.1
+  temperature_min: 0.3
   temperature_anneal_rate: 0.8
 
   # ==================== 损失权重 ====================
@@ -121,9 +121,9 @@ method_settings:
   # adv_loss: 让 fake 被判为 real
   # sparsity_loss: 约束保留率到目标值
 
-  task_loss_weight: 1.3
+  task_loss_weight: 1.2
   # adv_loss_weight: 0.1   # 增加到 1.0，让 pruner 更努力骗过判别器
-  adv_loss_weight: 0
+  adv_loss_weight: 0.1
   sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
 
   # 动态权重调度 (可选)
@@ -137,7 +137,7 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin"]
+  eval_mode: ["origin", "hard"]
 
   # 网格搜索配置（用于搜索最优阈值）
   grid_search:
