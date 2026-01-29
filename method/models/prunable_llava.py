@@ -703,7 +703,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # 保存 query_states_flat 用于 adapter（在 reshape 之前）
             # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
-            # [DEBUG] 注释掉 - 导致准确率下降
+            # [DEBUG] 注释掉排查问题
             query_states_flat = None  # query_states
 
             # Reshape
@@ -736,21 +736,78 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
-            # 计算 attention output
-            attn_output = torch.matmul(attn_weights, value_states_expanded)
-            attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
-
-            # === 剪枝层应用 Adapter 修正 ===
+            # === 剪枝层：与训练对齐的处理流程 ===
             if layer_idx in self.pruning_layers:
+                # Step 1: 计算 question->vision attention 和 hard_mask（提前计算）
+                q2v_attn_list = []
+                for i in range(batch_size):
+                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
+                    current_q_start = None
+                    current_q_end = None
+                    for new_idx, orig_idx in enumerate(kept_indices[i]):
+                        if orig_idx == orig_q_start and current_q_start is None:
+                            current_q_start = new_idx
+                        if orig_idx == orig_q_end - 1:
+                            current_q_end = new_idx + 1
+                    if current_q_start is None:
+                        current_q_start = current_vision_end
+                    if current_q_end is None:
+                        current_q_end = current_seq_len
+                    q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
+                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
+                    q2v_attn_list.append(q2v_avg_i)
+                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
+
+                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
+                pruner = self.pruner_manager.get_pruner(layer_idx)
+                with torch.no_grad():
+                    hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+
+                # Step 2: 用 mask 修改 attention weights（与训练一致）
+                current_n_vision = current_vision_end - current_vision_start
+                mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+
+                # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
+                ones_before = torch.ones(batch_size, num_heads, current_seq_len, current_vision_start,
+                                         device=device, dtype=dtype)
+                ones_after = torch.ones(batch_size, num_heads, current_seq_len, current_seq_len - current_vision_end,
+                                        device=device, dtype=dtype)
+                mask_vision = mask_expanded.expand(-1, num_heads, current_seq_len, -1)
+                full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
+
+                # 应用 mask 并重新归一化
+                attn_weights_masked = attn_weights * full_mask
+                attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
+                attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
+
+                # Step 3: 计算剪枝后的 attention output
+                attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
+                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+
+                # Step 4: 应用 Adapter（与训练一致：处理剪枝后的 attention output）
                 adapter = self.adapter_manager.get_adapter(layer_idx)
                 if adapter is not None:
-                    # 与训练时保持一致：传入 cumulative_vision_mask 和 query_states_flat
-                    # [DEBUG] 注释掉以排查问题
                     attn_output = adapter(
                         attn_output,
-                        mask=cumulative_vision_mask,  # None
-                        query=query_states_flat  # None
+                        mask=cumulative_vision_mask,
+                        query=query_states_flat
                     )
+
+                # Step 5: 更新累积 vision mask
+                for i in range(batch_size):
+                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                    for j, pos in enumerate(kept_positions):
+                        if j < hard_mask.shape[1]:
+                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
+
+                # 记录 mask 用于统计
+                n_kept_absolute = hard_mask[0].sum().int().item()
+                masks[layer_idx] = (hard_mask, n_kept_absolute)
+
+            else:
+                # 非剪枝层：正常计算 attention output
+                attn_output = torch.matmul(attn_weights, value_states_expanded)
+                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
             attn_output = attn.o_proj(attn_output)
 
@@ -763,61 +820,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             hidden_states = original_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-            # === 在剪枝层进行硬剪枝 ===
+            # === 在剪枝层进行硬剪枝（物理删除 tokens）===
             if layer_idx in self.pruning_layers:
-                # 计算 question->vision attention
-                q2v_attn_list = []
-                for i in range(batch_size):
-                    # 找到当前 question 在缩短后序列中的位置
-                    # question_starts[i] 是原始位置，需要映射到当前位置
-                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
-
-                    # 找到当前 kept_indices 中 question 的位置
-                    current_q_start = None
-                    current_q_end = None
-                    for new_idx, orig_idx in enumerate(kept_indices[i]):
-                        if orig_idx == orig_q_start and current_q_start is None:
-                            current_q_start = new_idx
-                        if orig_idx == orig_q_end - 1:
-                            current_q_end = new_idx + 1
-
-                    if current_q_start is None:
-                        current_q_start = current_vision_end
-                    if current_q_end is None:
-                        current_q_end = current_seq_len
-
-                    # 提取 question->vision attention
-                    q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
-                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
-                    q2v_attn_list.append(q2v_avg_i)
-
-                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)  # (batch, current_n_vision)
-
-                # 提取当前的 vision hidden（使用 attention 计算之前的 hidden_normed）
-                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
-
-                # 调用 pruner 计算 mask
-                pruner = self.pruner_manager.get_pruner(layer_idx)
-                with torch.no_grad():
-                    hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
-
-                # 记录绝对保留数量（相对于原始 576 tokens）
-                n_kept_absolute = hard_mask[0].sum().int().item()
-                masks[layer_idx] = (hard_mask, n_kept_absolute)
-
-                # === 更新累积 vision mask ===
-                # 将当前层的 hard_mask 映射回原始 n_vision 维空间
-                # hard_mask 是相对于当前剩余 vision tokens 的 mask
-                # cumulative_vision_mask 是相对于原始 n_vision 个 token 的 mask
-                # [DEBUG] 取消注释
-                for i in range(batch_size):
-                    # 找到 cumulative_vision_mask 中为 1 的位置（当前剩余的 vision tokens）
-                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
-                    # 根据 hard_mask 更新这些位置
-                    for j, pos in enumerate(kept_positions):
-                        if j < hard_mask.shape[1]:
-                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
-
                 # === 物理删除被剪掉的 vision tokens ===
                 # 对于每个样本，根据 hard_mask 选择要保留的 tokens
                 new_hidden_states_list = []
@@ -930,6 +934,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # 注意：需要传入已经构建好的 past_key_values
         max_new_tokens = generate_kwargs.pop('max_new_tokens', 32)
 
+        # 获取 attention 配置（用于 decode 阶段）
+        first_layer = llm.layers[0]
+        if isinstance(first_layer, PrunableLlamaDecoderLayer):
+            first_layer = first_layer.original_layer
+        first_attn = first_layer.self_attn
+        num_heads = first_attn.config.num_attention_heads
+        num_kv_heads = first_attn.config.num_key_value_heads
+        head_dim = first_attn.head_dim
+        num_kv_groups = num_heads // num_kv_heads
+
         # 获取下一个 token
         next_token = logits.argmax(dim=-1)  # (batch, 1)
 
@@ -956,14 +970,67 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 else:
                     original_layer = decoder_layer
 
-                hidden_states = original_layer(
-                    hidden_states,
-                    position_ids=new_position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
+                # 获取 attention 模块
+                attn = original_layer.self_attn
+
+                # LayerNorm
+                hidden_normed = original_layer.input_layernorm(hidden_states)
+
+                # Q/K/V 投影
+                query_states_gen = attn.q_proj(hidden_normed)
+                key_states_gen = attn.k_proj(hidden_normed)
+                value_states_gen = attn.v_proj(hidden_normed)
+
+                # 保存 query_states_flat 用于 adapter
+                query_states_flat_gen = query_states_gen
+
+                # Reshape
+                query_states_gen = query_states_gen.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
+                key_states_gen = key_states_gen.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
+                value_states_gen = value_states_gen.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
+
+                # Apply RoPE
+                cos, sin = position_embeddings
+                query_states_gen, key_states_gen = apply_rotary_pos_emb(query_states_gen, key_states_gen, cos, sin)
+
+                # 更新 KV cache
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states_gen, value_states_gen = past_key_values.update(
+                    key_states_gen, value_states_gen, layer_idx, cache_kwargs
                 )
+
+                # Repeat KV for GQA
+                key_states_gen = repeat_kv(key_states_gen, num_kv_groups)
+                value_states_gen = repeat_kv(value_states_gen, num_kv_groups)
+
+                # 计算 attention
+                attn_weights_gen = torch.matmul(query_states_gen, key_states_gen.transpose(-2, -1)) * attn.scaling
+                attn_weights_gen = F.softmax(attn_weights_gen, dim=-1, dtype=torch.float32).to(dtype)
+
+                # 计算 attention output
+                attn_output_gen = torch.matmul(attn_weights_gen, value_states_gen)
+                attn_output_gen = attn_output_gen.transpose(1, 2).contiguous().reshape(batch_size, 1, hidden_size)
+
+                # 在剪枝层应用 Adapter（与训练一致）
+                if layer_idx in self.pruning_layers:
+                    adapter = self.adapter_manager.get_adapter(layer_idx)
+                    if adapter is not None:
+                        attn_output_gen = adapter(
+                            attn_output_gen,
+                            mask=cumulative_vision_mask,
+                            query=None  # [DEBUG] 注释掉 query，排查问题
+                        )
+
+                attn_output_gen = attn.o_proj(attn_output_gen)
+
+                # 残差连接
+                hidden_states = hidden_states + attn_output_gen
+
+                # MLP
+                residual = hidden_states
+                hidden_states = original_layer.post_attention_layernorm(hidden_states)
+                hidden_states = original_layer.mlp(hidden_states)
+                hidden_states = residual + hidden_states
 
             hidden_states = llm.norm(hidden_states)
             logits = self.base_model.lm_head(hidden_states)
