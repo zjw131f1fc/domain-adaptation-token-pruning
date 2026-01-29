@@ -701,11 +701,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             key_states = attn.k_proj(hidden_normed)
             value_states = attn.v_proj(hidden_normed)
 
-            # 保存 query_states_flat 用于 adapter（在 reshape 之前）
-            # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
-            # [DEBUG] 注释掉排查问题
-            query_states_flat = None  # query_states
-
             # Reshape
             query_states = query_states.view(batch_size, current_seq_len, num_heads, head_dim).transpose(1, 2)
             key_states = key_states.view(batch_size, current_seq_len, num_kv_heads, head_dim).transpose(1, 2)
@@ -790,7 +785,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     attn_output = adapter(
                         attn_output,
                         mask=cumulative_vision_mask,
-                        query=query_states_flat
+                        query=None
                     )
 
                 # Step 5: 更新累积 vision mask
@@ -981,9 +976,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 key_states_gen = attn.k_proj(hidden_normed)
                 value_states_gen = attn.v_proj(hidden_normed)
 
-                # 保存 query_states_flat 用于 adapter
-                query_states_flat_gen = query_states_gen
-
                 # Reshape
                 query_states_gen = query_states_gen.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
                 key_states_gen = key_states_gen.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
@@ -1018,7 +1010,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         attn_output_gen = adapter(
                             attn_output_gen,
                             mask=cumulative_vision_mask,
-                            query=None  # [DEBUG] 注释掉 query，排查问题
+                            query=None
                         )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)
