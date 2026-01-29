@@ -758,7 +758,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 # === 应用 mask 到 attention weights 并重新归一化（与训练时一致）===
                 # 构建完整的 mask：非 vision 部分为 1，vision 部分为 hard_mask
                 current_n_vision = current_vision_end - current_vision_start
-                mask_expanded = layer_hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+                # 确保 mask 的 dtype 与 attn_weights 一致
+                mask_expanded = layer_hard_mask.to(dtype).unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
                 ones_before = torch.ones(
                     batch_size, num_heads, current_seq_len, current_vision_start,
@@ -774,9 +775,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 # 应用 mask（非 inplace）
                 attn_weights = attn_weights * full_mask
 
-                # 重新归一化
+                # 重新归一化（使用与 dtype 匹配的 epsilon）
                 attn_sum = attn_weights.sum(dim=-1, keepdim=True)
                 attn_weights = attn_weights / (attn_sum + 1e-8)
+                attn_weights = attn_weights.to(dtype)  # 确保类型一致
 
             # 计算 attention output（使用可能被 mask 修改过的 weights）
             attn_output = torch.matmul(attn_weights, value_states_expanded)
