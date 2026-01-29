@@ -726,11 +726,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
-            # 计算 attention output
-            attn_output = torch.matmul(attn_weights, value_states_expanded)
-            attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
-
-            # === 剪枝层：先计算 hard_mask，再应用 Adapter 修正 ===
+            # === 剪枝层：先计算 hard_mask，再应用 mask 到 attention weights（与训练时一致）===
             layer_hard_mask = None
             if layer_idx in self.pruning_layers:
                 # 计算 question->vision attention（用于 pruner）
@@ -759,7 +755,35 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 with torch.no_grad():
                     layer_hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
 
-                # 应用 Adapter（传入 mask 和 query）
+                # === 应用 mask 到 attention weights 并重新归一化（与训练时一致）===
+                # 构建完整的 mask：非 vision 部分为 1，vision 部分为 hard_mask
+                current_n_vision = current_vision_end - current_vision_start
+                mask_expanded = layer_hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+
+                ones_before = torch.ones(
+                    batch_size, num_heads, current_seq_len, current_vision_start,
+                    device=device, dtype=dtype
+                )
+                ones_after = torch.ones(
+                    batch_size, num_heads, current_seq_len, current_seq_len - current_vision_end,
+                    device=device, dtype=dtype
+                )
+                mask_vision = mask_expanded.expand(-1, num_heads, current_seq_len, -1)
+                full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
+
+                # 应用 mask（非 inplace）
+                attn_weights = attn_weights * full_mask
+
+                # 重新归一化
+                attn_sum = attn_weights.sum(dim=-1, keepdim=True)
+                attn_weights = attn_weights / (attn_sum + 1e-8)
+
+            # 计算 attention output（使用可能被 mask 修改过的 weights）
+            attn_output = torch.matmul(attn_weights, value_states_expanded)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+
+            # === 剪枝层：应用 Adapter 修正 ===
+            if layer_idx in self.pruning_layers and layer_hard_mask is not None:
                 adapter = self.adapter_manager.get_adapter(layer_idx)
                 if adapter is not None:
                     # 构建完整的 mask（需要 pad 到原始 n_vision 大小）
