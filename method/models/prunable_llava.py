@@ -730,11 +730,61 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             attn_output = torch.matmul(attn_weights, value_states_expanded)
             attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-            # === 剪枝层应用 Adapter 修正 ===
+            # === 剪枝层：先计算 hard_mask，再应用 Adapter 修正 ===
+            layer_hard_mask = None
             if layer_idx in self.pruning_layers:
+                # 计算 question->vision attention（用于 pruner）
+                q2v_attn_list = []
+                for i in range(batch_size):
+                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
+                    current_q_start = None
+                    current_q_end = None
+                    for new_idx, orig_idx in enumerate(kept_indices[i]):
+                        if orig_idx == orig_q_start and current_q_start is None:
+                            current_q_start = new_idx
+                        if orig_idx == orig_q_end - 1:
+                            current_q_end = new_idx + 1
+                    if current_q_start is None:
+                        current_q_start = current_vision_end
+                    if current_q_end is None:
+                        current_q_end = current_seq_len
+                    q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
+                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
+                    q2v_attn_list.append(q2v_avg_i)
+                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
+
+                # 提取 vision hidden 并计算 hard_mask
+                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
+                pruner = self.pruner_manager.get_pruner(layer_idx)
+                with torch.no_grad():
+                    layer_hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+
+                # 应用 Adapter（传入 mask 和 query）
                 adapter = self.adapter_manager.get_adapter(layer_idx)
                 if adapter is not None:
-                    attn_output = adapter(attn_output)
+                    # 构建完整的 mask（需要 pad 到原始 n_vision 大小）
+                    # layer_hard_mask: (batch, current_n_vision)
+                    # adapter 期望的 mask: (batch, original_n_vision=576)
+                    original_n_vision = 576
+                    current_n_vision = layer_hard_mask.shape[1]
+                    if current_n_vision < original_n_vision:
+                        # Pad mask to original size（被之前层剪掉的 token 对应位置为 0）
+                        padded_mask = torch.zeros(batch_size, original_n_vision, device=device, dtype=layer_hard_mask.dtype)
+                        # 需要根据 kept_indices 映射回原始位置
+                        for i in range(batch_size):
+                            vision_kept = kept_indices[i][current_vision_start:current_vision_end]
+                            for j, orig_idx in enumerate(vision_kept):
+                                # orig_idx 是原始序列中的位置，需要转换为 vision token 的索引
+                                vision_idx = orig_idx - vision_start  # vision_start 是原始的 vision 起始位置
+                                if 0 <= vision_idx < original_n_vision:
+                                    padded_mask[i, vision_idx] = layer_hard_mask[i, j]
+                        adapter_mask = padded_mask
+                    else:
+                        adapter_mask = layer_hard_mask
+
+                    # query: 使用当前层的 query states
+                    query_for_adapter = query_states.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+                    attn_output = adapter(attn_output, mask=adapter_mask, query=query_for_adapter)
 
             attn_output = attn.o_proj(attn_output)
 
@@ -747,43 +797,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             hidden_states = original_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-            # === 在剪枝层进行硬剪枝 ===
-            if layer_idx in self.pruning_layers:
-                # 计算 question->vision attention
-                q2v_attn_list = []
-                for i in range(batch_size):
-                    # 找到当前 question 在缩短后序列中的位置
-                    # question_starts[i] 是原始位置，需要映射到当前位置
-                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
-
-                    # 找到当前 kept_indices 中 question 的位置
-                    current_q_start = None
-                    current_q_end = None
-                    for new_idx, orig_idx in enumerate(kept_indices[i]):
-                        if orig_idx == orig_q_start and current_q_start is None:
-                            current_q_start = new_idx
-                        if orig_idx == orig_q_end - 1:
-                            current_q_end = new_idx + 1
-
-                    if current_q_start is None:
-                        current_q_start = current_vision_end
-                    if current_q_end is None:
-                        current_q_end = current_seq_len
-
-                    # 提取 question->vision attention
-                    q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
-                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
-                    q2v_attn_list.append(q2v_avg_i)
-
-                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)  # (batch, current_n_vision)
-
-                # 提取当前的 vision hidden（使用 attention 计算之前的 hidden_normed）
-                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
-
-                # 调用 pruner 计算 mask
-                pruner = self.pruner_manager.get_pruner(layer_idx)
-                with torch.no_grad():
-                    hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+            # === 在剪枝层进行硬剪枝（使用前面已计算的 layer_hard_mask）===
+            if layer_idx in self.pruning_layers and layer_hard_mask is not None:
+                hard_mask = layer_hard_mask
 
                 # 记录绝对保留数量（相对于原始 576 tokens）
                 n_kept_absolute = hard_mask[0].sum().int().item()
