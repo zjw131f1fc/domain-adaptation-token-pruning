@@ -598,6 +598,7 @@ def evaluate(
     distributed: bool = False,
     aggregate_judge=None,
     requires_aggregate_eval: bool = False,
+    dynamic_topk_ks: Optional[Dict[int, int]] = None,
 ) -> Dict[str, float]:
     """评估模型
 
@@ -605,6 +606,7 @@ def evaluate(
         distributed: 是否使用分布式评估（所有 rank 参与）
         aggregate_judge: 聚合评估函数（用于 MME/GQA 等需要全量评估的数据集）
         requires_aggregate_eval: 是否需要聚合评估
+        dynamic_topk_ks: 动态计算的 topk_ks（优先于配置文件中的值）
     """
     model.eval()
 
@@ -617,8 +619,12 @@ def evaluate(
     max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
 
     if inference_mode == 'topk':
-        topk_ks_raw = method_cfg.get('pruner_topk_ks', {})
-        topk_ks = {int(k): int(v) for k, v in topk_ks_raw.items()} if topk_ks_raw else {}
+        # 优先使用动态计算的 topk_ks
+        if dynamic_topk_ks:
+            topk_ks = dynamic_topk_ks
+        else:
+            topk_ks_raw = method_cfg.get('pruner_topk_ks', {})
+            topk_ks = {int(k): int(v) for k, v in topk_ks_raw.items()} if topk_ks_raw else {}
         if topk_ks:
             model.pruner_manager.set_topk_ks(topk_ks)
 
@@ -1175,14 +1181,23 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         if is_main_process():
                             logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited ({reinit_reason})")
 
-            # 统计每层保留的 token 数量（用于训练结束后推荐 topk_ks）
+            # 统计每层的累积保留 token 数量（用于 topk 推理）
+            # 注意：需要统计累积保留数量，而不是每层独立的保留数量
+            # 因为推理时是物理删除，L10 的输入是 L1 剩余的 tokens
             if result['pruning_infos']:
-                for layer_idx, info in result['pruning_infos'].items():
+                sorted_layers = sorted(result['pruning_infos'].keys())
+                cumulative_mask = None
+                for layer_idx in sorted_layers:
+                    info = result['pruning_infos'][layer_idx]
                     if 'hard_mask' in info:
-                        # hard_mask: (batch, n_vision), 计算每个样本保留的 token 数量
-                        hard_mask = info['hard_mask']
-                        n_kept_per_sample = hard_mask.sum(dim=-1)  # (batch,)
-                        layer_kept_counts[layer_idx].extend(n_kept_per_sample.tolist())
+                        hard_mask = info['hard_mask'].float()  # (batch, n_vision)
+                        if cumulative_mask is None:
+                            cumulative_mask = hard_mask
+                        else:
+                            cumulative_mask = cumulative_mask * hard_mask
+                        # 统计累积保留数量
+                        n_kept_cumulative = cumulative_mask.sum(dim=-1)  # (batch,)
+                        layer_kept_counts[layer_idx].extend(n_kept_cumulative.tolist())
 
             # 累计统计
             for k, v in losses.items():
@@ -1232,6 +1247,32 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info(f"Evaluating at step {global_step}...")
 
+                # === 动态计算 topk_ks（基于训练统计）===
+                inference_mode = method_cfg.get('pruner_inference_mode', 'threshold')
+                dynamic_topk_ks = {}
+                if inference_mode == 'topk' and any(len(counts) > 0 for counts in layer_kept_counts.values()):
+                    # 分布式聚合当前的统计数据
+                    if dist.is_initialized():
+                        all_kept_counts = [None] * dist.get_world_size()
+                        dist.all_gather_object(all_kept_counts, layer_kept_counts)
+                        merged_counts = {idx: [] for idx in pruning_layers}
+                        for counts_dict in all_kept_counts:
+                            for layer_idx, counts in counts_dict.items():
+                                merged_counts[layer_idx].extend(counts)
+                    else:
+                        merged_counts = layer_kept_counts
+
+                    # 计算每层的平均保留数量
+                    for layer_idx in pruning_layers:
+                        counts = merged_counts[layer_idx]
+                        if counts:
+                            mean_kept = sum(counts) / len(counts)
+                            dynamic_topk_ks[layer_idx] = int(round(mean_kept))
+
+                    if dynamic_topk_ks and is_main_process():
+                        topk_str = ", ".join(f"L{k}={v}" for k, v in sorted(dynamic_topk_ks.items()))
+                        logger.info(f"  Using dynamic topk_ks: [{topk_str}]")
+
                 eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
                 for eval_mode in eval_modes:
                     if eval_mode == 'origin':
@@ -1254,7 +1295,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             model, processor, test_dataset, judge, config, device,
                             max_samples=eval_max_samples,
                             mode=eval_mode,
-                            distributed=True
+                            distributed=True,
+                            dynamic_topk_ks=dynamic_topk_ks if dynamic_topk_ks else None,
                         )
                         if is_main_process():
                             logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%}")
@@ -1320,12 +1362,21 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 merged_kept_counts[layer_idx].extend(counts)
         layer_kept_counts = merged_kept_counts
 
+    # 计算推荐的 topk_ks（所有进程都需要计算，用于最终评估）
+    recommended_topk_ks = {}
+    if any(len(counts) > 0 for counts in layer_kept_counts.values()):
+        for layer_idx in pruning_layers:
+            counts = layer_kept_counts[layer_idx]
+            if counts:
+                mean_kept = sum(counts) / len(counts)
+                recommended_topk_ks[layer_idx] = int(round(mean_kept))
+
     # 输出推荐的 topk_ks（只在主进程）
-    if is_main_process() and any(len(counts) > 0 for counts in layer_kept_counts.values()):
+    if is_main_process() and recommended_topk_ks:
         logger.info("=" * 60)
         logger.info("Training Statistics - Recommended topk_ks for inference:")
+        logger.info("(Cumulative kept counts: L1 -> L1*L10 -> L1*L10*L20)")
         logger.info("=" * 60)
-        recommended_topk_ks = {}
         for layer_idx in pruning_layers:
             counts = layer_kept_counts[layer_idx]
             if counts:
@@ -1333,8 +1384,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 std_kept = (sum((x - mean_kept) ** 2 for x in counts) / len(counts)) ** 0.5
                 min_kept = min(counts)
                 max_kept = max(counts)
-                recommended_k = int(round(mean_kept))
-                recommended_topk_ks[layer_idx] = recommended_k
+                recommended_k = recommended_topk_ks[layer_idx]
                 logger.info(f"  Layer {layer_idx}: mean={mean_kept:.1f}, std={std_kept:.1f}, "
                            f"min={min_kept:.0f}, max={max_kept:.0f} -> recommended k={recommended_k}")
         logger.info("")
@@ -1347,6 +1397,13 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     if test_dataset:
         if is_main_process():
             logger.info("Final evaluation...")
+
+        # 使用训练统计的 recommended_topk_ks 进行最终评估
+        final_topk_ks = recommended_topk_ks if recommended_topk_ks else None
+        if final_topk_ks and is_main_process():
+            topk_str = ", ".join(f"L{k}={v}" for k, v in sorted(final_topk_ks.items()))
+            logger.info(f"Using final topk_ks: [{topk_str}]")
+
         eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
         for eval_mode in eval_modes:
             if eval_mode == 'origin' and cached_origin_result is not None:
@@ -1358,7 +1415,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     model, processor, test_dataset, judge, config, device,
                     max_samples=eval_max_samples,
                     mode=eval_mode,
-                    distributed=True
+                    distributed=True,
+                    dynamic_topk_ks=final_topk_ks,
                 )
                 if is_main_process():
                     logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
