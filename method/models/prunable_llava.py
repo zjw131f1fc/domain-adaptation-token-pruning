@@ -664,6 +664,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # kept_indices[i] = 原始序列中被保留的 token 索引列表
         kept_indices = [list(range(seq_len)) for _ in range(batch_size)]
 
+        # 累积 vision mask（相对于原始 n_vision 个 token，用于 adapter）
+        # 与训练时保持一致：adapter 接收的 mask 始终是原始 n_vision 维
+        # [DEBUG] 取消注释
+        cumulative_vision_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
+
         for layer_idx, decoder_layer in enumerate(llm.layers):
             # 获取原始层
             if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
@@ -695,6 +700,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             query_states = attn.q_proj(hidden_normed)
             key_states = attn.k_proj(hidden_normed)
             value_states = attn.v_proj(hidden_normed)
+
+            # 保存 query_states_flat 用于 adapter（在 reshape 之前）
+            # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
+            # [DEBUG] 注释掉 - 导致准确率下降
+            query_states_flat = None  # query_states
 
             # Reshape
             query_states = query_states.view(batch_size, current_seq_len, num_heads, head_dim).transpose(1, 2)
@@ -734,7 +744,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             if layer_idx in self.pruning_layers:
                 adapter = self.adapter_manager.get_adapter(layer_idx)
                 if adapter is not None:
-                    attn_output = adapter(attn_output)
+                    # 与训练时保持一致：传入 cumulative_vision_mask 和 query_states_flat
+                    # [DEBUG] 注释掉以排查问题
+                    attn_output = adapter(
+                        attn_output,
+                        mask=cumulative_vision_mask,  # None
+                        query=query_states_flat  # None
+                    )
 
             attn_output = attn.o_proj(attn_output)
 
@@ -788,6 +804,19 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 # 记录绝对保留数量（相对于原始 576 tokens）
                 n_kept_absolute = hard_mask[0].sum().int().item()
                 masks[layer_idx] = (hard_mask, n_kept_absolute)
+
+                # === 更新累积 vision mask ===
+                # 将当前层的 hard_mask 映射回原始 n_vision 维空间
+                # hard_mask 是相对于当前剩余 vision tokens 的 mask
+                # cumulative_vision_mask 是相对于原始 n_vision 个 token 的 mask
+                # [DEBUG] 取消注释
+                for i in range(batch_size):
+                    # 找到 cumulative_vision_mask 中为 1 的位置（当前剩余的 vision tokens）
+                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                    # 根据 hard_mask 更新这些位置
+                    for j, pos in enumerate(kept_positions):
+                        if j < hard_mask.shape[1]:
+                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
 
                 # === 物理删除被剪掉的 vision tokens ===
                 # 对于每个样本，根据 hard_mask 选择要保留的 tokens
