@@ -38,16 +38,21 @@ class LightweightAdapter(nn.Module):
         hidden_size: int,
         bottleneck_dim: int = 512,
         n_vision: int = 576,
+        dropout: float = 0.15,
         **kwargs
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.bottleneck_dim = bottleneck_dim
 
+        # Dropout 防止过拟合
+        self.dropout = nn.Dropout(dropout)
+
         # Mask encoder: 编码哪些 token 被剪掉
         self.mask_encoder = nn.Sequential(
             nn.Linear(n_vision, bottleneck_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(bottleneck_dim, bottleneck_dim)
         )
 
@@ -86,6 +91,7 @@ class LightweightAdapter(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         query: Optional[torch.Tensor] = None,
+        debug: bool = False,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -93,8 +99,15 @@ class LightweightAdapter(nn.Module):
             x: (batch, seq, hidden_size) - attention output
             mask: (batch, n_vision) - pruning mask (1=keep, 0=prune)
             query: (batch, seq, hidden_size) - attention query states
+            debug: 是否打印调试信息
         """
-        h = self.act(self.down(x))  # (batch, seq, bottleneck)
+        if debug:
+            print(f"[Adapter] x.shape: {x.shape}")
+            print(f"[Adapter] mask: {mask.shape if mask is not None else None}, sum: {mask.sum().item() if mask is not None else None}")
+            print(f"[Adapter] query: {query.shape if query is not None else None}")
+            print(f"[Adapter] training: {self.training}")
+
+        h = self.dropout(self.act(self.down(x)))  # (batch, seq, bottleneck)
 
         # 构建 condition
         condition = torch.zeros_like(h)  # (batch, seq, bottleneck)
@@ -103,14 +116,15 @@ class LightweightAdapter(nn.Module):
             mask_emb = self.mask_encoder(mask.to(dtype=x.dtype))  # (batch, bottleneck)
             condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
-        if query is not None:
-            query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
-            condition = condition + query_emb
+        # if query is not None:
+        #     query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
+        #     condition = condition + query_emb
 
         # FiLM modulation
         gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)
         beta = self.beta_net(condition)
         h = gamma * h + beta
+        h = self.dropout(h)  # Dropout after FiLM
 
         return x + self.up(h)
 
@@ -125,6 +139,7 @@ class AdapterManager(nn.Module):
         bottleneck_dim: int = 512,
         adapter_type: str = 'lightweight',
         n_vision: int = 576,
+        dropout: float = 0.15,
         **kwargs
     ):
         super().__init__()
@@ -140,7 +155,8 @@ class AdapterManager(nn.Module):
             str(idx): adapter_cls(
                 hidden_size=hidden_size,
                 bottleneck_dim=bottleneck_dim,
-                n_vision=n_vision
+                n_vision=n_vision,
+                dropout=dropout
             )
             for idx in layer_indices
         })
