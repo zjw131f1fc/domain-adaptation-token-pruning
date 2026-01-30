@@ -13,12 +13,12 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: /data/users/zjw/projects/domain-adaptation-token-pruning/outputs/checkpoints/checkpoint_step26000.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 2
+    batch_size: 8
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -32,7 +32,7 @@ trainer_settings:
         lr: 2.0e-04
     print_loss_every_batches: 50  # 隔多久打印一次损失
     eval_every_batches: 2000  # 隔多久评估一次
-    eval_max_samples: 2000 # 每次评估使用多少数据
+    eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
@@ -40,7 +40,7 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: "all"
-    test: 2000
+    test: "all"
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -137,7 +137,7 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin"]
+  eval_mode: ["hard"]
 
   # 网格搜索配置（用于搜索最优阈值）
   grid_search:

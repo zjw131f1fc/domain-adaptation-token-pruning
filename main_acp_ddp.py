@@ -648,7 +648,7 @@ def evaluate(
 
     # 中间统计日志间隔（按全局步数计算）
     # 确保 local_log_interval 不超过每卡实际处理的样本数，否则日志永不触发
-    log_interval = 500
+    log_interval = 200
     local_samples = len(local_indices)
     if distributed and dist.is_initialized():
         world_size = dist.get_world_size()
