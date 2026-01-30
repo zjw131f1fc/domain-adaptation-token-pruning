@@ -784,7 +784,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
                 attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-                # Step 4: 应用 Adapter（与训练一致：处理剪枝后的 attention output）
+                # Step 4: 更新累积 vision mask（移到 Adapter 之前，确保 Adapter 看到当前层的剪枝决策）
+                for i in range(batch_size):
+                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                    for j, pos in enumerate(kept_positions):
+                        if j < hard_mask.shape[1]:
+                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
+
+                # Step 5: 应用 Adapter（与训练一致：处理剪枝后的 attention output）
                 adapter = self.adapter_manager.get_adapter(layer_idx)
                 if adapter is not None:
                     attn_output = adapter(
@@ -792,13 +799,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         mask=cumulative_vision_mask,
                         query=query_states_flat
                     )
-
-                # Step 5: 更新累积 vision mask
-                for i in range(batch_size):
-                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
-                    for j, pos in enumerate(kept_positions):
-                        if j < hard_mask.shape[1]:
-                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
 
                 # 记录 mask 用于统计
                 n_kept_absolute = hard_mask[0].sum().int().item()
