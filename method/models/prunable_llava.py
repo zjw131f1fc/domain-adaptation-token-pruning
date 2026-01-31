@@ -233,9 +233,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 vision_feature_layer=vision_feature_layer,
                 vision_feature_select_strategy=vision_feature_select_strategy,
             )
-            image_features = torch.cat(image_features, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor
+            if isinstance(image_features, (list, tuple)):
+                image_features = torch.cat(image_features, dim=0)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             special_image_mask = model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
             )
@@ -623,9 +624,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 vision_feature_layer=vision_feature_layer,
                 vision_feature_select_strategy=vision_feature_select_strategy,
             )
-            image_features = torch.cat(image_features, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor
+            if isinstance(image_features, (list, tuple)):
+                image_features = torch.cat(image_features, dim=0)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             special_image_mask = model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
             )
@@ -706,8 +708,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # 保存 query_states_flat 用于 adapter（在 reshape 之前）
             # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
-            # [DEBUG] 注释掉排查问题
-            query_states_flat = None  # query_states
+            query_states_flat = query_states
 
             # Reshape
             query_states = query_states.view(batch_size, current_seq_len, num_heads, head_dim).transpose(1, 2)
@@ -1033,7 +1034,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         attn_output_gen = adapter(
                             attn_output_gen,
                             mask=padded_mask,
-                            query=None  # [DEBUG] 注释掉 query，排查问题
+                            query=query_states_flat_gen  # Decode 阶段的 query
                         )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)

@@ -31,7 +31,7 @@ trainer_settings:
         type: "adam"
         lr: 2.0e-04
     print_loss_every_batches: 50  # 隔多久打印一次损失
-    eval_every_batches: 2000  # 隔多久评估一次
+    eval_every_batches: 200  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
