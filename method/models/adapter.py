@@ -104,7 +104,12 @@ class LightweightAdapter(nn.Module):
             condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
         if query is not None:
-            query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
+            # 训练时：用同分布噪声代替 query，让 adapter 不依赖具体的 query 值
+            if self.training:
+                query_noise = torch.randn_like(query) * query.std() + query.mean()
+                query_emb = self.query_proj(query_noise)
+            else:
+                query_emb = self.query_proj(query)
             condition = condition + query_emb
 
         # FiLM modulation
