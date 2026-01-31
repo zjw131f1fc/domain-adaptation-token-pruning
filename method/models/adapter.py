@@ -116,9 +116,9 @@ class LightweightAdapter(nn.Module):
             mask_emb = self.mask_encoder(mask.to(dtype=x.dtype))  # (batch, bottleneck)
             condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
-        # if query is not None:
-        #     query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
-        #     condition = condition + query_emb
+        if query is not None:
+            query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
+            condition = condition + query_emb
 
         # FiLM modulation
         gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)

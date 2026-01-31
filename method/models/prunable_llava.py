@@ -536,7 +536,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # 获取该层的 mask 信息
             mask_info = masks[layer_idx]
             if isinstance(mask_info, tuple):
-                hard_mask, n_kept_absolute = mask_info
+                if len(mask_info) == 3:
+                    hard_mask, n_kept_absolute, _ = mask_info  # 新格式：包含 padded_mask
+                else:
+                    hard_mask, n_kept_absolute = mask_info  # 旧格式
             else:
                 # 兼容旧格式：只有 hard_mask
                 hard_mask = mask_info
@@ -784,25 +787,35 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
                 attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-                # Step 4: 更新累积 vision mask（移到 Adapter 之前，确保 Adapter 看到当前层的剪枝决策）
+                # Step 4: 将当前层的 hard_mask pad 到原始 n_vision 维度（与训练时一致）
+                # hard_mask: (batch, current_n_vision) -> (batch, n_vision)
+                current_n_vision = hard_mask.shape[1]
+                if current_n_vision < n_vision:
+                    # pad 0 到右边
+                    padded_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
+                    padded_mask[:, :current_n_vision] = hard_mask
+                else:
+                    padded_mask = hard_mask
+
+                # Step 5: 应用 Adapter（使用当前层的 mask，与训练一致）
+                adapter = self.adapter_manager.get_adapter(layer_idx)
+                if adapter is not None:
+                    attn_output = adapter(
+                        attn_output,
+                        mask=padded_mask,
+                        query=query_states_flat
+                    )
+
+                # Step 6: 更新累积 vision mask（用于后续层的物理删除）
                 for i in range(batch_size):
                     kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
                     for j, pos in enumerate(kept_positions):
                         if j < hard_mask.shape[1]:
                             cumulative_vision_mask[i, pos] = hard_mask[i, j]
 
-                # Step 5: 应用 Adapter（与训练一致：处理剪枝后的 attention output）
-                adapter = self.adapter_manager.get_adapter(layer_idx)
-                if adapter is not None:
-                    attn_output = adapter(
-                        attn_output,
-                        mask=cumulative_vision_mask,
-                        query=query_states_flat
-                    )
-
-                # 记录 mask 用于统计
+                # 记录 mask 用于统计（同时保存 padded_mask 供 Generate 阶段使用）
                 n_kept_absolute = hard_mask[0].sum().int().item()
-                masks[layer_idx] = (hard_mask, n_kept_absolute)
+                masks[layer_idx] = (hard_mask, n_kept_absolute, padded_mask)
 
             else:
                 # 非剪枝层：正常计算 attention output
@@ -1011,13 +1024,15 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 attn_output_gen = torch.matmul(attn_weights_gen, value_states_gen)
                 attn_output_gen = attn_output_gen.transpose(1, 2).contiguous().reshape(batch_size, 1, hidden_size)
 
-                # 在剪枝层应用 Adapter（与训练一致）
+                # 在剪枝层应用 Adapter（使用 Prefill 阶段保存的 padded_mask）
                 if layer_idx in self.pruning_layers:
                     adapter = self.adapter_manager.get_adapter(layer_idx)
                     if adapter is not None:
+                        # 从 masks 中获取 padded_mask
+                        _, _, padded_mask = masks[layer_idx]
                         attn_output_gen = adapter(
                             attn_output_gen,
-                            mask=cumulative_vision_mask,
+                            mask=padded_mask,
                             query=None  # [DEBUG] 注释掉 query，排查问题
                         )
 
