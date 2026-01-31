@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: /data/users/zjw/projects/domain-adaptation-token-pruning/outputs/checkpoints/checkpoint_step26000.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:

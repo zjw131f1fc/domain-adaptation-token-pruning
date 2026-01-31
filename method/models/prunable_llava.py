@@ -708,7 +708,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # 保存 query_states_flat 用于 adapter（在 reshape 之前）
             # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
-            query_states_flat = query_states
+            # 推理时禁用 query，只使用 mask
+            query_states_flat = None
 
             # Reshape
             query_states = query_states.view(batch_size, current_seq_len, num_heads, head_dim).transpose(1, 2)
@@ -1034,7 +1035,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         attn_output_gen = adapter(
                             attn_output_gen,
                             mask=padded_mask,
-                            query=query_states_flat_gen  # Decode 阶段的 query
+                            query=None  # 推理时禁用 query
                         )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)
