@@ -288,55 +288,54 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 使用 LayerNorm 后的 hidden states
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]  # (batch, n_vision, hidden_size)
 
-        # === 根据累积 mask 过滤 pruner 输入（模拟推理时的物理删除）===
+        # === 根据累积 mask 物理删除被剪掉的 tokens（模拟推理）===
+        # 这样 pruner 的输入维度和推理时完全一致
         if cumulative_vision_mask is not None:
             # cumulative_vision_mask: (batch, n_vision), 1=keep, 0=pruned
-            # 只把"逻辑上保留"的 tokens 传给 pruner
-            # 为了保持可导性，用 mask 乘以 hidden/attn，被剪掉的位置变成 0
-            # 然后 pruner 对这些位置的输出无关紧要（因为后面会用累积 mask 再过滤一次）
-            vision_hidden_masked = vision_hidden * cumulative_vision_mask.unsqueeze(-1)
-            q2v_attn_masked = q2v_attn_avg * cumulative_vision_mask
+            # 提取 kept 位置的 indices（假设 batch 内 mask 相同，用第一个样本）
+            kept_indices = cumulative_vision_mask[0].nonzero(as_tuple=True)[0]  # (n_kept,)
+            n_kept = len(kept_indices)
+
+            # 物理提取 kept 位置的 hidden 和 q2v_attn
+            vision_hidden_compact = vision_hidden[:, kept_indices, :]  # (batch, n_kept, hidden_size)
+            q2v_attn_compact = q2v_attn_avg[:, kept_indices]  # (batch, n_kept)
+
             # DEBUG: 打印 pruner 输入的统计信息
             print(f"\n[Pruner Input DEBUG - Layer {self.layer_idx}]")
             print(f"  cumulative_vision_mask.sum: {cumulative_vision_mask.sum().item()}")
-            print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
-            print(f"  vision_hidden_masked.mean: {vision_hidden_masked.mean().item():.6f}")
-            # q2v_attn_avg 已经通过 attn_weights_for_q2v 应用了 cumulative penalty
-            # 所以被剪掉的位置已经是 ~0，不需要再乘 mask
-            n_kept = cumulative_vision_mask.sum().item()
-            q2v_kept_mean = q2v_attn_avg.sum().item() / n_kept if n_kept > 0 else 0
-            print(f"  q2v_attn_avg.sum: {q2v_attn_avg.sum().item():.6f}")
-            print(f"  q2v_attn_avg (kept positions mean): {q2v_kept_mean:.6f}")
+            print(f"  n_kept (compact): {n_kept}")
+            print(f"  vision_hidden_compact.shape: {vision_hidden_compact.shape}")
+            print(f"  vision_hidden_compact.mean: {vision_hidden_compact.mean().item():.6f}")
+            print(f"  q2v_attn_compact.shape: {q2v_attn_compact.shape}")
+            print(f"  q2v_attn_compact.mean: {q2v_attn_compact.mean().item():.6f}")
         else:
-            vision_hidden_masked = vision_hidden
-            q2v_attn_masked = q2v_attn_avg
+            vision_hidden_compact = vision_hidden
+            q2v_attn_compact = q2v_attn_avg
+            kept_indices = None
+            n_kept = n_vision
             print(f"\n[Pruner Input DEBUG - Layer {self.layer_idx}]")
             print(f"  cumulative_vision_mask: None (first pruning layer)")
+            print(f"  vision_hidden.shape: {vision_hidden.shape}")
             print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
             print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
 
-        # Pruner 生成 mask（新接口：传入 vision_hidden, q2v_attn, key_padding_mask）
-        # key_padding_mask: True 表示该位置被 mask（不参与 cross-attention 计算）
-        if cumulative_vision_mask is not None:
-            # cumulative_vision_mask: 1=keep, 0=pruned
-            # key_padding_mask: True=mask, False=keep（相反）
-            key_padding_mask = (cumulative_vision_mask == 0)
-        else:
-            key_padding_mask = None
-        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden_masked, q2v_attn_masked, key_padding_mask)
-        # hard_mask: (batch, n_vision), 0/1
+        # Pruner 生成 mask（输入是 compact 的，输出也是 compact 的）
+        # 不再需要 key_padding_mask，因为已经物理删除了
+        hard_mask_compact, pruner_info = self.pruner.forward_full(vision_hidden_compact, q2v_attn_compact)
+        # hard_mask_compact: (batch, n_kept), 0/1
 
         # DEBUG: 打印 pruner 输出
-        print(f"  hard_mask (before cumulative).sum: {hard_mask.sum().item()}")
+        print(f"  hard_mask_compact.shape: {hard_mask_compact.shape}")
+        print(f"  hard_mask_compact.sum: {hard_mask_compact.sum().item()}")
 
-        # === 与累积 mask 结合：只有之前保留的 token 才能被当前层保留 ===
-        if cumulative_vision_mask is not None:
-            # 当前层只能在"之前保留"的 tokens 中选择
-            # hard_mask = hard_mask * cumulative_vision_mask 会导致：
-            # - 之前被剪掉的 token：无论当前层如何决定，最终都是 0
-            # - 之前保留的 token：由当前层决定
-            hard_mask = hard_mask * cumulative_vision_mask
-            print(f"  hard_mask (after cumulative).sum: {hard_mask.sum().item()}")
+        # === 把 compact 的 hard_mask scatter 回原始 n_vision 维度 ===
+        if kept_indices is not None:
+            # 创建全 0 的 mask，然后把 compact mask 填入 kept 位置
+            hard_mask = torch.zeros(batch_size, n_vision, device=hard_mask_compact.device, dtype=hard_mask_compact.dtype)
+            hard_mask[:, kept_indices] = hard_mask_compact
+            print(f"  hard_mask (scattered back).sum: {hard_mask.sum().item()}")
+        else:
+            hard_mask = hard_mask_compact
 
         # === Step 4: 计算 h_real 和 h_fake ===
         # h_real: 用完整 attention 聚合
