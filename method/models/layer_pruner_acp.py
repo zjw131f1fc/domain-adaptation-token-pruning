@@ -103,7 +103,6 @@ class CrossAttentionPruner(nn.Module):
         self,
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
         return_components: bool = False
     ) -> torch.Tensor:
         """计算 keep logits
@@ -114,7 +113,6 @@ class CrossAttentionPruner(nn.Module):
         参数:
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - LLM 的 question→vision attention 权重（作为 baseline）
-            key_padding_mask: (batch, n_vision) - True 表示该位置被 mask（不参与计算）
             return_components: 是否返回中间结果
 
         返回:
@@ -126,27 +124,14 @@ class CrossAttentionPruner(nn.Module):
         if q2v_attn is not None:
             # 将 attention 转换为 logit 空间（log 变换 + 中心化）
             baseline_raw = torch.log(q2v_attn.clamp(min=1e-6))
-            # 中心化：只对 kept 位置计算 mean（避免 masked 位置的 -inf 影响）
-            if key_padding_mask is not None:
-                kept_mask = (~key_padding_mask).to(baseline_raw.dtype)  # 转换为与 baseline 相同的 dtype
-                n_kept = kept_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-                baseline_mean = (baseline_raw * kept_mask).sum(dim=-1, keepdim=True) / n_kept
-            else:
-                baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
+            baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
             baseline = baseline_raw - baseline_mean
 
             # DEBUG: 打印 baseline 计算细节
             print(f"\n[Baseline DEBUG]")
             print(f"  q2v_attn - shape: {q2v_attn.shape}, sum: {q2v_attn.sum().item():.6f}")
-            if key_padding_mask is not None:
-                kept_indices = (~key_padding_mask[0]).nonzero(as_tuple=True)[0]
-                q2v_kept = q2v_attn[0, kept_indices]
-                baseline_raw_kept = baseline_raw[0, kept_indices]
-                print(f"  q2v_attn[kept] - count: {len(kept_indices)}, mean: {q2v_kept.mean().item():.6f}, min: {q2v_kept.min().item():.6f}, max: {q2v_kept.max().item():.6f}")
-                print(f"  baseline_raw[kept] - mean: {baseline_raw_kept.mean().item():.4f}, min: {baseline_raw_kept.min().item():.4f}, max: {baseline_raw_kept.max().item():.4f}")
-            else:
-                print(f"  q2v_attn - mean: {q2v_attn.mean().item():.6f}, min: {q2v_attn.min().item():.6f}, max: {q2v_attn.max().item():.6f}")
-                print(f"  baseline_raw - mean: {baseline_raw.mean().item():.4f}, min: {baseline_raw.min().item():.4f}, max: {baseline_raw.max().item():.4f}")
+            print(f"  q2v_attn - mean: {q2v_attn.mean().item():.6f}, min: {q2v_attn.min().item():.6f}, max: {q2v_attn.max().item():.6f}")
+            print(f"  baseline_raw - mean: {baseline_raw.mean().item():.4f}, min: {baseline_raw.min().item():.4f}, max: {baseline_raw.max().item():.4f}")
             print(f"  baseline_mean: {baseline_mean.item():.4f}")
         else:
             baseline = torch.zeros(batch_size, n_vision, device=vision_hidden.device)
@@ -164,7 +149,6 @@ class CrossAttentionPruner(nn.Module):
             query=queries,
             key=v,
             value=v,
-            key_padding_mask=key_padding_mask,  # 传入 mask
             need_weights=True,
             average_attn_weights=True  # 对 heads 取平均
         )
@@ -194,20 +178,6 @@ class CrossAttentionPruner(nn.Module):
         print(f"  delta - mean: {delta.mean().item():.4f}, min: {delta.min().item():.4f}, max: {delta.max().item():.4f}")
         print(f"  keep_bias: {self.keep_bias.item():.4f}")
         print(f"  keep_logits - mean: {keep_logits.mean().item():.4f}, min: {keep_logits.min().item():.4f}, max: {keep_logits.max().item():.4f}")
-        if key_padding_mask is not None:
-            n_masked = key_padding_mask.sum().item()
-            n_kept = n_vision - n_masked
-            print(f"  key_padding_mask: {n_masked} masked, {n_kept} kept")
-            # 打印被 mask 位置和保留位置的分别统计
-            kept_mask = ~key_padding_mask  # True = kept
-            if n_kept > 0:
-                print(f"  baseline[kept] - mean: {baseline[kept_mask].mean().item():.4f}")
-                print(f"  token_score[kept] - mean: {token_score[kept_mask].mean().item():.4f}")
-                print(f"  keep_logits[kept] - mean: {keep_logits[kept_mask].mean().item():.4f}")
-            if n_masked > 0:
-                print(f"  baseline[masked] - mean: {baseline[key_padding_mask].mean().item():.4f}")
-                print(f"  token_score[masked] - mean: {token_score[key_padding_mask].mean().item():.4f}")
-                print(f"  keep_logits[masked] - mean: {keep_logits[key_padding_mask].mean().item():.4f}")
 
         if return_components:
             return keep_logits, {
@@ -301,7 +271,6 @@ class CrossAttentionPruner(nn.Module):
         self,
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None
     ) -> Tuple[torch.Tensor, Dict]:
         """完整的前向传播：从 hidden states 到 hard mask
@@ -309,14 +278,13 @@ class CrossAttentionPruner(nn.Module):
         参数:
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
-            key_padding_mask: (batch, n_vision) - True 表示该位置被 mask（不参与计算）
             temperature: 可选的温度覆盖
 
         返回:
             hard_mask: (batch, n_vision) - 0/1 mask
             info: dict - 中间结果
         """
-        keep_logits, components = self.forward(vision_hidden, q2v_attn, key_padding_mask, return_components=True)
+        keep_logits, components = self.forward(vision_hidden, q2v_attn, return_components=True)
         hard_mask = self.gumbel_softmax_mask(keep_logits, temperature)
 
         return hard_mask, {
