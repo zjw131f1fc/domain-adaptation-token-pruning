@@ -6,12 +6,17 @@
 """
 
 import os
-import sys
-from pathlib import Path
-
 os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import sys
+from pathlib import Path
+
+# 检查实际加载的包路径
+import tokenizers
+import transformers
+print(f"tokenizers version: {tokenizers.__version__}, path: {tokenizers.__file__}")
+print(f"transformers version: {transformers.__version__}, path: {transformers.__file__}")
 
 import torch
 import torch.nn.functional as F
@@ -209,6 +214,17 @@ def compare_tensors(name, t1, t2):
         diff = (t1.float() - t2.float()).abs()
         print(f"    diff  - max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
 
+        # 找到 max diff 的位置
+        max_idx = diff.argmax().item()
+        max_pos = []
+        temp = max_idx
+        for dim in reversed(t1.shape):
+            max_pos.insert(0, temp % dim)
+            temp //= dim
+        print(f"    max_diff at position: {max_pos}")
+        print(f"    train value at max_pos: {t1[tuple(max_pos)].item()}")
+        print(f"    infer value at max_pos: {t2[tuple(max_pos)].item()}")
+
         # 计算相对误差
         rel_diff = diff / (t1.float().abs() + 1e-8)
         print(f"    rel_diff - max={rel_diff.max().item():.6f}, mean={rel_diff.mean().item():.6f}")
@@ -226,6 +242,17 @@ def compare_tensors(name, t1, t2):
         diff = (t1_part.float() - t2_part.float()).abs()
         print(f"    (comparing first {min_seq} positions)")
         print(f"    diff  - max={diff.max().item():.6f}, mean={diff.mean().item():.6f}")
+
+        # 找到 max diff 的位置
+        max_idx = diff.argmax().item()
+        max_pos = []
+        temp = max_idx
+        for dim in reversed(t1_part.shape):
+            max_pos.insert(0, temp % dim)
+            temp //= dim
+        print(f"    max_diff at position: {max_pos}")
+        print(f"    train value at max_pos: {t1_part[tuple(max_pos)].item()}")
+        print(f"    infer value at max_pos: {t2_part[tuple(max_pos)].item()}")
 
 
 def main():
