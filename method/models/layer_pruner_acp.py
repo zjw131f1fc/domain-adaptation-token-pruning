@@ -127,12 +127,12 @@ class CrossAttentionPruner(nn.Module):
             baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
             baseline = baseline_raw - baseline_mean
 
-            # DEBUG: 打印 baseline 计算细节
-            print(f"\n[Baseline DEBUG]")
-            print(f"  q2v_attn - shape: {q2v_attn.shape}, sum: {q2v_attn.sum().item():.6f}")
-            print(f"  q2v_attn - mean: {q2v_attn.mean().item():.6f}, min: {q2v_attn.min().item():.6f}, max: {q2v_attn.max().item():.6f}")
-            print(f"  baseline_raw - mean: {baseline_raw.mean().item():.4f}, min: {baseline_raw.min().item():.4f}, max: {baseline_raw.max().item():.4f}")
-            print(f"  baseline_mean: {baseline_mean.item():.4f}")
+            # # DEBUG: 打印 baseline 计算细节
+            # print(f"\n[Baseline DEBUG]")
+            # print(f"  q2v_attn - shape: {q2v_attn.shape}, sum: {q2v_attn.sum().item():.6f}")
+            # print(f"  q2v_attn - mean: {q2v_attn.mean().item():.6f}, min: {q2v_attn.min().item():.6f}, max: {q2v_attn.max().item():.6f}")
+            # print(f"  baseline_raw - mean: {baseline_raw.mean().item():.4f}, min: {baseline_raw.min().item():.4f}, max: {baseline_raw.max().item():.4f}")
+            # print(f"  baseline_mean: {baseline_mean.item():.4f}")
         else:
             baseline = torch.zeros(batch_size, n_vision, device=vision_hidden.device)
 
@@ -169,15 +169,15 @@ class CrossAttentionPruner(nn.Module):
         # === 残差连接: keep_logits = baseline + delta + bias ===
         keep_logits = baseline + delta + self.keep_bias
 
-        # DEBUG: 打印 pruner 内部各组件的统计信息
-        print(f"\n[Pruner Internal DEBUG]")
-        print(f"  n_vision: {n_vision}")
-        print(f"  baseline - mean: {baseline.mean().item():.4f}, min: {baseline.min().item():.4f}, max: {baseline.max().item():.4f}")
-        print(f"  attn_score - mean: {attn_score.mean().item():.4f}, min: {attn_score.min().item():.4f}, max: {attn_score.max().item():.4f}")
-        print(f"  token_score - mean: {token_score.mean().item():.4f}, min: {token_score.min().item():.4f}, max: {token_score.max().item():.4f}")
-        print(f"  delta - mean: {delta.mean().item():.4f}, min: {delta.min().item():.4f}, max: {delta.max().item():.4f}")
-        print(f"  keep_bias: {self.keep_bias.item():.4f}")
-        print(f"  keep_logits - mean: {keep_logits.mean().item():.4f}, min: {keep_logits.min().item():.4f}, max: {keep_logits.max().item():.4f}")
+        # # DEBUG: 打印 pruner 内部各组件的统计信息
+        # print(f"\n[Pruner Internal DEBUG]")
+        # print(f"  n_vision: {n_vision}")
+        # print(f"  baseline - mean: {baseline.mean().item():.4f}, min: {baseline.min().item():.4f}, max: {baseline.max().item():.4f}")
+        # print(f"  attn_score - mean: {attn_score.mean().item():.4f}, min: {attn_score.min().item():.4f}, max: {attn_score.max().item():.4f}")
+        # print(f"  token_score - mean: {token_score.mean().item():.4f}, min: {token_score.min().item():.4f}, max: {token_score.max().item():.4f}")
+        # print(f"  delta - mean: {delta.mean().item():.4f}, min: {delta.min().item():.4f}, max: {delta.max().item():.4f}")
+        # print(f"  keep_bias: {self.keep_bias.item():.4f}")
+        # print(f"  keep_logits - mean: {keep_logits.mean().item():.4f}, min: {keep_logits.min().item():.4f}, max: {keep_logits.max().item():.4f}")
 
         if return_components:
             return keep_logits, {
@@ -210,9 +210,13 @@ class CrossAttentionPruner(nn.Module):
         temp = temperature if temperature is not None else self.temperature
         input_dtype = keep_logits.dtype
 
+        # 在 float32 下计算以避免 bfloat16 精度问题
+        # (bool).to(bfloat16) 可能产生非精确的 0/1 值
+        keep_logits_f32 = keep_logits.float()
+
         # 构建二分类 logits: [drop_logit, keep_logit]
-        drop_logits = torch.zeros_like(keep_logits)
-        stacked = torch.stack([drop_logits, keep_logits], dim=-1)  # (batch, n_vision, 2)
+        drop_logits = torch.zeros_like(keep_logits_f32)
+        stacked = torch.stack([drop_logits, keep_logits_f32], dim=-1)  # (batch, n_vision, 2)
 
         if self.training:
             # 训练模式：Gumbel-Softmax with hard=True
@@ -222,12 +226,13 @@ class CrossAttentionPruner(nn.Module):
             # 推理模式：根据 inference_mode 选择
             if self.inference_mode == 'topk' and self.topk_k is not None:
                 # Top-k 模式：保留 sigmoid 最高的 k 个 token
-                hard_mask = self._topk_mask(keep_logits, self.topk_k)
+                hard_mask = self._topk_mask(keep_logits_f32, self.topk_k)
             else:
                 # 阈值模式：sigmoid(keep_logits) > threshold
-                keep_prob = torch.sigmoid(keep_logits)
-                hard_mask = (keep_prob > self.threshold).to(input_dtype)
+                keep_prob = torch.sigmoid(keep_logits_f32)
+                hard_mask = (keep_prob > self.threshold).float()
 
+        # 转回原始 dtype
         return hard_mask.to(input_dtype)
 
     def _topk_mask(self, keep_logits: torch.Tensor, k: int) -> torch.Tensor:
@@ -284,6 +289,8 @@ class CrossAttentionPruner(nn.Module):
             hard_mask: (batch, n_vision) - 0/1 mask
             info: dict - 中间结果
         """
+        # forward 保持原始 dtype（与模型权重兼容）
+        # mask 生成在 gumbel_softmax_mask 内部用 float32 计算
         keep_logits, components = self.forward(vision_hidden, q2v_attn, return_components=True)
         hard_mask = self.gumbel_softmax_mask(keep_logits, temperature)
 

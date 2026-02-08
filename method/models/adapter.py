@@ -87,31 +87,6 @@ class LightweightAdapter(nn.Module):
             query: (batch, seq, hidden_size) - attention query states
             debug: 是否打印调试信息
         """
-        # 调试：打印训练/推理时的输入差异
-        mode = "train" if self.training else "eval"
-        # 区分 prefill 和 decode 阶段
-        seq_len = x.shape[1]
-        if not self.training and seq_len == 1:
-            mode = "eval_decode"
-        _DEBUG_COUNTER[mode] += 1
-        if _DEBUG_COUNTER[mode] <= 3:  # 只打印前3次
-            print(f"\n[Adapter DEBUG - {mode} #{_DEBUG_COUNTER[mode]}]")
-            print(f"  x.shape: {x.shape}")
-            print(f"  x.mean: {x.mean().item():.6f}, x.std: {x.std().item():.6f}")
-            print(f"  mask: {mask.shape if mask is not None else None}")
-            if mask is not None:
-                print(f"  mask.sum: {mask.sum().item()}, mask.mean: {mask.mean().item():.4f}")
-            print(f"  query: {query.shape if query is not None else None}")
-            if query is not None:
-                print(f"  query.mean: {query.mean().item():.6f}, query.std: {query.std().item():.6f}")
-                print(f"  query[:, 0, :5]: {query[0, 0, :5].tolist()}")  # 打印部分值
-
-        if debug:
-            print(f"[Adapter] x.shape: {x.shape}")
-            print(f"[Adapter] mask: {mask.shape if mask is not None else None}, sum: {mask.sum().item() if mask is not None else None}")
-            print(f"[Adapter] query: {query.shape if query is not None else None}")
-            print(f"[Adapter] training: {self.training}")
-
         h = self.dropout(self.act(self.down(x)))  # (batch, seq, bottleneck)
 
         # 构建 condition
@@ -124,10 +99,6 @@ class LightweightAdapter(nn.Module):
         if query is not None:
             query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
             condition = condition + query_emb
-            # 调试：打印 query_emb 的统计信息
-            if _DEBUG_COUNTER[mode] <= 3:
-                print(f"  query_emb.mean: {query_emb.mean().item():.6f}, query_emb.std: {query_emb.std().item():.6f}")
-                print(f"  condition.mean: {condition.mean().item():.6f}, condition.std: {condition.std().item():.6f}")
 
         # FiLM modulation
         gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)

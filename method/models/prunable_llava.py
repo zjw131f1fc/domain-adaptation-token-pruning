@@ -16,7 +16,6 @@ from dataclasses import dataclass
 
 from transformers import LlavaForConditionalGeneration, LlavaConfig
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaDecoderLayer
 
 from .layer_pruner_acp import LayerPruner, LayerPrunerManager
@@ -309,16 +308,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         # 提取当前层保留的 vision token 索引（相对于当前 vision 位置）
                         # cumulative_vision_mask 是相对于原始 n_vision 的，需要转换
                         if cumulative_vision_mask is not None:
-                            # 找到之前保留的位置
-                            prev_kept_indices = cumulative_vision_mask[0].nonzero(as_tuple=True)[0]
+                            # 强制二值化，避免 bfloat16 精度问题
+                            cumulative_clean = (cumulative_vision_mask > 0.5).to(dtype)
+                            prev_kept_indices = cumulative_clean[0].nonzero(as_tuple=True)[0]
                             n_prev_kept = len(prev_kept_indices)
                         else:
                             n_prev_kept = n_vision_orig
 
-                        # 当前层的 mask 是在 prev_kept tokens 上的
-                        # hard_mask 已经是原始 n_vision 维度的（在 prunable_llama_layer 中 scatter 回来的）
-                        # 找到当前保留的位置
-                        current_kept_indices = new_cumulative_mask[0].nonzero(as_tuple=True)[0]
+                        # 当前层的 mask 也需要二值化
+                        new_cumulative_clean = (new_cumulative_mask > 0.5).to(dtype)
+                        current_kept_indices = new_cumulative_clean[0].nonzero(as_tuple=True)[0]
                         n_current_kept = len(current_kept_indices)
 
                         # 计算这一层删除了多少 tokens
@@ -343,7 +342,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                                 # 需要找到 prev_kept_indices 中哪些在 new_cumulative_mask 中仍然是 1
                                 relative_kept = []
                                 for rel_idx, orig_idx in enumerate(prev_kept_indices):
-                                    if new_cumulative_mask[0, orig_idx] == 1:
+                                    # 使用 > 0.5 替代 == 1，避免 bfloat16 精度问题
+                                    if new_cumulative_mask[0, orig_idx] > 0.5:
                                         relative_kept.append(rel_idx)
                                 relative_kept = torch.tensor(relative_kept, device=device, dtype=torch.long)
                             else:
@@ -371,11 +371,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             current_answer_ends = [ae - offset if ae >= current_vision_start + n_prev_kept else ae
                                                    for ae in current_answer_ends]
 
-                            print(f"[Physical Deletion in forward - Layer {layer_idx}]")
-                            print(f"  Deleted {n_deleted} tokens, seq_len: {orig_seq_len} -> {current_seq_len}")
+                            print(f"[Physical Deletion L{layer_idx}] deleted={n_deleted}, seq: {orig_seq_len}->{current_seq_len}")
 
-                        # 更新累积 mask
-                        cumulative_vision_mask = new_cumulative_mask
+                        # 更新累积 mask（使用二值化后的版本，确保后续层的一致性）
+                        cumulative_vision_mask = new_cumulative_clean
 
             else:
                 # 非剪枝层
@@ -650,9 +649,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             else:
                 # 兼容旧格式：只有 hard_mask
                 hard_mask = mask_info
-                n_kept_absolute = hard_mask.sum().int().item()
-                # 计算绝对保留数量
-                n_kept_absolute = int(cumulative_kept * hard_mask.float().mean().item())
+                n_kept_absolute = (hard_mask > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
 
             # 更新累积保留数量
             cumulative_kept = n_kept_absolute
@@ -787,6 +784,32 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             else:
                 original_layer = decoder_layer
 
+            # 当前序列长度
+            current_seq_len = hidden_states.shape[1]
+
+            # 计算 position embeddings（使用当前的 position_ids）
+            position_embeddings = llm.rotary_emb(hidden_states, position_ids)
+
+            # === 非剪枝层：直接使用原始层的 forward（与训练完全一致）===
+            if layer_idx not in self.pruning_layers:
+                # 使用原始层的 forward，确保数值计算与训练完全一致
+                layer_outputs = original_layer(
+                    hidden_states,
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    cache_position=torch.arange(current_seq_len, device=device),
+                    position_embeddings=position_embeddings,
+                )
+                # 处理输出格式
+                if isinstance(layer_outputs, tuple):
+                    hidden_states = layer_outputs[0]
+                else:
+                    hidden_states = layer_outputs
+                continue
+
+            # === 剪枝层：手动计算 attention 以实现剪枝 ===
             attn = original_layer.self_attn
 
             # 获取配置
@@ -795,11 +818,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             head_dim = attn.head_dim
             num_kv_groups = num_heads // num_kv_heads
 
-            # 当前序列长度
-            current_seq_len = hidden_states.shape[1]
-
-            # 计算 position embeddings（使用当前的 position_ids）
-            position_embeddings = llm.rotary_emb(hidden_states, position_ids)
             cos, sin = position_embeddings
 
             # LayerNorm + Q/K/V 投影
@@ -821,8 +839,25 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             key_states = key_states.view(batch_size, current_seq_len, num_kv_heads, head_dim).transpose(1, 2)
             value_states = value_states.view(batch_size, current_seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
+            # DEBUG: RoPE 之前的 query 和 key（仅剪枝层）
+            orig_q_start = question_starts[0]
+            curr_q_start = None
+            for new_idx, orig_idx in enumerate(kept_indices[0]):
+                if orig_idx == orig_q_start:
+                    curr_q_start = new_idx
+                    break
+            if curr_q_start is None:
+                curr_q_start = current_vision_end
+            v_pos = current_vision_start + 5  # 检查第 5 个 vision token
+            print(f"  query[0,0,{curr_q_start},:5] before RoPE: {query_states[0,0,curr_q_start,:5].tolist()}")
+            print(f"  key[0,0,{v_pos},:5] before RoPE: {key_states[0,0,v_pos,:5].tolist()}")
+
             # Apply RoPE
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            # DEBUG: RoPE 之后的 query 和 key（仅剪枝层）
+            print(f"  query[0,0,{curr_q_start},:5] after RoPE: {query_states[0,0,curr_q_start,:5].tolist()}")
+            print(f"  key[0,0,{v_pos},:5] after RoPE: {key_states[0,0,v_pos,:5].tolist()}")
 
             # 存入 KV cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": torch.arange(current_seq_len, device=device)}
@@ -837,6 +872,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # 计算 attention
             attn_weights = torch.matmul(query_states, key_states_expanded.transpose(-2, -1)) * attn.scaling
 
+            # DEBUG: 打印 softmax 前的 attn_scores（仅剪枝层）
+            scores_slice = attn_weights[0, 0, curr_q_start, current_vision_start:current_vision_start+10]
+            print(f"  attn_scores[0,0,{curr_q_start},{current_vision_start}:{current_vision_start+10}]: {scores_slice.tolist()}")
+
             # 应用 causal mask
             causal_mask = torch.triu(
                 torch.full((current_seq_len, current_seq_len), float('-inf'), device=device, dtype=dtype),
@@ -844,110 +883,105 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             )
             attn_weights = attn_weights + causal_mask
 
-            # DEBUG: 打印推理时的 causal_mask
-            if layer_idx in self.pruning_layers:
-                print(f"  [attn DEBUG INFER] Layer {layer_idx}: causal_mask.shape={causal_mask.shape}, min={causal_mask.min().item():.2f}, max={causal_mask.max().item():.2f}")
-
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
-            # === 剪枝层：与训练对齐的处理流程 ===
-            if layer_idx in self.pruning_layers:
-                # Step 1: 计算 question->vision attention 和 hard_mask（提前计算）
-                q2v_attn_list = []
-                for i in range(batch_size):
-                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
-                    current_q_start = None
-                    current_q_end = None
-                    for new_idx, orig_idx in enumerate(kept_indices[i]):
-                        if orig_idx == orig_q_start and current_q_start is None:
-                            current_q_start = new_idx
-                        if orig_idx == orig_q_end - 1:
-                            current_q_end = new_idx + 1
-                    if current_q_start is None:
-                        current_q_start = current_vision_end
-                    if current_q_end is None:
-                        current_q_end = current_seq_len
-                    # DEBUG: 打印 question 位置
-                    print(f"  [q2v DEBUG INFER] sample {i}: orig_q=({orig_q_start},{orig_q_end}), current_q=({current_q_start},{current_q_end}), n_question={current_q_end-current_q_start}")
-                    q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
-                    q2v_avg_i = q2v_i.mean(dim=(0, 1))
-                    q2v_attn_list.append(q2v_avg_i)
-                q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
+            # === 剪枝层处理（现在只有剪枝层会到达这里）===
+            # DEBUG: 打印进入剪枝层时的 hidden_states
+            print(f"\n[Layer {layer_idx} INFER entering]")
+            print(f"  input hidden_states: mean={hidden_states.mean().item():.6f}, std={hidden_states.std().item():.6f}")
+            print(f"  hidden_states[0,0,:5]: {hidden_states[0,0,:5].tolist()}")
 
-                vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
+            # Step 1: 计算 question->vision attention 和 hard_mask（提前计算）
+            q2v_attn_list = []
+            for i in range(batch_size):
+                orig_q_start, orig_q_end = question_starts[i], question_ends[i]
+                current_q_start = None
+                current_q_end = None
+                for new_idx, orig_idx in enumerate(kept_indices[i]):
+                    if orig_idx == orig_q_start and current_q_start is None:
+                        current_q_start = new_idx
+                    if orig_idx == orig_q_end - 1:
+                        current_q_end = new_idx + 1
+                if current_q_start is None:
+                    current_q_start = current_vision_end
+                if current_q_end is None:
+                    current_q_end = current_seq_len
+                q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
+                q2v_avg_i = q2v_i.mean(dim=(0, 1))
+                q2v_attn_list.append(q2v_avg_i)
+            q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
 
-                # DEBUG: 打印推理时 pruner 输入（与训练对比）
-                print(f"\n[Pruner Input DEBUG - Layer {layer_idx} (INFERENCE)]")
-                print(f"  current_seq_len: {current_seq_len}")
-                print(f"  current_n_vision: {current_vision_end - current_vision_start}")
-                print(f"  vision_hidden.shape: {vision_hidden.shape}")
-                print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
-                print(f"  q2v_attn_avg.shape: {q2v_attn_avg.shape}")
-                print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
+            vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
 
-                pruner = self.pruner_manager.get_pruner(layer_idx)
-                with torch.no_grad():
-                    hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+            # DEBUG: 打印 attention weights 的详细信息
+            q2v_slice = attn_weights[0, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
+            print(f"  attn_weights[q→v]: shape={q2v_slice.shape}, mean={q2v_slice.mean().item():.8f}, sum={q2v_slice.sum().item():.4f}")
+            # 打印第一个 head 的前几个值
+            print(f"  attn_weights[0,0,{current_q_start},:10]: {attn_weights[0,0,current_q_start,:10].tolist()}")
 
-                # DEBUG: 打印 pruner 输出
-                print(f"  hard_mask.shape: {hard_mask.shape}")
-                print(f"  hard_mask.sum: {hard_mask.sum().item()}")
+            # 简化的推理调试输出
+            print(f"\n[Layer {layer_idx} INFER] seq_len={current_seq_len}, n_vision={current_vision_end - current_vision_start}")
+            print(f"  question=[{question_starts[0]},{question_ends[0]}), current_q=[{current_q_start},{current_q_end})")
+            print(f"  q2v_attn_avg: mean={q2v_attn_avg.mean().item():.6f}, sum={q2v_attn_avg.sum().item():.4f}")
+            print(f"  vision_hidden: mean={vision_hidden.mean().item():.6f}, std={vision_hidden.std().item():.6f}")
 
-                # Step 2: 用 mask 修改 attention weights（与训练一致）
-                current_n_vision = current_vision_end - current_vision_start
-                mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+            pruner = self.pruner_manager.get_pruner(layer_idx)
+            with torch.no_grad():
+                hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
 
-                # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
-                ones_before = torch.ones(batch_size, num_heads, current_seq_len, current_vision_start,
-                                         device=device, dtype=dtype)
-                ones_after = torch.ones(batch_size, num_heads, current_seq_len, current_seq_len - current_vision_end,
-                                        device=device, dtype=dtype)
-                mask_vision = mask_expanded.expand(-1, num_heads, current_seq_len, -1)
-                full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
+            # DEBUG: 打印 pruner 输出
+            print(f"  hard_mask.sum={hard_mask.sum().item():.0f}")
 
-                # 应用 mask 并重新归一化
-                attn_weights_masked = attn_weights * full_mask
-                attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
-                attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
+            # Step 2: 用 mask 修改 attention weights（与训练一致）
+            current_n_vision = current_vision_end - current_vision_start
+            mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
-                # Step 3: 计算剪枝后的 attention output
-                attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
-                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+            # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
+            ones_before = torch.ones(batch_size, num_heads, current_seq_len, current_vision_start,
+                                     device=device, dtype=dtype)
+            ones_after = torch.ones(batch_size, num_heads, current_seq_len, current_seq_len - current_vision_end,
+                                    device=device, dtype=dtype)
+            mask_vision = mask_expanded.expand(-1, num_heads, current_seq_len, -1)
+            full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
 
-                # Step 4: 将当前层的 hard_mask pad 到原始 n_vision 维度（与训练时一致）
-                # hard_mask: (batch, current_n_vision) -> (batch, n_vision)
-                current_n_vision = hard_mask.shape[1]
-                if current_n_vision < n_vision:
-                    # pad 0 到右边
-                    padded_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
-                    padded_mask[:, :current_n_vision] = hard_mask
-                else:
-                    padded_mask = hard_mask
+            # 应用 mask 并重新归一化
+            attn_weights_masked = attn_weights * full_mask
+            attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
+            attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
 
-                # Step 5: 应用 Adapter（使用当前层的 mask，与训练一致）
-                adapter = self.adapter_manager.get_adapter(layer_idx)
-                if adapter is not None:
-                    attn_output = adapter(
-                        attn_output,
-                        mask=padded_mask,
-                        query=query_states_flat
-                    )
+            # Step 3: 计算剪枝后的 attention output
+            attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-                # Step 6: 更新累积 vision mask（用于后续层的物理删除）
-                for i in range(batch_size):
-                    kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
-                    for j, pos in enumerate(kept_positions):
-                        if j < hard_mask.shape[1]:
-                            cumulative_vision_mask[i, pos] = hard_mask[i, j]
-
-                # 记录 mask 用于统计（同时保存 padded_mask 供 Generate 阶段使用）
-                n_kept_absolute = hard_mask[0].sum().int().item()
-                masks[layer_idx] = (hard_mask, n_kept_absolute, padded_mask)
-
+            # Step 4: 将当前层的 hard_mask pad 到原始 n_vision 维度（与训练时一致）
+            # hard_mask: (batch, current_n_vision) -> (batch, n_vision)
+            current_n_vision = hard_mask.shape[1]
+            if current_n_vision < n_vision:
+                # pad 0 到右边
+                padded_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
+                padded_mask[:, :current_n_vision] = hard_mask
             else:
-                # 非剪枝层：正常计算 attention output
-                attn_output = torch.matmul(attn_weights, value_states_expanded)
-                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+                padded_mask = hard_mask
+
+            # Step 5: 应用 Adapter（使用当前层的 mask，与训练一致）
+            adapter = self.adapter_manager.get_adapter(layer_idx)
+            if adapter is not None:
+                attn_output = adapter(
+                    attn_output,
+                    mask=padded_mask,
+                    query=query_states_flat
+                )
+
+            # Step 6: 更新累积 vision mask（用于后续层的物理删除）
+            for i in range(batch_size):
+                kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                for j, pos in enumerate(kept_positions):
+                    if j < hard_mask.shape[1]:
+                        cumulative_vision_mask[i, pos] = hard_mask[i, j]
+
+            # 记录 mask 用于统计（同时保存 padded_mask 供 Generate 阶段使用）
+            n_kept_absolute = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
+            masks[layer_idx] = (hard_mask, n_kept_absolute, padded_mask)
 
             attn_output = attn.o_proj(attn_output)
 
@@ -960,105 +994,104 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             hidden_states = original_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-            # === 在剪枝层进行硬剪枝（物理删除 tokens）===
-            if layer_idx in self.pruning_layers:
-                # === 物理删除被剪掉的 vision tokens ===
-                # 对于每个样本，根据 hard_mask 选择要保留的 tokens
-                new_hidden_states_list = []
-                new_position_ids_list = []
-                new_kept_indices_list = []
+            # === 硬剪枝（物理删除 tokens）- 现在只有剪枝层会到达这里 ===
+            # 物理删除被剪掉的 vision tokens
+            # 对于每个样本，根据 hard_mask 选择要保留的 tokens
+            new_hidden_states_list = []
+            new_position_ids_list = []
+            new_kept_indices_list = []
+
+            for i in range(batch_size):
+                # 当前样本的 mask
+                sample_mask = hard_mask[i]  # (current_n_vision,)
+                kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]  # 保留的 vision token 的相对索引
+
+                # 构建新的序列：[前部分] + [保留的 vision tokens] + [后部分]
+                # 前部分：position 0 到 current_vision_start
+                # 后部分：current_vision_end 到末尾
+
+                before_vision = hidden_states[i, :current_vision_start, :]  # (vision_start, hidden)
+                kept_vision = hidden_states[i, current_vision_start:current_vision_end, :][kept_vision_indices]  # (n_kept, hidden)
+                after_vision = hidden_states[i, current_vision_end:, :]  # (rest, hidden)
+
+                new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
+                new_hidden_states_list.append(new_hidden)
+
+                # 更新 position_ids（重新编号）
+                new_seq_len = new_hidden.shape[0]
+                new_pos_ids = torch.arange(new_seq_len, device=device)
+                new_position_ids_list.append(new_pos_ids)
+
+                # 更新 kept_indices（记录哪些原始位置被保留）
+                old_kept = kept_indices[i]
+                new_kept = (
+                    old_kept[:current_vision_start] +
+                    [old_kept[current_vision_start + j] for j in kept_vision_indices.tolist()] +
+                    old_kept[current_vision_end:]
+                )
+                new_kept_indices_list.append(new_kept)
+
+            # Pad to same length (batch 内可能长度不同)
+            max_new_len = max(h.shape[0] for h in new_hidden_states_list)
+
+            padded_hidden = torch.zeros(batch_size, max_new_len, hidden_size, device=device, dtype=dtype)
+            padded_position_ids = torch.zeros(batch_size, max_new_len, device=device, dtype=torch.long)
+
+            for i in range(batch_size):
+                length = new_hidden_states_list[i].shape[0]
+                padded_hidden[i, :length] = new_hidden_states_list[i]
+                padded_position_ids[i, :length] = new_position_ids_list[i]
+
+            hidden_states = padded_hidden
+            position_ids = padded_position_ids
+            kept_indices = new_kept_indices_list
+
+            # 更新 vision 位置（batch_size=1，直接用第一个样本）
+            n_kept = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
+            current_vision_end = current_vision_start + n_kept
+
+            # 更新 KV cache（删除被剪掉的 tokens）
+            # 需要重新构建 cache
+            new_cache = DynamicCache()
+            for l_idx in range(layer_idx + 1):
+                # 使用 layers[l_idx].keys 和 layers[l_idx].values 访问
+                old_k = past_key_values.layers[l_idx].keys  # (batch, heads, old_seq, head_dim)
+                old_v = past_key_values.layers[l_idx].values
+
+                new_k_list = []
+                new_v_list = []
 
                 for i in range(batch_size):
-                    # 当前样本的 mask
-                    sample_mask = hard_mask[i]  # (current_n_vision,)
-                    kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]  # 保留的 vision token 的相对索引
+                    sample_mask = hard_mask[i]
+                    kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]
 
-                    # 构建新的序列：[前部分] + [保留的 vision tokens] + [后部分]
-                    # 前部分：position 0 到 current_vision_start
-                    # 后部分：current_vision_end 到末尾
+                    # 同样的逻辑：保留 before + kept_vision + after
+                    before_k = old_k[i, :, :current_vision_start, :]
+                    kept_k = old_k[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
+                    after_k = old_k[i, :, current_vision_start + len(sample_mask):, :]
+                    new_k = torch.cat([before_k, kept_k, after_k], dim=1)
+                    new_k_list.append(new_k)
 
-                    before_vision = hidden_states[i, :current_vision_start, :]  # (vision_start, hidden)
-                    kept_vision = hidden_states[i, current_vision_start:current_vision_end, :][kept_vision_indices]  # (n_kept, hidden)
-                    after_vision = hidden_states[i, current_vision_end:, :]  # (rest, hidden)
+                    before_v = old_v[i, :, :current_vision_start, :]
+                    kept_v = old_v[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
+                    after_v = old_v[i, :, current_vision_start + len(sample_mask):, :]
+                    new_v = torch.cat([before_v, kept_v, after_v], dim=1)
+                    new_v_list.append(new_v)
 
-                    new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
-                    new_hidden_states_list.append(new_hidden)
-
-                    # 更新 position_ids（重新编号）
-                    new_seq_len = new_hidden.shape[0]
-                    new_pos_ids = torch.arange(new_seq_len, device=device)
-                    new_position_ids_list.append(new_pos_ids)
-
-                    # 更新 kept_indices（记录哪些原始位置被保留）
-                    old_kept = kept_indices[i]
-                    new_kept = (
-                        old_kept[:current_vision_start] +
-                        [old_kept[current_vision_start + j] for j in kept_vision_indices.tolist()] +
-                        old_kept[current_vision_end:]
-                    )
-                    new_kept_indices_list.append(new_kept)
-
-                # Pad to same length (batch 内可能长度不同)
-                max_new_len = max(h.shape[0] for h in new_hidden_states_list)
-
-                padded_hidden = torch.zeros(batch_size, max_new_len, hidden_size, device=device, dtype=dtype)
-                padded_position_ids = torch.zeros(batch_size, max_new_len, device=device, dtype=torch.long)
+                # Pad KV cache
+                max_kv_len = max(k.shape[1] for k in new_k_list)
+                padded_k = torch.zeros(batch_size, old_k.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
+                padded_v = torch.zeros(batch_size, old_v.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
 
                 for i in range(batch_size):
-                    length = new_hidden_states_list[i].shape[0]
-                    padded_hidden[i, :length] = new_hidden_states_list[i]
-                    padded_position_ids[i, :length] = new_position_ids_list[i]
+                    length = new_k_list[i].shape[1]
+                    padded_k[i, :, :length, :] = new_k_list[i]
+                    padded_v[i, :, :length, :] = new_v_list[i]
 
-                hidden_states = padded_hidden
-                position_ids = padded_position_ids
-                kept_indices = new_kept_indices_list
+                # 使用 update 方法添加到新 cache
+                new_cache.update(padded_k, padded_v, l_idx, {})
 
-                # 更新 vision 位置（batch_size=1，直接用第一个样本）
-                n_kept = hard_mask[0].sum().int().item()
-                current_vision_end = current_vision_start + n_kept
-
-                # 更新 KV cache（删除被剪掉的 tokens）
-                # 需要重新构建 cache
-                new_cache = DynamicCache()
-                for l_idx in range(layer_idx + 1):
-                    # 使用 layers[l_idx].keys 和 layers[l_idx].values 访问
-                    old_k = past_key_values.layers[l_idx].keys  # (batch, heads, old_seq, head_dim)
-                    old_v = past_key_values.layers[l_idx].values
-
-                    new_k_list = []
-                    new_v_list = []
-
-                    for i in range(batch_size):
-                        sample_mask = hard_mask[i]
-                        kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]
-
-                        # 同样的逻辑：保留 before + kept_vision + after
-                        before_k = old_k[i, :, :current_vision_start, :]
-                        kept_k = old_k[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
-                        after_k = old_k[i, :, current_vision_start + len(sample_mask):, :]
-                        new_k = torch.cat([before_k, kept_k, after_k], dim=1)
-                        new_k_list.append(new_k)
-
-                        before_v = old_v[i, :, :current_vision_start, :]
-                        kept_v = old_v[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
-                        after_v = old_v[i, :, current_vision_start + len(sample_mask):, :]
-                        new_v = torch.cat([before_v, kept_v, after_v], dim=1)
-                        new_v_list.append(new_v)
-
-                    # Pad KV cache
-                    max_kv_len = max(k.shape[1] for k in new_k_list)
-                    padded_k = torch.zeros(batch_size, old_k.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
-                    padded_v = torch.zeros(batch_size, old_v.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
-
-                    for i in range(batch_size):
-                        length = new_k_list[i].shape[1]
-                        padded_k[i, :, :length, :] = new_k_list[i]
-                        padded_v[i, :, :length, :] = new_v_list[i]
-
-                    # 使用 update 方法添加到新 cache
-                    new_cache.update(padded_k, padded_v, l_idx, {})
-
-                past_key_values = new_cache
+            past_key_values = new_cache
 
         # Final LayerNorm
         hidden_states = llm.norm(hidden_states)

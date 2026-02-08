@@ -159,6 +159,7 @@ def preprocess_sample(sample, processor, device, mode="train"):
         'answer_starts': answer_starts,
         'answer_ends': answer_ends,
         'answer': answer,
+        'seq_len': seq_len,
     }
 
 
@@ -255,6 +256,8 @@ def main():
     prep_train = preprocess_sample(sample, processor, device, mode="train")
     inputs_train = prep_train['inputs']
 
+    print(f"\n*** TRAIN: seq={prep_train['seq_len']}, question=[{prep_train['question_starts'][0]},{prep_train['question_ends'][0]}) ***\n")
+
     # 使用 eval 模式进行公平对比（排除 Gumbel 噪声影响）
     # 这样训练和推理都用 threshold 逻辑生成 mask
     model.eval()
@@ -293,6 +296,8 @@ def main():
     # 预处理（推理模式，不包含答案）
     prep_infer = preprocess_sample(sample, processor, device, mode="inference")
     inputs_infer = prep_infer['inputs']
+
+    print(f"\n*** INFER: seq={prep_infer['seq_len']}, question=[{prep_infer['question_starts'][0]},{prep_infer['question_ends'][0]}) ***\n")
 
     # 推理模式
     model.eval()
