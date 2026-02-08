@@ -13,28 +13,6 @@ def reset_adapter_debug_counter():
     _DEBUG_COUNTER = {"train": 0, "eval": 0, "eval_decode": 0}
 
 
-class PruningAdapter(nn.Module):
-    """剪枝补偿 Adapter（简单版本）
-
-    两层 MLP，补偿剪枝造成的信息损失。
-    """
-
-    def __init__(self, hidden_size: int, bottleneck_dim: int = 512, **kwargs):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.bottleneck_dim = bottleneck_dim
-
-        self.down = nn.Linear(hidden_size, self.bottleneck_dim)
-        self.mid = nn.Linear(self.bottleneck_dim, self.bottleneck_dim)
-        self.up = nn.Linear(self.bottleneck_dim, hidden_size)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        h = self.act(self.down(x))
-        h = self.act(self.mid(h))
-        return x + self.up(h)
-
-
 class LightweightAdapter(nn.Module):
     """轻量级 Adapter：Mask-Aware + Query-Aware FiLM 调制
 
@@ -178,7 +156,6 @@ class AdapterManager(nn.Module):
         self.adapter_type = adapter_type
 
         adapter_cls = {
-            'simple': PruningAdapter,
             'lightweight': LightweightAdapter,
         }.get(adapter_type, LightweightAdapter)
 
