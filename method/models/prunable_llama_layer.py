@@ -188,13 +188,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         head_dim = attn.head_dim
         num_kv_groups = num_heads // num_kv_heads
 
-        # DEBUG: 只保留关键信息
-        print(f"\n[Layer {self.layer_idx} TRAIN] seq_len={seq_len}, n_vision={n_vision}, vision=[{vision_start},{vision_end})")
-        print(f"  question=[{question_starts[0]},{question_ends[0]})")
-        print(f"  input hidden_states: mean={hidden_states.mean().item():.6f}, std={hidden_states.std().item():.6f}")
-        # 打印前几个值
-        print(f"  hidden_states[0,0,:5]: {hidden_states[0,0,:5].tolist()}")
-
         # === Step 1: LayerNorm + Q/K/V 投影 ===
         residual = hidden_states
         hidden_states_normed = layer.input_layernorm(hidden_states)
@@ -211,19 +204,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
         key_states = key_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
-        # DEBUG: RoPE 之前的 query 和 key
-        q_pos = question_starts[0]
-        v_pos = vision_start + 5  # 检查第 5 个 vision token
-        print(f"  query[0,0,{q_pos},:5] before RoPE: {query_states[0,0,q_pos,:5].tolist()}")
-        print(f"  key[0,0,{v_pos},:5] before RoPE: {key_states[0,0,v_pos,:5].tolist()}")
-
         # Apply RoPE
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        # DEBUG: RoPE 之后的 query 和 key
-        print(f"  query[0,0,{q_pos},:5] after RoPE: {query_states[0,0,q_pos,:5].tolist()}")
-        print(f"  key[0,0,{v_pos},:5] after RoPE: {key_states[0,0,v_pos,:5].tolist()}")
 
         # Handle KV cache if needed
         if past_key_values is not None:
@@ -239,11 +222,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # === Step 2: 计算 Attention Weights ===
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
 
-        # DEBUG: 打印 softmax 前的 attn_scores
-        q_start, q_end = question_starts[0], question_ends[0]
-        scores_slice = attn_scores[0, 0, q_start, vision_start:vision_start+10]
-        print(f"  attn_scores[0,0,{q_start},{vision_start}:{vision_start+10}]: {scores_slice.tolist()}")
-
         # 创建 causal mask
         kv_len = key_states.shape[-2]
         causal_mask = torch.triu(
@@ -252,20 +230,10 @@ class PrunableLlamaDecoderLayer(nn.Module):
         )
         attn_scores = attn_scores + causal_mask
 
-        # 保存 softmax 前的 scores（用于 h_fake 计算）
-        attn_scores_for_fake = attn_scores.clone()
-
         # Softmax
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(dtype)
 
         # === Step 3: 提取 question→vision attention 并生成 mask ===
-        # DEBUG: 打印 attention weights 的详细信息
-        q_start, q_end = question_starts[0], question_ends[0]
-        q2v_slice = attn_weights[0, :, q_start:q_end, vision_start:vision_end]
-        print(f"  attn_weights[q→v]: shape={q2v_slice.shape}, mean={q2v_slice.mean().item():.8f}, sum={q2v_slice.sum().item():.4f}")
-        # 打印第一个 head 的前几个值
-        print(f"  attn_weights[0,0,{q_start},:10]: {attn_weights[0,0,q_start,:10].tolist()}")
-
         q2v_attn_list = []
         for i in range(batch_size):
             q_start, q_end = question_starts[i], question_ends[i]
@@ -279,15 +247,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 提取 vision tokens 的 hidden states
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]
 
-        # DEBUG: 打印 pruner 输入
-        print(f"  q2v_attn_avg: mean={q2v_attn_avg.mean().item():.6f}, sum={q2v_attn_avg.sum().item():.4f}")
-        print(f"  vision_hidden: mean={vision_hidden.mean().item():.6f}, std={vision_hidden.std().item():.6f}")
-
         # Pruner 生成 mask（输入维度 = 当前 n_vision，与推理完全一致）
         hard_mask, pruner_info = self.pruner.forward_full(vision_hidden, q2v_attn_avg)
         # hard_mask: (batch, n_vision) - 当前 vision tokens 的 mask
-
-        print(f"  hard_mask.sum={hard_mask.sum().item():.0f}")
 
         # === 将当前层的 mask scatter 回原始 n_vision_orig 维度（如果需要）===
         # cumulative_vision_mask 告诉我们当前 n_vision tokens 对应原始的哪些位置
@@ -311,18 +273,22 @@ class PrunableLlamaDecoderLayer(nn.Module):
         attn_output_real = torch.matmul(attn_weights, value_states)
 
         # h_fake: 当前层 mask 剪枝后的 attention 聚合
-        mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)
-        penalty_vision = (1.0 - mask_expanded) * (-10000.0)
-        penalty_vision = penalty_vision.expand(-1, num_heads, seq_len, -1)
+        # 使用 post-softmax mask + renormalize（与推理一致，更接近物理删除效果）
+        mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
-        zeros_before = torch.zeros(batch_size, num_heads, seq_len, vision_start,
-                                   device=device, dtype=dtype)
-        zeros_after = torch.zeros(batch_size, num_heads, seq_len, kv_len - vision_end,
-                                  device=device, dtype=dtype)
-        full_penalty = torch.cat([zeros_before, penalty_vision, zeros_after], dim=-1)
+        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
+        ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start,
+                                 device=device, dtype=dtype)
+        ones_after = torch.ones(batch_size, num_heads, seq_len, kv_len - vision_end,
+                                device=device, dtype=dtype)
+        mask_vision = mask_expanded.expand(-1, num_heads, seq_len, -1)
+        full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
 
-        attn_scores_fake = attn_scores_for_fake + full_penalty
-        attn_weights_fake = F.softmax(attn_scores_fake, dim=-1, dtype=torch.float32).to(dtype)
+        # 应用 mask 并重新归一化
+        attn_weights_fake = attn_weights * full_mask
+        attn_sum = attn_weights_fake.sum(dim=-1, keepdim=True)
+        attn_weights_fake = (attn_weights_fake / (attn_sum + 1e-8)).to(dtype)
+
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
         # === Step 4.5: Adapter 修正 ===

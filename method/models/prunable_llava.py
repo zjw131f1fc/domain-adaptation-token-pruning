@@ -371,7 +371,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             current_answer_ends = [ae - offset if ae >= current_vision_start + n_prev_kept else ae
                                                    for ae in current_answer_ends]
 
-                            print(f"[Physical Deletion L{layer_idx}] deleted={n_deleted}, seq: {orig_seq_len}->{current_seq_len}")
 
                         # 更新累积 mask（使用二值化后的版本，确保后续层的一致性）
                         cumulative_vision_mask = new_cumulative_clean
@@ -402,9 +401,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         position_ids=position_ids,
                         past_key_values=past_key_values,
                         use_cache=use_cache,
-                        cache_position=None,
+                        cache_position=torch.arange(current_seq_len, device=device),
                         position_embeddings=position_embeddings,
                     )
+
 
         # Final LayerNorm
         hidden_states = llm.norm(hidden_states)
@@ -774,7 +774,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
         # 累积 vision mask（相对于原始 n_vision 个 token，用于 adapter）
         # 与训练时保持一致：adapter 接收的 mask 始终是原始 n_vision 维
-        # [DEBUG] 取消注释
         cumulative_vision_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
 
         for layer_idx, decoder_layer in enumerate(llm.layers):
@@ -807,6 +806,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     hidden_states = layer_outputs[0]
                 else:
                     hidden_states = layer_outputs
+
                 continue
 
             # === 剪枝层：手动计算 attention 以实现剪枝 ===
@@ -839,25 +839,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             key_states = key_states.view(batch_size, current_seq_len, num_kv_heads, head_dim).transpose(1, 2)
             value_states = value_states.view(batch_size, current_seq_len, num_kv_heads, head_dim).transpose(1, 2)
 
-            # DEBUG: RoPE 之前的 query 和 key（仅剪枝层）
-            orig_q_start = question_starts[0]
-            curr_q_start = None
-            for new_idx, orig_idx in enumerate(kept_indices[0]):
-                if orig_idx == orig_q_start:
-                    curr_q_start = new_idx
-                    break
-            if curr_q_start is None:
-                curr_q_start = current_vision_end
-            v_pos = current_vision_start + 5  # 检查第 5 个 vision token
-            print(f"  query[0,0,{curr_q_start},:5] before RoPE: {query_states[0,0,curr_q_start,:5].tolist()}")
-            print(f"  key[0,0,{v_pos},:5] before RoPE: {key_states[0,0,v_pos,:5].tolist()}")
-
             # Apply RoPE
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-            # DEBUG: RoPE 之后的 query 和 key（仅剪枝层）
-            print(f"  query[0,0,{curr_q_start},:5] after RoPE: {query_states[0,0,curr_q_start,:5].tolist()}")
-            print(f"  key[0,0,{v_pos},:5] after RoPE: {key_states[0,0,v_pos,:5].tolist()}")
 
             # 存入 KV cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": torch.arange(current_seq_len, device=device)}
@@ -872,10 +855,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # 计算 attention
             attn_weights = torch.matmul(query_states, key_states_expanded.transpose(-2, -1)) * attn.scaling
 
-            # DEBUG: 打印 softmax 前的 attn_scores（仅剪枝层）
-            scores_slice = attn_weights[0, 0, curr_q_start, current_vision_start:current_vision_start+10]
-            print(f"  attn_scores[0,0,{curr_q_start},{current_vision_start}:{current_vision_start+10}]: {scores_slice.tolist()}")
-
             # 应用 causal mask
             causal_mask = torch.triu(
                 torch.full((current_seq_len, current_seq_len), float('-inf'), device=device, dtype=dtype),
@@ -885,13 +864,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
-            # === 剪枝层处理（现在只有剪枝层会到达这里）===
-            # DEBUG: 打印进入剪枝层时的 hidden_states
-            print(f"\n[Layer {layer_idx} INFER entering]")
-            print(f"  input hidden_states: mean={hidden_states.mean().item():.6f}, std={hidden_states.std().item():.6f}")
-            print(f"  hidden_states[0,0,:5]: {hidden_states[0,0,:5].tolist()}")
-
-            # Step 1: 计算 question->vision attention 和 hard_mask（提前计算）
+            # === 剪枝层处理 ===
+            # Step 1: 计算 question->vision attention 和 hard_mask
             q2v_attn_list = []
             for i in range(batch_size):
                 orig_q_start, orig_q_end = question_starts[i], question_ends[i]
@@ -913,24 +887,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
 
-            # DEBUG: 打印 attention weights 的详细信息
-            q2v_slice = attn_weights[0, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
-            print(f"  attn_weights[q→v]: shape={q2v_slice.shape}, mean={q2v_slice.mean().item():.8f}, sum={q2v_slice.sum().item():.4f}")
-            # 打印第一个 head 的前几个值
-            print(f"  attn_weights[0,0,{current_q_start},:10]: {attn_weights[0,0,current_q_start,:10].tolist()}")
-
-            # 简化的推理调试输出
-            print(f"\n[Layer {layer_idx} INFER] seq_len={current_seq_len}, n_vision={current_vision_end - current_vision_start}")
-            print(f"  question=[{question_starts[0]},{question_ends[0]}), current_q=[{current_q_start},{current_q_end})")
-            print(f"  q2v_attn_avg: mean={q2v_attn_avg.mean().item():.6f}, sum={q2v_attn_avg.sum().item():.4f}")
-            print(f"  vision_hidden: mean={vision_hidden.mean().item():.6f}, std={vision_hidden.std().item():.6f}")
-
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
                 hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
-
-            # DEBUG: 打印 pruner 输出
-            print(f"  hard_mask.sum={hard_mask.sum().item():.0f}")
 
             # Step 2: 用 mask 修改 attention weights（与训练一致）
             current_n_vision = current_vision_end - current_vision_start
@@ -951,6 +910,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # Step 3: 计算剪枝后的 attention output
             attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
+
             attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
             # Step 4: 将当前层的 hard_mask pad 到原始 n_vision 维度（与训练时一致）
