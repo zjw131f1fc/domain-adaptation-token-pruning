@@ -202,7 +202,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         return_pruning_info: bool = True,
         **kwargs
     ) -> PrunableLlavaOutput:
-        """前向传播
+        """前向传播（训练时物理删除 vision tokens，与推理完全对齐）
 
         参数:
             input_ids: 输入 token IDs
@@ -243,102 +243,167 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
         # 准备 LLaMA forward 的参数
-        batch_size, seq_len, _ = inputs_embeds.shape
+        batch_size, orig_seq_len, _ = inputs_embeds.shape
+        device = inputs_embeds.device
+        dtype = inputs_embeds.dtype
 
         use_cache = kwargs.get('use_cache', False)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=llm.config)
 
-        cache_position = kwargs.get('cache_position', None)
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + seq_len, device=inputs_embeds.device
-            )
-
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        # 创建 causal mask
-        causal_mask = create_causal_mask(
-            config=llm.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-
-        # Position embeddings
-        hidden_states = inputs_embeds
-        position_embeddings = llm.rotary_emb(hidden_states, position_ids)
-
         # === 累积 mask：用于让后续层知道之前哪些 vision tokens 被剪掉了 ===
-        n_vision = vision_end - vision_start if (vision_start is not None and vision_end is not None) else 0
-        if n_vision > 0:
+        n_vision_orig = vision_end - vision_start if (vision_start is not None and vision_end is not None) else 0
+        if n_vision_orig > 0:
             cumulative_vision_mask = torch.ones(
-                batch_size, n_vision,
-                device=inputs_embeds.device,
-                dtype=inputs_embeds.dtype
+                batch_size, n_vision_orig,
+                device=device,
+                dtype=dtype
             )
         else:
             cumulative_vision_mask = None
+
+        # === 当前状态（会随着剪枝层更新）===
+        hidden_states = inputs_embeds
+        current_seq_len = orig_seq_len
+        current_vision_start = vision_start
+        current_vision_end = vision_end
+        current_question_starts = list(question_starts) if question_starts else None
+        current_question_ends = list(question_ends) if question_ends else None
+        current_answer_starts = list(answer_starts) if answer_starts else None
+        current_answer_ends = list(answer_ends) if answer_ends else None
 
         # === 遍历所有层 ===
         pruning_infos = {}
 
         for layer_idx, decoder_layer in enumerate(llm.layers):
+            # 为当前序列长度计算 position_ids 和 position_embeddings
+            position_ids = torch.arange(current_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+            position_embeddings = llm.rotary_emb(hidden_states, position_ids)
+
             if isinstance(decoder_layer, PrunableLlamaDecoderLayer) and return_pruning_info:
                 # 剪枝层
                 hidden_states, pruning_info = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask,
+                    attention_mask=None,  # 让剪枝层自己创建 causal mask
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
-                    cache_position=cache_position,
+                    cache_position=None,
                     position_embeddings=position_embeddings,
-                    vision_start=vision_start,
-                    vision_end=vision_end,
-                    question_starts=question_starts,
-                    question_ends=question_ends,
-                    answer_starts=answer_starts,
-                    answer_ends=answer_ends,
+                    vision_start=current_vision_start,
+                    vision_end=current_vision_end,
+                    question_starts=current_question_starts,
+                    question_ends=current_question_ends,
+                    answer_starts=current_answer_starts,
+                    answer_ends=current_answer_ends,
                     return_pruning_info=True,
-                    cumulative_vision_mask=cumulative_vision_mask,  # 传递累积 mask
+                    cumulative_vision_mask=cumulative_vision_mask,
                 )
                 if pruning_info is not None:
                     pruning_infos[layer_idx] = pruning_info
                     # 更新累积 mask
                     if 'hard_mask' in pruning_info:
-                        cumulative_vision_mask = pruning_info['hard_mask']
+                        new_cumulative_mask = pruning_info['hard_mask']
+
+                        # === 物理删除 vision tokens 并更新位置 ===
+                        # 提取当前层保留的 vision token 索引（相对于当前 vision 位置）
+                        # cumulative_vision_mask 是相对于原始 n_vision 的，需要转换
+                        if cumulative_vision_mask is not None:
+                            # 找到之前保留的位置
+                            prev_kept_indices = cumulative_vision_mask[0].nonzero(as_tuple=True)[0]
+                            n_prev_kept = len(prev_kept_indices)
+                        else:
+                            n_prev_kept = n_vision_orig
+
+                        # 当前层的 mask 是在 prev_kept tokens 上的
+                        # hard_mask 已经是原始 n_vision 维度的（在 prunable_llama_layer 中 scatter 回来的）
+                        # 找到当前保留的位置
+                        current_kept_indices = new_cumulative_mask[0].nonzero(as_tuple=True)[0]
+                        n_current_kept = len(current_kept_indices)
+
+                        # 计算这一层删除了多少 tokens
+                        n_deleted = n_prev_kept - n_current_kept
+
+                        if n_deleted > 0:
+                            # 物理删除 hidden_states 中的 vision tokens
+                            # hidden_states 的当前 vision 区间是 [current_vision_start, current_vision_end)
+                            # 需要找出哪些位置要保留
+
+                            # 当前的 vision tokens
+                            before_vision = hidden_states[:, :current_vision_start, :]
+                            vision_part = hidden_states[:, current_vision_start:current_vision_end, :]
+                            after_vision = hidden_states[:, current_vision_end:, :]
+
+                            # 相对于当前 vision 区间的保留索引
+                            # cumulative_vision_mask 转换到当前 vision 区间
+                            if cumulative_vision_mask is not None:
+                                # 在之前保留的位置中，找到现在仍然保留的
+                                # prev_kept_indices 对应当前 vision_part 的索引 0, 1, 2, ...
+                                # new_cumulative_mask 在 orig 维度上标记哪些保留
+                                # 需要找到 prev_kept_indices 中哪些在 new_cumulative_mask 中仍然是 1
+                                relative_kept = []
+                                for rel_idx, orig_idx in enumerate(prev_kept_indices):
+                                    if new_cumulative_mask[0, orig_idx] == 1:
+                                        relative_kept.append(rel_idx)
+                                relative_kept = torch.tensor(relative_kept, device=device, dtype=torch.long)
+                            else:
+                                # 第一个剪枝层
+                                relative_kept = current_kept_indices
+
+                            # 物理删除
+                            kept_vision = vision_part[:, relative_kept, :]
+                            hidden_states = torch.cat([before_vision, kept_vision, after_vision], dim=1)
+
+                            # 更新位置
+                            current_seq_len = hidden_states.shape[1]
+                            offset = n_prev_kept - n_current_kept
+
+                            # vision 区间更新
+                            current_vision_end = current_vision_start + n_current_kept
+
+                            # question 和 answer 位置更新（它们在 vision 之后，需要减去 offset）
+                            current_question_starts = [qs - offset if qs >= current_vision_start + n_prev_kept else qs
+                                                       for qs in current_question_starts]
+                            current_question_ends = [qe - offset if qe >= current_vision_start + n_prev_kept else qe
+                                                     for qe in current_question_ends]
+                            current_answer_starts = [ans - offset if ans >= current_vision_start + n_prev_kept else ans
+                                                     for ans in current_answer_starts]
+                            current_answer_ends = [ae - offset if ae >= current_vision_start + n_prev_kept else ae
+                                                   for ae in current_answer_ends]
+
+                            print(f"[Physical Deletion in forward - Layer {layer_idx}]")
+                            print(f"  Deleted {n_deleted} tokens, seq_len: {orig_seq_len} -> {current_seq_len}")
+
+                        # 更新累积 mask
+                        cumulative_vision_mask = new_cumulative_mask
+
             else:
-                # 非剪枝层或不需要返回剪枝信息
+                # 非剪枝层
                 if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
                     hidden_states = decoder_layer(
                         hidden_states,
-                        attention_mask=causal_mask,
+                        attention_mask=None,
                         position_ids=position_ids,
                         past_key_values=past_key_values,
                         use_cache=use_cache,
-                        cache_position=cache_position,
+                        cache_position=None,
                         position_embeddings=position_embeddings,
-                        vision_start=vision_start,
-                        vision_end=vision_end,
-                        question_starts=question_starts,
-                        question_ends=question_ends,
-                        answer_starts=answer_starts,
-                        answer_ends=answer_ends,
+                        vision_start=current_vision_start,
+                        vision_end=current_vision_end,
+                        question_starts=current_question_starts,
+                        question_ends=current_question_ends,
+                        answer_starts=current_answer_starts,
+                        answer_ends=current_answer_ends,
                         return_pruning_info=False,
                     )
                 else:
                     hidden_states = decoder_layer(
                         hidden_states,
-                        attention_mask=causal_mask,
+                        attention_mask=None,  # 让层自己创建 causal mask
                         position_ids=position_ids,
                         past_key_values=past_key_values,
                         use_cache=use_cache,
-                        cache_position=cache_position,
+                        cache_position=None,
                         position_embeddings=position_embeddings,
                     )
 
@@ -348,9 +413,35 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # LM Head
         logits = self.base_model.lm_head(hidden_states)
 
-        # 计算 loss
+        # 计算 loss（注意：序列长度可能已经改变，labels 需要相应调整）
         loss = None
         if labels is not None:
+            # labels 仍然是原始长度，需要根据删除的 tokens 调整
+            # 但由于我们只在 vision 区间删除，而 labels 通常只在 answer 位置有效
+            # 可以简单地截断 logits 和 labels 到匹配的长度
+            # 或者使用原始方式（如果 labels 已经正确对齐）
+
+            # 更安全的方式：只在有效位置计算 loss
+            # logits: (batch, current_seq_len, vocab)
+            # labels: (batch, orig_seq_len)
+
+            # 计算偏移量
+            total_offset = orig_seq_len - current_seq_len
+            if total_offset > 0:
+                # labels 需要删除 vision 区间被删除的位置
+                # 但这很复杂，暂时用简单的方式：截断到匹配长度
+                # 注意：这假设 labels 在 vision 区间都是 -100（忽略）
+                new_labels = torch.full((batch_size, current_seq_len), -100, device=device, dtype=labels.dtype)
+                # 复制 before vision
+                new_labels[:, :vision_start] = labels[:, :vision_start]
+                # 复制 after vision（根据新位置）
+                orig_after_start = vision_end
+                new_after_start = current_vision_end
+                after_len = orig_seq_len - orig_after_start
+                if after_len > 0 and new_after_start + after_len <= current_seq_len:
+                    new_labels[:, new_after_start:new_after_start + after_len] = labels[:, orig_after_start:orig_after_start + after_len]
+                labels = new_labels
+
             loss = self.base_model.loss_function(
                 logits=logits,
                 labels=labels,
