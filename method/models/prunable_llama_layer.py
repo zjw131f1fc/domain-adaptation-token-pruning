@@ -72,6 +72,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_starts: Optional[list] = None,    # 每个样本的 answer 开始位置
         answer_ends: Optional[list] = None,      # 每个样本的 answer 结束位置
         return_pruning_info: bool = False,
+        cumulative_vision_mask: Optional[torch.Tensor] = None,  # 累积 vision mask
         **kwargs
     ):
         """前向传播
@@ -137,6 +138,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             answer_starts=answer_starts,
             answer_ends=answer_ends,
             return_pruning_info=return_pruning_info,
+            cumulative_vision_mask=cumulative_vision_mask,
             **kwargs
         )
 
@@ -156,6 +158,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_starts: list,
         answer_ends: list,
         return_pruning_info: bool,
+        cumulative_vision_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """剪枝层的前向传播
@@ -212,16 +215,19 @@ class PrunableLlamaDecoderLayer(nn.Module):
         value_states = repeat_kv(value_states, num_kv_groups)
 
         # === Step 2: 计算 Attention Weights ===
-        # attn_weights: (batch, heads, seq, seq)
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
+        # attn_scores: (batch, heads, seq, seq) - softmax 前的 scores
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
 
         # 应用 causal mask
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attn_scores = attn_scores + causal_mask
 
-        # Softmax
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # 保存 softmax 前的 scores（用于后续 attn_weights_fake 计算）
+        attn_scores_for_fake = attn_scores.clone()
+
+        # Softmax（用于 h_real 和 q2v_attn 提取）
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # === Step 3: 提取 question→vision attention 并生成 mask ===
         n_vision = vision_end - vision_start
@@ -242,9 +248,44 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 使用 LayerNorm 后的 hidden states
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]  # (batch, n_vision, hidden_size)
 
+        # === 根据累积 mask 过滤 pruner 输入（模拟推理时的物理删除）===
+        if cumulative_vision_mask is not None:
+            # cumulative_vision_mask: (batch, n_vision), 1=keep, 0=pruned
+            # 只把"逻辑上保留"的 tokens 传给 pruner
+            # 为了保持可导性，用 mask 乘以 hidden/attn，被剪掉的位置变成 0
+            # 然后 pruner 对这些位置的输出无关紧要（因为后面会用累积 mask 再过滤一次）
+            vision_hidden_masked = vision_hidden * cumulative_vision_mask.unsqueeze(-1)
+            q2v_attn_masked = q2v_attn_avg * cumulative_vision_mask
+            # DEBUG: 打印 pruner 输入的统计信息
+            print(f"\n[Pruner Input DEBUG - Layer {self.layer_idx}]")
+            print(f"  cumulative_vision_mask.sum: {cumulative_vision_mask.sum().item()}")
+            print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
+            print(f"  vision_hidden_masked.mean: {vision_hidden_masked.mean().item():.6f}")
+            print(f"  vision_hidden_masked (non-zero).mean: {vision_hidden_masked[cumulative_vision_mask.bool()].mean().item():.6f}")
+            print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
+            print(f"  q2v_attn_masked.mean: {q2v_attn_masked.mean().item():.6f}")
+        else:
+            vision_hidden_masked = vision_hidden
+            q2v_attn_masked = q2v_attn_avg
+            print(f"\n[Pruner Input DEBUG - Layer {self.layer_idx}]")
+            print(f"  cumulative_vision_mask: None (first pruning layer)")
+            print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
+
         # Pruner 生成 mask（新接口：传入 vision_hidden 和 q2v_attn）
-        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden, q2v_attn_avg)
+        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden_masked, q2v_attn_masked)
         # hard_mask: (batch, n_vision), 0/1
+
+        # DEBUG: 打印 pruner 输出
+        print(f"  hard_mask (before cumulative).sum: {hard_mask.sum().item()}")
+
+        # === 与累积 mask 结合：只有之前保留的 token 才能被当前层保留 ===
+        if cumulative_vision_mask is not None:
+            # 当前层只能在"之前保留"的 tokens 中选择
+            # hard_mask = hard_mask * cumulative_vision_mask 会导致：
+            # - 之前被剪掉的 token：无论当前层如何决定，最终都是 0
+            # - 之前保留的 token：由当前层决定
+            hard_mask = hard_mask * cumulative_vision_mask
+            print(f"  hard_mask (after cumulative).sum: {hard_mask.sum().item()}")
 
         # === Step 4: 计算 h_real 和 h_fake ===
         # h_real: 用完整 attention 聚合
@@ -252,31 +293,29 @@ class PrunableLlamaDecoderLayer(nn.Module):
         attn_output_real = torch.matmul(attn_weights, value_states)
 
         # h_fake: 用剪枝后的 attention 聚合
-        # 修改 attention weights，把被剪掉的 vision tokens 权重置零
-        # 使用非 inplace 操作以保持梯度
+        # 关键：在 softmax 前应用 mask（-inf penalty），而不是 softmax 后 mask + renormalize
+        # 这样与推理时物理删除的 softmax 归一化方式一致
+        # hard_mask: (batch, n_vision), 1=keep, 0=prune
+        batch_size_local, num_heads_local, seq_len_local, kv_len = attn_weights.shape
+
+        # 创建 penalty: 1->0, 0->-10000（在 softmax 前加到 scores 上）
         # hard_mask: (batch, n_vision) -> (batch, 1, 1, n_vision)
         mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)
+        penalty_vision = (1.0 - mask_expanded) * (-10000.0)
+        penalty_vision = penalty_vision.expand(-1, num_heads_local, seq_len_local, -1)
 
-        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
-        # 使用 torch.cat 避免 inplace 操作
-        batch_size_local, num_heads_local, seq_len_local, kv_len = attn_weights.shape
-        ones_before = torch.ones(batch_size_local, num_heads_local, seq_len_local, vision_start,
-                                  device=attn_weights.device, dtype=attn_weights.dtype)
-        ones_after = torch.ones(batch_size_local, num_heads_local, seq_len_local, kv_len - vision_end,
-                                 device=attn_weights.device, dtype=attn_weights.dtype)
-        # mask_expanded 需要扩展到 (batch, heads, seq, n_vision)
-        mask_vision = mask_expanded.expand(-1, num_heads_local, seq_len_local, -1)
-        full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
+        # 创建完整的 penalty（非 vision 部分为 0，vision 部分为 penalty）
+        zeros_before = torch.zeros(batch_size_local, num_heads_local, seq_len_local, vision_start,
+                                   device=attn_scores_for_fake.device, dtype=attn_scores_for_fake.dtype)
+        zeros_after = torch.zeros(batch_size_local, num_heads_local, seq_len_local, kv_len - vision_end,
+                                  device=attn_scores_for_fake.device, dtype=attn_scores_for_fake.dtype)
+        full_penalty = torch.cat([zeros_before, penalty_vision, zeros_after], dim=-1)
 
-        # 非 inplace 方式应用 mask
-        attn_weights_fake = attn_weights * full_mask
+        # 在 softmax 前应用 penalty
+        attn_scores_fake = attn_scores_for_fake + full_penalty
 
-        # 重新归一化（防止除零）
-        # NOTE: 当前是全局归一化，剪掉的 vision tokens 权重会分配给所有剩余 tokens
-        # （包括 system, question, answer 等非 vision tokens）
-        # 另一种选择是只在 vision tokens 内部重新分配，待后续实验对比
-        attn_sum = attn_weights_fake.sum(dim=-1, keepdim=True)
-        attn_weights_fake = attn_weights_fake / (attn_sum + 1e-8)
+        # Softmax（被剪掉的位置自然变成 0，且不影响归一化 - 与物理删除等效）
+        attn_weights_fake = F.softmax(attn_scores_fake, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
