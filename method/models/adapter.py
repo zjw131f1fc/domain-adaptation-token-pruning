@@ -4,14 +4,6 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-# 全局调试计数器
-_DEBUG_COUNTER = {"train": 0, "eval": 0, "eval_decode": 0}
-
-def reset_adapter_debug_counter():
-    """重置调试计数器"""
-    global _DEBUG_COUNTER
-    _DEBUG_COUNTER = {"train": 0, "eval": 0, "eval_decode": 0}
-
 
 class LightweightAdapter(nn.Module):
     """轻量级 Adapter：Mask-Aware + Query-Aware FiLM 调制
@@ -77,7 +69,6 @@ class LightweightAdapter(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         query: Optional[torch.Tensor] = None,
-        debug: bool = False,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -85,7 +76,6 @@ class LightweightAdapter(nn.Module):
             x: (batch, seq, hidden_size) - attention output
             mask: (batch, n_vision) - pruning mask (1=keep, 0=prune)
             query: (batch, seq, hidden_size) - attention query states
-            debug: 是否打印调试信息
         """
         h = self.dropout(self.act(self.down(x)))  # (batch, seq, bottleneck)
 
