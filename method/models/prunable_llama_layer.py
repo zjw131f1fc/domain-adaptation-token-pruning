@@ -218,26 +218,66 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # attn_scores: (batch, heads, seq, seq) - softmax 前的 scores
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
 
-        # 应用 causal mask
+        # 应用 causal mask（如果没有传入，自己创建）
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, :key_states.shape[-2]]
-            attn_scores = attn_scores + causal_mask
+        else:
+            # 创建标准的 causal mask
+            kv_len = key_states.shape[-2]
+            causal_mask = torch.triu(
+                torch.full((seq_len, kv_len), float('-inf'), device=attn_scores.device, dtype=attn_scores.dtype),
+                diagonal=1
+            )
+        attn_scores = attn_scores + causal_mask
 
         # 保存 softmax 前的 scores（用于后续 attn_weights_fake 计算）
         attn_scores_for_fake = attn_scores.clone()
 
+        # === 应用 cumulative_vision_mask 到 attn_scores（用于 q2v_attn 提取）===
+        # 这样被之前层剪掉的 vision token 在 softmax 后变成 ~0，
+        # kept 位置的 attention 分布才会和推理时一致
+        if cumulative_vision_mask is not None:
+            # cumulative_vision_mask: (batch, n_vision), 1=keep, 0=pruned
+            # 创建 penalty: 0->-10000, 1->0（保持 dtype 一致）
+            cumulative_penalty = (1.0 - cumulative_vision_mask.float()).unsqueeze(1).unsqueeze(2) * (-10000.0)
+            cumulative_penalty = cumulative_penalty.to(attn_scores.dtype)
+            # cumulative_penalty: (batch, 1, 1, n_vision)
+
+            # 创建完整的 penalty（非 vision 部分为 0）
+            kv_len = key_states.shape[-2]
+            zeros_before = torch.zeros(
+                batch_size, 1, 1, vision_start,
+                device=attn_scores.device, dtype=attn_scores.dtype
+            )
+            zeros_after = torch.zeros(
+                batch_size, 1, 1, kv_len - vision_end,
+                device=attn_scores.device, dtype=attn_scores.dtype
+            )
+            full_cumulative_penalty = torch.cat([zeros_before, cumulative_penalty, zeros_after], dim=-1)
+            # full_cumulative_penalty: (batch, 1, 1, kv_len)
+
+            attn_scores_for_q2v = attn_scores + full_cumulative_penalty
+        else:
+            attn_scores_for_q2v = attn_scores
+
         # Softmax（用于 h_real 和 q2v_attn 提取）
+        # h_real 用原始 attn_scores（不含 cumulative penalty）
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # q2v_attn 用含 cumulative penalty 的 scores
+        attn_weights_for_q2v = F.softmax(attn_scores_for_q2v, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
         # === Step 3: 提取 question→vision attention 并生成 mask ===
         n_vision = vision_end - vision_start
 
         # 逐样本提取 question→vision attention（每个样本的 question 位置不同）
+        # 使用 attn_weights_for_q2v（已应用 cumulative mask penalty）
         q2v_attn_list = []
         for i in range(batch_size):
             q_start, q_end = question_starts[i], question_ends[i]
+            # DEBUG: 打印 question 位置
+            print(f"  [q2v DEBUG] sample {i}: q_start={q_start}, q_end={q_end}, n_question={q_end-q_start}")
             # question→vision attention: (heads, n_question_i, n_vision)
-            q2v_i = attn_weights[i, :, q_start:q_end, vision_start:vision_end]
+            q2v_i = attn_weights_for_q2v[i, :, q_start:q_end, vision_start:vision_end]
             # 平均所有 heads 和 question tokens: (n_vision,)
             q2v_avg_i = q2v_i.mean(dim=(0, 1))
             q2v_attn_list.append(q2v_avg_i)
@@ -261,18 +301,29 @@ class PrunableLlamaDecoderLayer(nn.Module):
             print(f"  cumulative_vision_mask.sum: {cumulative_vision_mask.sum().item()}")
             print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
             print(f"  vision_hidden_masked.mean: {vision_hidden_masked.mean().item():.6f}")
-            print(f"  vision_hidden_masked (non-zero).mean: {vision_hidden_masked[cumulative_vision_mask.bool()].mean().item():.6f}")
-            print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
-            print(f"  q2v_attn_masked.mean: {q2v_attn_masked.mean().item():.6f}")
+            # q2v_attn_avg 已经通过 attn_weights_for_q2v 应用了 cumulative penalty
+            # 所以被剪掉的位置已经是 ~0，不需要再乘 mask
+            n_kept = cumulative_vision_mask.sum().item()
+            q2v_kept_mean = q2v_attn_avg.sum().item() / n_kept if n_kept > 0 else 0
+            print(f"  q2v_attn_avg.sum: {q2v_attn_avg.sum().item():.6f}")
+            print(f"  q2v_attn_avg (kept positions mean): {q2v_kept_mean:.6f}")
         else:
             vision_hidden_masked = vision_hidden
             q2v_attn_masked = q2v_attn_avg
             print(f"\n[Pruner Input DEBUG - Layer {self.layer_idx}]")
             print(f"  cumulative_vision_mask: None (first pruning layer)")
             print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
+            print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
 
-        # Pruner 生成 mask（新接口：传入 vision_hidden 和 q2v_attn）
-        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden_masked, q2v_attn_masked)
+        # Pruner 生成 mask（新接口：传入 vision_hidden, q2v_attn, key_padding_mask）
+        # key_padding_mask: True 表示该位置被 mask（不参与 cross-attention 计算）
+        if cumulative_vision_mask is not None:
+            # cumulative_vision_mask: 1=keep, 0=pruned
+            # key_padding_mask: True=mask, False=keep（相反）
+            key_padding_mask = (cumulative_vision_mask == 0)
+        else:
+            key_padding_mask = None
+        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden_masked, q2v_attn_masked, key_padding_mask)
         # hard_mask: (batch, n_vision), 0/1
 
         # DEBUG: 打印 pruner 输出

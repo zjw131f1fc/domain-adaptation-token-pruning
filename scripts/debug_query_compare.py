@@ -248,15 +248,16 @@ def main():
         handles.append(handle)
 
     print("\n" + "=" * 60)
-    print("Running TRAIN mode...")
+    print("Running TRAIN mode (with eval for fair comparison)...")
     print("=" * 60)
 
     # 预处理（训练模式，包含答案）
     prep_train = preprocess_sample(sample, processor, device, mode="train")
     inputs_train = prep_train['inputs']
 
-    # 训练模式 forward
-    model.train()
+    # 使用 eval 模式进行公平对比（排除 Gumbel 噪声影响）
+    # 这样训练和推理都用 threshold 逻辑生成 mask
+    model.eval()
     hook.clear()
 
     with torch.no_grad():  # 不需要梯度，只是对比
