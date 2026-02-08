@@ -32,4 +32,4 @@ configs/loss_tests/
 *.backup
 
 # 示例
-examples/
+examples/tmp/
