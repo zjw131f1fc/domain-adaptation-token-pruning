@@ -273,6 +273,17 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = llm.rotary_emb(hidden_states, position_ids)
 
+        # === 累积 mask：用于让后续层知道之前哪些 vision tokens 被剪掉了 ===
+        n_vision = vision_end - vision_start if (vision_start is not None and vision_end is not None) else 0
+        if n_vision > 0:
+            cumulative_vision_mask = torch.ones(
+                batch_size, n_vision,
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype
+            )
+        else:
+            cumulative_vision_mask = None
+
         # === 遍历所有层 ===
         pruning_infos = {}
 
@@ -294,9 +305,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     answer_starts=answer_starts,
                     answer_ends=answer_ends,
                     return_pruning_info=True,
+                    cumulative_vision_mask=cumulative_vision_mask,  # 传递累积 mask
                 )
                 if pruning_info is not None:
                     pruning_infos[layer_idx] = pruning_info
+                    # 更新累积 mask
+                    if 'hard_mask' in pruning_info:
+                        cumulative_vision_mask = pruning_info['hard_mask']
             else:
                 # 非剪枝层或不需要返回剪枝信息
                 if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
@@ -738,6 +753,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             )
             attn_weights = attn_weights + causal_mask
 
+            # DEBUG: 打印推理时的 causal_mask
+            if layer_idx in self.pruning_layers:
+                print(f"  [attn DEBUG INFER] Layer {layer_idx}: causal_mask.shape={causal_mask.shape}, min={causal_mask.min().item():.2f}, max={causal_mask.max().item():.2f}")
+
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
 
             # === 剪枝层：与训练对齐的处理流程 ===
@@ -757,15 +776,31 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         current_q_start = current_vision_end
                     if current_q_end is None:
                         current_q_end = current_seq_len
+                    # DEBUG: 打印 question 位置
+                    print(f"  [q2v DEBUG INFER] sample {i}: orig_q=({orig_q_start},{orig_q_end}), current_q=({current_q_start},{current_q_end}), n_question={current_q_end-current_q_start}")
                     q2v_i = attn_weights[i, :, current_q_start:current_q_end, current_vision_start:current_vision_end]
                     q2v_avg_i = q2v_i.mean(dim=(0, 1))
                     q2v_attn_list.append(q2v_avg_i)
                 q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
 
                 vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
+
+                # DEBUG: 打印推理时 pruner 输入（与训练对比）
+                print(f"\n[Pruner Input DEBUG - Layer {layer_idx} (INFERENCE)]")
+                print(f"  current_seq_len: {current_seq_len}")
+                print(f"  current_n_vision: {current_vision_end - current_vision_start}")
+                print(f"  vision_hidden.shape: {vision_hidden.shape}")
+                print(f"  vision_hidden.mean: {vision_hidden.mean().item():.6f}")
+                print(f"  q2v_attn_avg.shape: {q2v_attn_avg.shape}")
+                print(f"  q2v_attn_avg.mean: {q2v_attn_avg.mean().item():.6f}")
+
                 pruner = self.pruner_manager.get_pruner(layer_idx)
                 with torch.no_grad():
                     hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+
+                # DEBUG: 打印 pruner 输出
+                print(f"  hard_mask.shape: {hard_mask.shape}")
+                print(f"  hard_mask.sum: {hard_mask.sum().item()}")
 
                 # Step 2: 用 mask 修改 attention weights（与训练一致）
                 current_n_vision = current_vision_end - current_vision_start
