@@ -452,10 +452,11 @@ def train_step(
     losses = {}
     stats = {'temperature': current_temp}
 
-    # 1. Task Loss
+    # 1. Task Loss（使用物理删除后调整的 answer_starts）
+    adjusted_answer_starts = output.adjusted_answer_starts if output.adjusted_answer_starts else prep['answer_starts']
     task_loss = compute_task_loss(
         output.logits,
-        prep['answer_starts'],
+        adjusted_answer_starts,
         prep['answers'],
         processor.tokenizer,
         device

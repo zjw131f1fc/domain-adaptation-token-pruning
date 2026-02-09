@@ -35,6 +35,9 @@ class PrunableLlavaOutput:
     image_hidden_states: Optional[torch.Tensor] = None
     # 剪枝信息
     pruning_infos: Optional[Dict[int, Dict]] = None
+    # 物理删除后调整的位置（用于 compute_task_loss）
+    adjusted_answer_starts: Optional[List[int]] = None
+    adjusted_answer_ends: Optional[List[int]] = None
 
 
 class PrunableLlavaForConditionalGeneration(nn.Module):
@@ -455,6 +458,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             attentions=None,
             image_hidden_states=image_features if pixel_values is not None else None,
             pruning_infos=pruning_infos if return_pruning_info else None,
+            adjusted_answer_starts=current_answer_starts,
+            adjusted_answer_ends=current_answer_ends,
         )
 
     def set_temperature(self, temperature: float):
