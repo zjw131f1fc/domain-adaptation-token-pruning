@@ -918,35 +918,32 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-            # Step 4: 将当前层的 hard_mask pad 到原始 n_vision 维度（与训练时一致）
-            # hard_mask: (batch, current_n_vision) -> (batch, n_vision)
-            current_n_vision = hard_mask.shape[1]
-            if current_n_vision < n_vision:
-                # pad 0 到右边
-                padded_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
-                padded_mask[:, :current_n_vision] = hard_mask
-            else:
-                padded_mask = hard_mask
-
-            # Step 5: 应用 Adapter（使用当前层的 mask，与训练一致）
-            adapter = self.adapter_manager.get_adapter(layer_idx)
-            if adapter is not None:
-                attn_output = adapter(
-                    attn_output,
-                    mask=padded_mask,
-                    query=query_states_flat
-                )
-
-            # Step 6: 更新累积 vision mask（用于后续层的物理删除）
+            # Step 4: 将当前层的 hard_mask scatter 到原始 n_vision 维度（与训练时一致）
+            # 训练时使用 cumulative_vision_mask 的保留位置来 scatter，推理时也要一致
+            # hard_mask: (batch, current_n_vision) -> scattered_mask: (batch, n_vision)
+            scattered_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
             for i in range(batch_size):
                 kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
                 for j, pos in enumerate(kept_positions):
                     if j < hard_mask.shape[1]:
-                        cumulative_vision_mask[i, pos] = hard_mask[i, j]
+                        scattered_mask[i, pos] = hard_mask[i, j]
 
-            # 记录 mask 用于统计（同时保存 padded_mask 供 Generate 阶段使用）
+            # Step 5: 应用 Adapter（使用 scatter 后的 mask，与训练一致）
+            adapter = self.adapter_manager.get_adapter(layer_idx)
+            if adapter is not None:
+                attn_output = adapter(
+                    attn_output,
+                    mask=scattered_mask,
+                    query=query_states_flat
+                )
+
+            # Step 6: 更新累积 vision mask（用于后续层的物理删除）
+            # 直接使用 scattered_mask 作为新的累积 mask
+            cumulative_vision_mask = scattered_mask.clone()
+
+            # 记录 mask 用于统计（保存 scattered_mask 供 Generate 阶段使用）
             n_kept_absolute = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
-            masks[layer_idx] = (hard_mask, n_kept_absolute, padded_mask)
+            masks[layer_idx] = (hard_mask, n_kept_absolute, scattered_mask)
 
             attn_output = attn.o_proj(attn_output)
 
@@ -1153,11 +1150,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 if layer_idx in self.pruning_layers:
                     adapter = self.adapter_manager.get_adapter(layer_idx)
                     if adapter is not None:
-                        # 从 masks 中获取 padded_mask
-                        _, _, padded_mask = masks[layer_idx]
+                        # 从 masks 中获取 scattered_mask（与训练时一致的 scatter 格式）
+                        _, _, scattered_mask = masks[layer_idx]
                         attn_output_gen = adapter(
                             attn_output_gen,
-                            mask=padded_mask,
+                            mask=scattered_mask,
                             query=query_states_flat_gen  # Decode 阶段的 query
                         )
 
