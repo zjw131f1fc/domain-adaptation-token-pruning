@@ -15,6 +15,7 @@ docs
 todo.md
 todo2.md
 TRAINING_NOTES.md
+阈值.md
 
 # 日志
 train.log
@@ -33,3 +34,4 @@ configs/loss_tests/
 
 # 示例
 examples/tmp/
+阈值.md
