@@ -517,22 +517,25 @@ def train_step(
         pruning_layers = sorted(output.pruning_infos.keys())
 
         weighted_kept = torch.tensor(0.0, device=device)
-        cumulative_mask = None
+
+        # Debug: 前几步打印 sparsity 计算详情
+        debug_sparsity = (current_step <= 3)
+        if debug_sparsity:
+            print(f"[DEBUG sparsity] n_vision={n_vision}, target_token_num={target_token_num}, target_ratio={target_ratio:.4f}")
+            print(f"[DEBUG sparsity] total_layers={total_layers}, pruning_layers={pruning_layers}")
 
         for i, layer_idx in enumerate(pruning_layers):
             if i == 0:
                 n_layers_before = layer_idx
                 weighted_kept = weighted_kept + n_layers_before * 1.0
+                if debug_sparsity:
+                    print(f"[DEBUG sparsity] layers 0-{layer_idx-1}: kept_ratio=1.0, n_layers={n_layers_before}")
 
+            # hard_mask 已经是累积 mask（之前被剪掉的 token 在这里是 0）
+            # 所以 layer_mask.mean() 直接就是累积保留率，不需要额外乘法
             hard_mask = output.pruning_infos[layer_idx]['hard_mask']
             layer_mask = hard_mask.float().mean(dim=0)
-
-            if cumulative_mask is None:
-                cumulative_mask = layer_mask
-            else:
-                cumulative_mask = cumulative_mask * layer_mask
-
-            cumulative_ratio = cumulative_mask.mean()
+            cumulative_ratio = layer_mask.mean()
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
 
             if i < len(pruning_layers) - 1:
@@ -540,10 +543,21 @@ def train_step(
             else:
                 n_affected = total_layers - layer_idx
 
+            if debug_sparsity:
+                n_kept = (hard_mask[0] > 0.5).sum().item()  # 第一个样本的保留数量
+                print(f"[DEBUG sparsity] L{layer_idx}: hard_mask.shape={hard_mask.shape}, "
+                      f"n_kept(sample0)={n_kept}, cumulative_ratio={cumulative_ratio.item():.4f}, "
+                      f"n_affected={n_affected}")
+
             weighted_kept = weighted_kept + n_affected * cumulative_ratio
 
         avg_kept_ratio_tensor = weighted_kept / total_layers
         sparsity_loss = torch.abs(avg_kept_ratio_tensor - target_ratio)
+
+        if debug_sparsity:
+            print(f"[DEBUG sparsity] weighted_kept={weighted_kept.item():.4f}, "
+                  f"avg_kept_ratio={avg_kept_ratio_tensor.item():.4f}, "
+                  f"sparsity_loss={sparsity_loss.item():.4f}")
 
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
