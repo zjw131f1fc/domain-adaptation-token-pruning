@@ -273,6 +273,7 @@ def preprocess_batch(
         prompts = []
         for q, a in zip(questions, answers):
             # 答案首字母大写，与 compute_task_loss 中的处理保持一致
+            # ASSISTANT: 后面加空格，compute_task_loss 中 tokenize 时也要加空格前缀
             prompt = f"USER: <image>\n{q}\nASSISTANT: {a.capitalize()}"
             prompts.append(prompt)
     else:
@@ -370,13 +371,15 @@ def compute_task_loss(
     answer_starts: List[int],
     answers: List[str],
     tokenizer,
-    device: torch.device
+    device: torch.device,
+    debug: bool = False
 ) -> torch.Tensor:
     """计算 task loss (cross entropy)"""
     batch_size = logits.shape[0]
     total_loss = torch.tensor(0.0, device=device)
 
     for i in range(batch_size):
+        # 不加空格前缀，因为 answer_starts 指向的是答案的第一个 token（空格在前面）
         answer = answers[i].capitalize()
         answer_ids = tokenizer(answer, add_special_tokens=False)['input_ids']
         if len(answer_ids) == 0:
@@ -391,6 +394,16 @@ def compute_task_loss(
         pred_logits = logits[i, pred_start:pred_end]
         target_len = min(len(answer_ids), pred_end - pred_start)
         targets = torch.tensor(answer_ids[:target_len], device=device)
+
+        # Debug: 打印实际参与计算的 pred_logits 和 targets
+        if debug and i == 0:
+            pred_token_ids = pred_logits.argmax(dim=-1).tolist()
+            target_ids = targets.tolist()
+            print(f"[DEBUG task_loss] answer='{answer}'")
+            print(f"[DEBUG task_loss] pred_start={pred_start}, pred_end={pred_end}, logits.shape={logits.shape}")
+            print(f"[DEBUG task_loss] targets (answer_ids): {target_ids} -> '{tokenizer.decode(target_ids)}'")
+            print(f"[DEBUG task_loss] pred_token_ids (argmax): {pred_token_ids} -> '{tokenizer.decode(pred_token_ids)}'")
+            print(f"[DEBUG task_loss] match: {pred_token_ids == target_ids}")
 
         loss = F.cross_entropy(pred_logits, targets)
         total_loss = total_loss + loss
@@ -459,7 +472,8 @@ def train_step(
         adjusted_answer_starts,
         prep['answers'],
         processor.tokenizer,
-        device
+        device,
+        debug=(current_step <= 3)  # 前几步打印调试信息
     )
     losses['task_loss'] = task_loss
     stats['raw_task_loss'] = task_loss.item()
@@ -990,6 +1004,57 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
     disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
 
+    # 创建学习率调度器（余弦退火）
+    # 计算总步数用于调度器
+    epochs = trainer_cfg.get('epochs', 1)  # 提前获取 epochs
+    total_batches_per_epoch = len(train_dataset) // batch_size
+    total_steps_for_scheduler = epochs * total_batches_per_epoch
+
+    lr_scheduler_cfg = opt_cfg.get('lr_scheduler', {})
+    lr_scheduler_type = lr_scheduler_cfg.get('type', 'none')  # 'none', 'cosine', 'linear'
+    warmup_ratio = lr_scheduler_cfg.get('warmup_ratio', 0.1)
+    min_lr_ratio = lr_scheduler_cfg.get('min_lr_ratio', 0.1)  # 最小学习率 = 初始学习率 * min_lr_ratio
+
+    pruner_scheduler = None
+    disc_scheduler = None
+
+    if lr_scheduler_type == 'cosine':
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        warmup_steps = int(total_steps_for_scheduler * warmup_ratio)
+        cosine_steps = total_steps_for_scheduler - warmup_steps
+
+        # Pruner scheduler: warmup + cosine
+        if warmup_steps > 0:
+            pruner_warmup = LinearLR(pruner_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+            pruner_cosine = CosineAnnealingLR(pruner_optimizer, T_max=cosine_steps, eta_min=pruner_lr * min_lr_ratio)
+            pruner_scheduler = SequentialLR(pruner_optimizer, schedulers=[pruner_warmup, pruner_cosine], milestones=[warmup_steps])
+        else:
+            pruner_scheduler = CosineAnnealingLR(pruner_optimizer, T_max=total_steps_for_scheduler, eta_min=pruner_lr * min_lr_ratio)
+
+        # Disc scheduler: warmup + cosine
+        if warmup_steps > 0:
+            disc_warmup = LinearLR(disc_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+            disc_cosine = CosineAnnealingLR(disc_optimizer, T_max=cosine_steps, eta_min=disc_lr * min_lr_ratio)
+            disc_scheduler = SequentialLR(disc_optimizer, schedulers=[disc_warmup, disc_cosine], milestones=[warmup_steps])
+        else:
+            disc_scheduler = CosineAnnealingLR(disc_optimizer, T_max=total_steps_for_scheduler, eta_min=disc_lr * min_lr_ratio)
+
+        if is_main_process():
+            logger.info(f"LR Scheduler: Cosine Annealing with warmup")
+            logger.info(f"  Warmup steps: {warmup_steps} ({warmup_ratio:.0%})")
+            logger.info(f"  Min LR ratio: {min_lr_ratio}")
+
+    elif lr_scheduler_type == 'linear':
+        from torch.optim.lr_scheduler import LinearLR
+
+        pruner_scheduler = LinearLR(pruner_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
+        disc_scheduler = LinearLR(disc_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
+
+        if is_main_process():
+            logger.info(f"LR Scheduler: Linear Decay")
+            logger.info(f"  Min LR ratio: {min_lr_ratio}")
+
     # 检查是否有 checkpoint 需要加载（用于恢复训练）
     checkpoint_path = config.global_settings.get('checkpoint', None)
     start_step = 0
@@ -1029,6 +1094,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info("  Loaded disc_optimizer state")
 
+            # 加载学习率调度器状态
+            if 'pruner_scheduler' in checkpoint and pruner_scheduler is not None:
+                pruner_scheduler.load_state_dict(checkpoint['pruner_scheduler'])
+                if is_main_process():
+                    logger.info("  Loaded pruner_scheduler state")
+
+            if 'disc_scheduler' in checkpoint and disc_scheduler is not None:
+                disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
+                if is_main_process():
+                    logger.info("  Loaded disc_scheduler state")
+
             # 恢复训练步数
             if 'step' in checkpoint:
                 start_step = checkpoint['step']
@@ -1044,8 +1120,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             if is_main_process():
                 logger.warning(f"Checkpoint file not found: {checkpoint_path}, starting from scratch")
 
-    # 训练参数
-    epochs = trainer_cfg.get('epochs', 1)
+    # 训练参数（epochs 已在上面获取）
     print_every = trainer_cfg.get('print_loss_every_batches', 50)
     eval_every = trainer_cfg.get('eval_every_batches', 1000)
     eval_max_samples = trainer_cfg.get('eval_max_samples', 500)
@@ -1129,6 +1204,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
                 pruner_optimizer.step()
+
+            # 学习率调度器步进
+            if pruner_scheduler is not None:
+                pruner_scheduler.step()
+            if disc_scheduler is not None:
+                disc_scheduler.step()
 
             # 判别器重新初始化
             # 注意：需要在所有进程间同步决策，避免死锁
@@ -1281,14 +1362,19 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             # 保存（只在主进程）
             if global_step % save_every == 0 and is_main_process():
                 ckpt_path = save_dir / f"checkpoint_step{global_step}.pt"
-                torch.save({
+                ckpt_data = {
                     'step': global_step,
                     'pruner_state_dict': model.pruner_manager.state_dict(),
                     'adapter_state_dict': model.adapter_manager.state_dict(),
                     'disc_state_dict': model.disc_manager.state_dict(),
                     'pruner_optimizer': pruner_optimizer.state_dict(),
                     'disc_optimizer': disc_optimizer.state_dict(),
-                }, ckpt_path)
+                }
+                if pruner_scheduler is not None:
+                    ckpt_data['pruner_scheduler'] = pruner_scheduler.state_dict()
+                if disc_scheduler is not None:
+                    ckpt_data['disc_scheduler'] = disc_scheduler.state_dict()
+                torch.save(ckpt_data, ckpt_path)
                 logger.info(f"Saved checkpoint to {ckpt_path}")
 
             # 同步所有进程

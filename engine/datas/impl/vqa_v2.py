@@ -172,6 +172,9 @@ class VQAV2Preparer(BasePreparer):
                 train_answer = mc_answer
             else:
                 train_answer = self._get_most_common_answer(answers)
+            # 过滤掉答案为 "none" 的样本（这类样本对训练没有意义）
+            if train_answer.lower().strip() == 'none':
+                continue
             # 构建样本
             sample = {
                 'image': img_path,  # 存储路径而非加载图像
@@ -241,6 +244,9 @@ class VQAV2Preparer(BasePreparer):
                 train_answer = mc_answer
             else:
                 train_answer = self._get_most_common_answer(answers)
+            # 过滤掉答案为 "none" 的样本（这类样本对训练没有意义）
+            if train_answer.lower().strip() == 'none':
+                continue
             # 构建样本
             sample = {
                 'image': img_path,  # 存储路径而非加载图像
