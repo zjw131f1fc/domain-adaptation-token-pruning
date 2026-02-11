@@ -262,8 +262,10 @@ class PrunableLlamaDecoderLayer(nn.Module):
             kept_indices = cumulative_vision_mask_clean[0].nonzero(as_tuple=True)[0]
 
             # 创建新的累积 mask：在原始维度上，只有当前层保留且之前也保留的才是 1
+            # 使用 scatter 操作保持梯度流（in-place 赋值会断开梯度）
             hard_mask_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
-            hard_mask_full[:, kept_indices] = hard_mask
+            indices = kept_indices.unsqueeze(0).expand(batch_size, -1)
+            hard_mask_full = hard_mask_full.scatter(1, indices, hard_mask)
         else:
             hard_mask_full = hard_mask
             n_vision_orig = n_vision
