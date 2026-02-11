@@ -16,8 +16,6 @@
 配置说明：
     - eval_mode: 在配置文件 evaluation_settings.eval_mode 中设置，如 ["origin", "hard"]
     - max_samples: 在配置文件 trainer_settings.dl_settings.eval_max_samples 中设置
-    - 阈值: 在配置文件 method_settings.pruner_thresholds 中设置
-    - 网格搜索: 在配置文件 evaluation_settings.grid_search.enable 中设置
 """
 
 import os
@@ -28,12 +26,10 @@ os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import random
 import torch
 import torch.distributed as dist
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from itertools import product
 from tqdm import tqdm
 
 # 添加项目根目录
@@ -86,156 +82,6 @@ def load_checkpoint(
         logger.info("Checkpoint loaded successfully.")
 
     return checkpoint
-
-
-def print_grid_search_progress(
-    results: List[Dict[str, Any]],
-    origin_acc: float,
-    pruning_layers: List[int],
-):
-    """打印当前所有网格搜索结果（按准确率排序）"""
-    if not results:
-        return
-
-    # 按准确率排序
-    sorted_results = sorted(results, key=lambda x: x['accuracy'], reverse=True)
-
-    print("\n" + "-" * 90)
-    print(f"Progress: {len(results)} combinations evaluated | Origin Acc: {origin_acc:.2%}")
-    print("-" * 90)
-    print(f"{'#':<3} {'Acc':<8} {'Rel':<8} {'Kept':<8} {'Thresholds'}")
-    print("-" * 90)
-
-    for i, r in enumerate(sorted_results):
-        rel_acc = r['accuracy'] / origin_acc if origin_acc > 0 else 0
-        thresh_str = '/'.join(f"{r['thresholds'][l]:.2f}" for l in pruning_layers)
-        print(f"{i+1:<3} {r['accuracy']:.4f}   {rel_acc:.4f}   {r['avg_kept_ratio']:.4f}   {thresh_str}")
-
-    print("-" * 90)
-
-
-def run_grid_search(
-    model,
-    processor,
-    eval_dataset,
-    judge,
-    config,
-    device: torch.device,
-    max_samples: int,
-    pruning_layers: List[int],
-    threshold_values: List[float],
-    distributed: bool,
-    origin_result: Optional[Dict[str, Any]] = None,
-    aggregate_judge=None,
-    requires_aggregate_eval: bool = False,
-) -> List[Dict[str, Any]]:
-    """执行网格搜索（笛卡尔积，每层阈值可不同，随机顺序）"""
-    results = []
-
-    # 生成所有组合并随机打乱
-    combinations = list(product(threshold_values, repeat=len(pruning_layers)))
-    random.shuffle(combinations)
-
-    origin_acc = origin_result['accuracy'] if origin_result else 0.0
-
-    if is_main_process():
-        print(f"\nGrid search: {len(combinations)} combinations (randomized)")
-        print(f"Layers: {pruning_layers}")
-        print(f"Values: {threshold_values}")
-        if origin_result:
-            print(f"Origin baseline: {origin_acc:.2%}")
-
-    pbar = tqdm(combinations, desc="Grid search", disable=not is_main_process())
-
-    for combo in pbar:
-        # 构建阈值字典
-        thresholds = {layer: t for layer, t in zip(pruning_layers, combo)}
-
-        # 设置阈值
-        model.pruner_manager.set_thresholds(thresholds)
-
-        # 评估
-        eval_result = evaluate(
-            model=model,
-            processor=processor,
-            dataset=eval_dataset,
-            judge=judge,
-            config=config,
-            device=device,
-            max_samples=max_samples,
-            mode='hard',
-            distributed=distributed,
-            aggregate_judge=aggregate_judge,
-            requires_aggregate_eval=requires_aggregate_eval,
-        )
-
-        result_entry = {
-            'thresholds': thresholds.copy(),
-            'accuracy': eval_result['accuracy'],
-            'avg_kept_ratio': eval_result.get('avg_kept_ratio', 0),
-            'correct': eval_result.get('correct', 0),
-            'total': eval_result.get('total', 0),
-        }
-        results.append(result_entry)
-
-        # 更新进度条
-        if is_main_process():
-            thresh_str = '/'.join(f"{t:.2f}" for t in combo)
-            rel_acc = eval_result['accuracy'] / origin_acc if origin_acc > 0 else 0
-            pbar.set_postfix({
-                'thresh': thresh_str,
-                'acc': f"{eval_result['accuracy']:.2%}",
-                'rel': f"{rel_acc:.2%}",
-                'kept': f"{eval_result.get('avg_kept_ratio', 0):.2%}"
-            })
-
-            # 每步打印所有结果
-            print_grid_search_progress(results, origin_acc, pruning_layers)
-
-    return results
-
-
-def print_grid_search_results(
-    results: List[Dict[str, Any]],
-    pruning_layers: List[int],
-    origin_result: Optional[Dict[str, Any]] = None,
-):
-    """打印网格搜索结果"""
-    if not results:
-        print("No results.")
-        return
-
-    origin_acc = origin_result['accuracy'] if origin_result else 0.0
-
-    # 按准确率排序
-    sorted_results = sorted(results, key=lambda x: x['accuracy'], reverse=True)
-
-    print("\n" + "=" * 90)
-    print("Grid Search Results (sorted by accuracy)")
-    if origin_result:
-        print(f"Origin Baseline: {origin_acc:.2%} ({origin_result['correct']}/{origin_result['total']})")
-    print("=" * 90)
-    print(f"{'Rank':<5} {'Accuracy':<10} {'Rel Acc':<10} {'Kept':<10} {'Thresholds'}")
-    print("-" * 90)
-
-    for i, r in enumerate(sorted_results[:20]):
-        rel_acc = r['accuracy'] / origin_acc if origin_acc > 0 else 0
-        thresh_str = ', '.join(f"L{l}={r['thresholds'][l]:.2f}" for l in pruning_layers)
-        print(f"{i+1:<5} {r['accuracy']:.4f}     {rel_acc:.4f}     {r['avg_kept_ratio']:.4f}     {thresh_str}")
-
-    # 最佳配置
-    best = sorted_results[0]
-    print("\n" + "=" * 90)
-    print("Best Configuration")
-    print("=" * 90)
-    print(f"Accuracy: {best['accuracy']:.4f} ({best['correct']}/{best['total']})")
-    if origin_acc > 0:
-        print(f"Relative Accuracy: {best['accuracy'] / origin_acc:.4f}")
-    print(f"Kept Ratio: {best['avg_kept_ratio']:.4f}")
-    print("\nConfig (copy to yaml):")
-    print("pruner_thresholds:")
-    for layer in pruning_layers:
-        print(f"  {layer}: {best['thresholds'][layer]}")
 
 
 def evaluate_no_image_samples(
@@ -396,18 +242,13 @@ def main():
             config.logger = None
         logger = config.logger
 
-        # 检查是否启用网格搜索
         eval_cfg = config.evaluation_settings
-        grid_cfg = eval_cfg.get('grid_search', {})
-        grid_search_enabled = grid_cfg.get('enable', False)
 
         if is_main_process():
             print("=" * 60)
             print("Attention Consistency Pruning - Evaluation")
             if distributed:
                 print(f"Distributed mode: world_size={world_size}")
-            if grid_search_enabled:
-                print("Mode: Grid Search")
             print("=" * 60)
 
         # 确定 checkpoint
@@ -492,21 +333,34 @@ def main():
         if distributed:
             dist.barrier()
 
-        # 网格搜索或普通评估
-        if grid_search_enabled:
-            # 从配置读取阈值列表
-            threshold_values = grid_cfg.get('threshold_values', [0.2, 0.3, 0.4, 0.5, 0.6])
+        # 普通评估
+        # 从配置文件读取评估模式
+        eval_modes = eval_cfg.get('eval_mode', ['hard'])
+        if isinstance(eval_modes, str):
+            eval_modes = [eval_modes]
 
-            if logger:
-                logger.info(f"Grid search values: {threshold_values}")
+        if is_main_process():
+            print("\n" + "=" * 60)
+            print("Evaluation Results")
+            print("=" * 60)
 
-            # 先评估 origin 作为 baseline（缓存，只需计算一次）
+        # 计算无图样本的 max_samples（按比例分配）
+        if has_no_image_samples:
+            total_samples = len(eval_dataset) + len(no_image_samples)
+            no_image_ratio = len(no_image_samples) / total_samples
+            no_image_max_samples = int(max_samples * no_image_ratio)
+            image_max_samples = max_samples - no_image_max_samples
             if logger:
-                logger.info("Evaluating origin mode as baseline...")
-            if is_main_process():
-                print("\n" + "=" * 60)
-                print("Evaluating Origin Baseline (cached for grid search)")
-                print("=" * 60)
+                logger.info(f"Samples allocation: {image_max_samples} with image, {no_image_max_samples} without image")
+        else:
+            image_max_samples = max_samples
+            no_image_max_samples = 0
+
+        # 如果 mode 包含 origin，先评估并缓存（用于后续 hard 模式的相对准确率）
+        origin_result = None
+        if 'origin' in eval_modes:
+            if logger:
+                logger.info("Evaluating 'origin' mode...")
 
             origin_result = evaluate(
                 model=model,
@@ -515,194 +369,127 @@ def main():
                 judge=judge,
                 config=config,
                 device=device,
-                max_samples=max_samples,
+                max_samples=image_max_samples,
                 mode='origin',
                 distributed=distributed,
                 aggregate_judge=aggregate_judge,
                 requires_aggregate_eval=requires_aggregate_eval,
             )
 
-            if is_main_process():
-                print(f"Origin Accuracy: {origin_result['accuracy']:.2%} ({origin_result.get('correct', 'N/A')}/{origin_result.get('total', 'N/A')})")
-                print("=" * 60)
+            # 评估无图样本并合并（仅非聚合评估模式）
+            if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
+                if logger:
+                    logger.info("Evaluating no-image samples...")
+                no_image_result = evaluate_no_image_samples(
+                    model=model,
+                    processor=processor,
+                    no_image_samples=no_image_samples,
+                    judge=judge,
+                    device=device,
+                    max_samples=no_image_max_samples,
+                    max_length=max_length,
+                    distributed=distributed,
+                )
+                origin_result = merge_eval_results(origin_result, no_image_result)
 
-            # 执行网格搜索
-            grid_results = run_grid_search(
+            if is_main_process():
+                print(f"\n[ORIGIN]")
+                # 根据数据集类型打印不同指标
+                if 'total_score' in origin_result:
+                    # MME
+                    print(f"  MME Total Score: {origin_result['total_score']:.1f}")
+                    print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
+                    print(f"  Categories: {origin_result.get('num_categories', 0)}")
+                elif 'balanced_accuracy' in origin_result:
+                    # GQA
+                    print(f"  Balanced Accuracy: {origin_result['balanced_accuracy']:.2%}")
+                    print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
+                    print(f"  Answer Categories: {origin_result.get('num_answer_categories', 0)}")
+                else:
+                    # 普通数据集
+                    print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result.get('correct', 'N/A')}/{origin_result.get('total', 'N/A')})")
+                    if has_no_image_samples and 'image_accuracy' in origin_result:
+                        print(f"    - with image: {origin_result['image_accuracy']:.2%} ({origin_result['image_correct']}/{origin_result['image_total']})")
+                        print(f"    - no image:   {origin_result['no_image_accuracy']:.2%} ({origin_result['no_image_correct']}/{origin_result['no_image_total']})")
+
+        # 评估其他模式（跳过已评估的 origin）
+        for eval_mode in eval_modes:
+            if eval_mode == 'origin':
+                # 已经评估过了，跳过
+                continue
+
+            if logger:
+                logger.info(f"\nEvaluating '{eval_mode}' mode...")
+
+            eval_result = evaluate(
                 model=model,
                 processor=processor,
-                eval_dataset=eval_dataset,
+                dataset=eval_dataset,
                 judge=judge,
                 config=config,
                 device=device,
-                max_samples=max_samples,
-                pruning_layers=pruning_layers,
-                threshold_values=threshold_values,
+                max_samples=image_max_samples,
+                mode=eval_mode,
                 distributed=distributed,
-                origin_result=origin_result,
                 aggregate_judge=aggregate_judge,
                 requires_aggregate_eval=requires_aggregate_eval,
             )
 
-            if is_main_process():
-                print_grid_search_results(grid_results, pruning_layers, origin_result)
-        else:
-            # 普通评估
-            # 从配置文件读取评估模式
-            eval_modes = eval_cfg.get('eval_mode', ['hard'])
-            if isinstance(eval_modes, str):
-                eval_modes = [eval_modes]
-
-            if is_main_process():
-                print("\n" + "=" * 60)
-                print("Evaluation Results")
-                print("=" * 60)
-
-            # 计算无图样本的 max_samples（按比例分配）
-            if has_no_image_samples:
-                total_samples = len(eval_dataset) + len(no_image_samples)
-                no_image_ratio = len(no_image_samples) / total_samples
-                no_image_max_samples = int(max_samples * no_image_ratio)
-                image_max_samples = max_samples - no_image_max_samples
+            # 评估无图样本并合并（仅非聚合评估模式）
+            if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
                 if logger:
-                    logger.info(f"Samples allocation: {image_max_samples} with image, {no_image_max_samples} without image")
-            else:
-                image_max_samples = max_samples
-                no_image_max_samples = 0
-
-            # 如果 mode 包含 origin，先评估并缓存（用于后续 hard 模式的相对准确率）
-            origin_result = None
-            if 'origin' in eval_modes:
-                if logger:
-                    logger.info("Evaluating 'origin' mode...")
-
-                origin_result = evaluate(
+                    logger.info("Evaluating no-image samples...")
+                no_image_result = evaluate_no_image_samples(
                     model=model,
                     processor=processor,
-                    dataset=eval_dataset,
+                    no_image_samples=no_image_samples,
                     judge=judge,
-                    config=config,
                     device=device,
-                    max_samples=image_max_samples,
-                    mode='origin',
+                    max_samples=no_image_max_samples,
+                    max_length=max_length,
                     distributed=distributed,
-                    aggregate_judge=aggregate_judge,
-                    requires_aggregate_eval=requires_aggregate_eval,
                 )
-
-                # 评估无图样本并合并（仅非聚合评估模式）
-                if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
-                    if logger:
-                        logger.info("Evaluating no-image samples...")
-                    no_image_result = evaluate_no_image_samples(
-                        model=model,
-                        processor=processor,
-                        no_image_samples=no_image_samples,
-                        judge=judge,
-                        device=device,
-                        max_samples=no_image_max_samples,
-                        max_length=max_length,
-                        distributed=distributed,
-                    )
-                    origin_result = merge_eval_results(origin_result, no_image_result)
-
-                if is_main_process():
-                    print(f"\n[ORIGIN]")
-                    # 根据数据集类型打印不同指标
-                    if 'total_score' in origin_result:
-                        # MME
-                        print(f"  MME Total Score: {origin_result['total_score']:.1f}")
-                        print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
-                        print(f"  Categories: {origin_result.get('num_categories', 0)}")
-                    elif 'balanced_accuracy' in origin_result:
-                        # GQA
-                        print(f"  Balanced Accuracy: {origin_result['balanced_accuracy']:.2%}")
-                        print(f"  Simple Accuracy: {origin_result.get('simple_accuracy', 0):.2%}")
-                        print(f"  Answer Categories: {origin_result.get('num_answer_categories', 0)}")
-                    else:
-                        # 普通数据集
-                        print(f"  Accuracy: {origin_result['accuracy']:.2%} ({origin_result.get('correct', 'N/A')}/{origin_result.get('total', 'N/A')})")
-                        if has_no_image_samples and 'image_accuracy' in origin_result:
-                            print(f"    - with image: {origin_result['image_accuracy']:.2%} ({origin_result['image_correct']}/{origin_result['image_total']})")
-                            print(f"    - no image:   {origin_result['no_image_accuracy']:.2%} ({origin_result['no_image_correct']}/{origin_result['no_image_total']})")
-
-            # 评估其他模式（跳过已评估的 origin）
-            for eval_mode in eval_modes:
-                if eval_mode == 'origin':
-                    # 已经评估过了，跳过
-                    continue
-
-                if logger:
-                    logger.info(f"\nEvaluating '{eval_mode}' mode...")
-
-                eval_result = evaluate(
-                    model=model,
-                    processor=processor,
-                    dataset=eval_dataset,
-                    judge=judge,
-                    config=config,
-                    device=device,
-                    max_samples=image_max_samples,
-                    mode=eval_mode,
-                    distributed=distributed,
-                    aggregate_judge=aggregate_judge,
-                    requires_aggregate_eval=requires_aggregate_eval,
-                )
-
-                # 评估无图样本并合并（仅非聚合评估模式）
-                if has_no_image_samples and no_image_max_samples > 0 and not requires_aggregate_eval:
-                    if logger:
-                        logger.info("Evaluating no-image samples...")
-                    no_image_result = evaluate_no_image_samples(
-                        model=model,
-                        processor=processor,
-                        no_image_samples=no_image_samples,
-                        judge=judge,
-                        device=device,
-                        max_samples=no_image_max_samples,
-                        max_length=max_length,
-                        distributed=distributed,
-                    )
-                    eval_result = merge_eval_results(eval_result, no_image_result)
-
-                if is_main_process():
-                    print(f"\n[{eval_mode.upper()}]")
-                    # 根据数据集类型打印不同指标
-                    if 'total_score' in eval_result:
-                        # MME
-                        print(f"  MME Total Score: {eval_result['total_score']:.1f}")
-                        print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
-                        print(f"  Categories: {eval_result.get('num_categories', 0)}")
-                    elif 'balanced_accuracy' in eval_result:
-                        # GQA
-                        print(f"  Balanced Accuracy: {eval_result['balanced_accuracy']:.2%}")
-                        print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
-                        print(f"  Answer Categories: {eval_result.get('num_answer_categories', 0)}")
-                    else:
-                        # 普通数据集
-                        print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result.get('correct', 'N/A')}/{eval_result.get('total', 'N/A')})")
-                        if has_no_image_samples and 'image_accuracy' in eval_result:
-                            print(f"    - with image: {eval_result['image_accuracy']:.2%} ({eval_result['image_correct']}/{eval_result['image_total']})")
-                            print(f"    - no image:   {eval_result['no_image_accuracy']:.2%} ({eval_result['no_image_correct']}/{eval_result['no_image_total']})")
-
-                    # 显示相对准确率（仅当 origin 也被评估时）
-                    if origin_result is not None and origin_result['accuracy'] > 0:
-                        rel_acc = eval_result['accuracy'] / origin_result['accuracy']
-                        print(f"  Relative Accuracy: {rel_acc:.2%}")
-
-                    if 'avg_kept_ratio' in eval_result:
-                        print(f"  Kept ratio: {eval_result['avg_kept_ratio']:.2%}")
-                        layer_ratios = []
-                        for layer_idx in pruning_layers:
-                            kept_key = f'L{layer_idx}_kept'
-                            if kept_key in eval_result:
-                                layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
-                        if layer_ratios:
-                            print(f"  Per-layer: [{', '.join(layer_ratios)}]")
+                eval_result = merge_eval_results(eval_result, no_image_result)
 
             if is_main_process():
-                print("\n" + "=" * 60)
-                print("Evaluation completed.")
-                print("=" * 60)
+                print(f"\n[{eval_mode.upper()}]")
+                # 根据数据集类型打印不同指标
+                if 'total_score' in eval_result:
+                    # MME
+                    print(f"  MME Total Score: {eval_result['total_score']:.1f}")
+                    print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
+                    print(f"  Categories: {eval_result.get('num_categories', 0)}")
+                elif 'balanced_accuracy' in eval_result:
+                    # GQA
+                    print(f"  Balanced Accuracy: {eval_result['balanced_accuracy']:.2%}")
+                    print(f"  Simple Accuracy: {eval_result.get('simple_accuracy', 0):.2%}")
+                    print(f"  Answer Categories: {eval_result.get('num_answer_categories', 0)}")
+                else:
+                    # 普通数据集
+                    print(f"  Accuracy: {eval_result['accuracy']:.2%} ({eval_result.get('correct', 'N/A')}/{eval_result.get('total', 'N/A')})")
+                    if has_no_image_samples and 'image_accuracy' in eval_result:
+                        print(f"    - with image: {eval_result['image_accuracy']:.2%} ({eval_result['image_correct']}/{eval_result['image_total']})")
+                        print(f"    - no image:   {eval_result['no_image_accuracy']:.2%} ({eval_result['no_image_correct']}/{eval_result['no_image_total']})")
+
+                # 显示相对准确率（仅当 origin 也被评估时）
+                if origin_result is not None and origin_result['accuracy'] > 0:
+                    rel_acc = eval_result['accuracy'] / origin_result['accuracy']
+                    print(f"  Relative Accuracy: {rel_acc:.2%}")
+
+                if 'avg_kept_ratio' in eval_result:
+                    print(f"  Kept ratio: {eval_result['avg_kept_ratio']:.2%}")
+                    layer_ratios = []
+                    for layer_idx in pruning_layers:
+                        kept_key = f'L{layer_idx}_kept'
+                        if kept_key in eval_result:
+                            layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
+                    if layer_ratios:
+                        print(f"  Per-layer: [{', '.join(layer_ratios)}]")
+
+        if is_main_process():
+            print("\n" + "=" * 60)
+            print("Evaluation completed.")
+            print("=" * 60)
 
     finally:
         if distributed:

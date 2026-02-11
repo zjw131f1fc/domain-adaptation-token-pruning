@@ -15,6 +15,7 @@
 
 import os
 import sys
+import math
 
 # 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
 os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
@@ -125,14 +126,20 @@ def load_model(config, device: torch.device, local_rank: int):
     dropout = method_cfg.get('pruner_dropout', 0.1)
     disc_spectral_norm = method_cfg.get('disc_use_spectral_norm', False)
 
+    # Gumbel mode: 'always', 'never', 'hybrid'
+    # 初始化时根据 mode 设置 use_gumbel_noise
+    gumbel_mode = method_cfg.get('gumbel_mode', 'never')
+    if gumbel_mode == 'always':
+        use_gumbel_noise = True
+    elif gumbel_mode == 'hybrid':
+        # hybrid 模式初始时使用 noise（阶段1）
+        use_gumbel_noise = True
+    else:
+        use_gumbel_noise = False
+
     # Adapter 配置
     adapter_type = method_cfg.get('adapter_type', 'lightweight')
     adapter_bottleneck = method_cfg.get('adapter_bottleneck', None)
-
-    # 获取每层的推理阈值配置
-    pruner_thresholds_raw = method_cfg.get('pruner_thresholds', {})
-    # 确保 key 是整数
-    pruner_thresholds = {int(k): float(v) for k, v in pruner_thresholds_raw.items()} if pruner_thresholds_raw else None
 
     # 模型路径
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
@@ -180,16 +187,14 @@ def load_model(config, device: torch.device, local_rank: int):
         temperature=temperature,
         dropout=dropout,
         disc_use_spectral_norm=disc_spectral_norm,
-        pruner_thresholds=pruner_thresholds,
+        use_gumbel_noise=use_gumbel_noise,
     )
 
     # 冻结基础模型
     model.freeze_base_model()
 
     if logger:
-        logger.info(f"Model loaded. Pruning layers: {pruning_layers}")
-        if pruner_thresholds:
-            logger.info(f"Pruner thresholds: {pruner_thresholds}")
+        logger.info(f"Model loaded. Pruning layers: {pruning_layers}, gumbel_mode: {gumbel_mode}")
         logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, "
                    f"Adapters={sum(p.numel() for p in model.get_adapter_parameters()):,}, "
                    f"Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
@@ -427,16 +432,55 @@ def train_step(
     """执行一个训练步骤"""
     method_cfg = config.method_settings
 
-    # === Temperature Annealing ===
-    temperature = method_cfg.get('temperature', 1.0)
-    temperature_min = method_cfg.get('temperature_min', 0.5)
-    anneal_rate = method_cfg.get('temperature_anneal_rate', 0.4)
-
+    # === Gumbel Mode 三阶段调度 ===
+    gumbel_mode = method_cfg.get('gumbel_mode', 'never')
     progress = current_step / total_steps if total_steps > 0 else 0
-    if progress < anneal_rate:
-        current_temp = temperature - (progress / anneal_rate) * (temperature - temperature_min)
+
+    if gumbel_mode == 'hybrid':
+        # 混合三阶段策略
+        phase1_end = method_cfg.get('hybrid_phase1_end', 0.5)
+        phase2_end = method_cfg.get('hybrid_phase2_end', 0.8)
+        phase1_temp_start = method_cfg.get('hybrid_phase1_temp_start', 1.5)
+        phase1_temp_end = method_cfg.get('hybrid_phase1_temp_end', 0.1)
+        phase3_temp = method_cfg.get('hybrid_phase3_temp', 0.1)
+
+        if progress < phase1_end:
+            # 阶段1：探索期 - 温度退火 + Gumbel noise
+            phase_progress = progress / phase1_end
+            current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
+            use_gumbel_noise = True
+            current_phase = 1
+        elif progress < phase2_end:
+            # 阶段2：稳定期 - 低温 + Gumbel noise
+            current_temp = phase1_temp_end
+            use_gumbel_noise = True
+            current_phase = 2
+        else:
+            # 阶段3：确定性微调期 - 关闭 noise，训练=推理
+            current_temp = phase3_temp
+            use_gumbel_noise = False
+            current_phase = 3
+
+        model.set_use_gumbel_noise(use_gumbel_noise)
+    elif gumbel_mode == 'always':
+        # 始终使用 Gumbel noise（旧的温度退火逻辑）
+        temperature = method_cfg.get('temperature', 1.0)
+        temperature_min = method_cfg.get('temperature_min', 0.5)
+        anneal_rate = method_cfg.get('temperature_anneal_rate', 0.4)
+
+        if progress < anneal_rate:
+            current_temp = temperature - (progress / anneal_rate) * (temperature - temperature_min)
+        else:
+            current_temp = temperature_min
+        use_gumbel_noise = True
+        current_phase = 0
+        model.set_use_gumbel_noise(True)
     else:
-        current_temp = temperature_min
+        # never: 纯 STE，不使用 Gumbel noise
+        current_temp = method_cfg.get('temperature_min', 0.1)
+        use_gumbel_noise = False
+        current_phase = 0
+        model.set_use_gumbel_noise(False)
 
     model.set_temperature(current_temp)
 
@@ -463,7 +507,12 @@ def train_step(
 
     # === 计算 Losses ===
     losses = {}
-    stats = {'temperature': current_temp}
+    stats = {
+        'temperature': current_temp,
+        'use_gumbel_noise': use_gumbel_noise,
+    }
+    if gumbel_mode == 'hybrid':
+        stats['hybrid_phase'] = current_phase
 
     # 1. Task Loss（使用物理删除后调整的 answer_starts）
     adjusted_answer_starts = output.adjusted_answer_starts if output.adjusted_answer_starts else prep['answer_starts']
@@ -511,7 +560,18 @@ def train_step(
         # Sparsity Loss
         target_token_num = method_cfg.get('target_token_num', 144)
         n_vision = prep['n_vision']
-        target_ratio = target_token_num / n_vision
+        final_target_ratio = target_token_num / n_vision
+
+        # 剪枝目标退火：从 100% 保留逐渐退火到目标值
+        sparsity_anneal_ratio = method_cfg.get('sparsity_anneal_ratio', 0.0)
+        if sparsity_anneal_ratio > 0 and progress < sparsity_anneal_ratio:
+            # 使用余弦退火：从 1.0 平滑过渡到 final_target_ratio
+            anneal_progress = progress / sparsity_anneal_ratio
+            # 余弦退火：(1 + cos(π * t)) / 2 从 1 到 0
+            cosine_factor = (1 + math.cos(math.pi * anneal_progress)) / 2
+            target_ratio = final_target_ratio + (1.0 - final_target_ratio) * cosine_factor
+        else:
+            target_ratio = final_target_ratio
 
         total_layers = len(model.base_model.language_model.layers)
         pruning_layers = sorted(output.pruning_infos.keys())
@@ -565,6 +625,26 @@ def train_step(
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
 
+    # === Entropy 正则损失：鼓励 logits 生成极端值 ===
+    # 最小化 entropy 会让 sigmoid(logits) 接近 0 或 1，使训练和推理行为一致
+    entropy_weight = method_cfg.get('entropy_weight', 0.0)
+    if entropy_weight > 0 and output.pruning_infos:
+        entropy_losses = []
+        for layer_idx in output.pruning_infos:
+            keep_logits = output.pruning_infos[layer_idx].get('keep_logits')
+            if keep_logits is not None:
+                # p = sigmoid(keep_logits)
+                p = torch.sigmoid(keep_logits.float())
+                # entropy = -p * log(p) - (1-p) * log(1-p)
+                # 使用 clamp 避免 log(0)
+                p_clamped = p.clamp(min=1e-7, max=1-1e-7)
+                entropy = -p_clamped * torch.log(p_clamped) - (1 - p_clamped) * torch.log(1 - p_clamped)
+                entropy_losses.append(entropy.mean())
+        if entropy_losses:
+            entropy_loss = torch.stack(entropy_losses).mean()
+            losses['entropy_loss'] = entropy_loss
+            stats['entropy_loss'] = entropy_loss.item()
+
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     adv_weight = method_cfg.get('adv_loss_weight', 0.5)
@@ -600,6 +680,8 @@ def train_step(
         weighted_losses['adv_loss'] = losses['adv_loss'] * adv_weight
     if 'sparsity_loss' in losses:
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
+    if 'entropy_loss' in losses:
+        weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
     if 'disc_loss' in losses:
         weighted_losses['disc_loss'] = losses['disc_loss']
 
@@ -637,19 +719,8 @@ def evaluate(
     """
     model.eval()
 
-    # 设置推理模式
-    method_cfg = config.method_settings
-    inference_mode = method_cfg.get('pruner_inference_mode', 'threshold')
-    model.pruner_manager.set_inference_mode(inference_mode)
-
     # 获取 max_length 配置
     max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
-
-    if inference_mode == 'topk':
-        topk_ks_raw = method_cfg.get('pruner_topk_ks', {})
-        topk_ks = {int(k): int(v) for k, v in topk_ks_raw.items()} if topk_ks_raw else {}
-        if topk_ks:
-            model.pruner_manager.set_topk_ks(topk_ks)
 
     n_samples = min(len(dataset), max_samples)
 
@@ -802,7 +873,17 @@ def evaluate(
 
                         if merged_kept:
                             interim_kept = sum(merged_kept) / len(merged_kept)
-                            print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                            # 打印每层保留率
+                            layer_str = ""
+                            if layer_kept_ratios:
+                                layer_parts = []
+                                for layer_idx in sorted([k for k in layer_kept_ratios.keys() if isinstance(k, int)]):
+                                    if layer_kept_ratios[layer_idx]:
+                                        avg_ratio = sum(layer_kept_ratios[layer_idx]) / len(layer_kept_ratios[layer_idx])
+                                        layer_parts.append(f"L{layer_idx}={avg_ratio:.2%}")
+                                if layer_parts:
+                                    layer_str = f" [{', '.join(layer_parts)}]"
+                            print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}{layer_str}")
                         else:
                             print(f"\n[Step {interim_total}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
             else:
@@ -823,7 +904,17 @@ def evaluate(
 
                     if kept_ratios:
                         interim_kept = sum(kept_ratios) / len(kept_ratios)
-                        print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}")
+                        # 打印每层保留率
+                        layer_str = ""
+                        if layer_kept_ratios:
+                            layer_parts = []
+                            for layer_idx in sorted([k for k in layer_kept_ratios.keys() if isinstance(k, int)]):
+                                if layer_kept_ratios[layer_idx]:
+                                    avg_ratio = sum(layer_kept_ratios[layer_idx]) / len(layer_kept_ratios[layer_idx])
+                                    layer_parts.append(f"L{layer_idx}={avg_ratio:.2%}")
+                            if layer_parts:
+                                layer_str = f" [{', '.join(layer_parts)}]"
+                        print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total}), Kept: {interim_kept:.2%}{layer_str}")
                     else:
                         print(f"\n[Step {step_idx}] Acc: {interim_acc:.2%} ({interim_correct}/{interim_total})")
 
@@ -1300,7 +1391,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             # 打印（只在主进程）
             if global_step % print_every == 0 and is_main_process():
                 loss_str = ", ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
-                logger.info(f"Step {global_step}: {loss_str}")
+                # 显示阶段信息
+                phase_str = ""
+                if 'hybrid_phase' in stats:
+                    phase_str = f" [Phase {stats['hybrid_phase']}]"
+                noise_str = "noise=ON" if stats.get('use_gumbel_noise', False) else "noise=OFF"
+                logger.info(f"Step {global_step}{phase_str}: {loss_str} (temp={stats['temperature']:.2f}, {noise_str})")
 
                 if 'avg_kept_ratio' in stats:
                     layer_ratios = []
@@ -1314,6 +1410,27 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     layer_str = ", ".join(layer_ratios)
                     logger.info(f"  Kept ratio: {stats['avg_kept_ratio']:.2%} "
                                f"(target: {stats['target_kept_ratio']:.2%}) [{layer_str}]")
+
+                    # 模拟推理时的累积保留率（Gumbel-Sigmoid: x > 0 即保留）
+                    if result['pruning_infos']:
+                        infer_layer_ratios = []
+                        cumulative_infer_mask = None
+                        for layer_idx in sorted(pruning_layers):
+                            info = result['pruning_infos'].get(layer_idx)
+                            if info and 'keep_logits' in info and info['keep_logits'] is not None:
+                                keep_logits = info['keep_logits'].float()
+                                # 推理时直接用 x > 0 判断
+                                current_infer_mask = (keep_logits > 0).float()
+                                # 累积 mask：当前层 mask * 之前层累积 mask
+                                if cumulative_infer_mask is None:
+                                    cumulative_infer_mask = current_infer_mask
+                                else:
+                                    cumulative_infer_mask = cumulative_infer_mask * current_infer_mask
+                                infer_kept = cumulative_infer_mask.mean().item()
+                                infer_layer_ratios.append(f"L{layer_idx}={infer_kept:.2%}")
+                        if infer_layer_ratios:
+                            infer_str = ", ".join(infer_layer_ratios)
+                            logger.info(f"  Infer ratio (x>0): [{infer_str}]")
 
                 if 'disc_per_layer' in stats:
                     per_layer_strs = []
