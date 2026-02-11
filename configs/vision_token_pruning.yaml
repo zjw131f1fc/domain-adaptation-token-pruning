@@ -18,7 +18,7 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 15
+    batch_size: 7
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -35,16 +35,16 @@ trainer_settings:
         type: "cosine"  # 'none', 'cosine', 'linear'
         warmup_ratio: 0.1  # warmup 步数占总步数的比例
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
-    print_loss_every_batches: 10  # 隔多久打印一次损失
-    eval_every_batches: 500  # 隔多久评估一次
+    print_loss_every_batches: 40  # 隔多久打印一次损失
+    eval_every_batches: 5000  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
-    save_every_batches: 500 # 隔多久保存一个checkpoint
+    save_every_batches: 5000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 20000
+    train: "all"
     test: 3000
   fast_load_no_random: false
   category_priority:
@@ -59,39 +59,34 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [4,12,20]
+  pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
   pruner_d_internal: 512   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
-  pruner_dropout: 0
+  pruner_dropout: 0.15
 
-  # 推理时的剪枝阈值（概率空间，0-1）
-  # 保留概率 > threshold 时保留 token
-  # 0.5 = 与训练时行为一致
-  # 0.6 = 更严格（保留更少），0.4 = 更宽松（保留更多）
-  pruner_thresholds:
-    4: 0.5
-    14: 0.5
-    24: 0.5
+  # Gumbel noise 模式配置
+  # - "always": 始终使用 Gumbel noise（有随机性，训练和推理可能不一致）
+  # - "never": 始终不使用 Gumbel noise（纯 STE，训练和推理完全一致）
+  # - "hybrid": 混合三阶段策略（推荐）
+  #     阶段1 探索期 (0% - phase1_end): 温度退火 + Gumbel noise，探索哪些 token 重要
+  #     阶段2 稳定期 (phase1_end - phase2_end): 低温 + Gumbel noise，精细化决策
+  #     阶段3 确定性微调期 (phase2_end - 100%): 关闭 noise，训练=推理，消除 gap
+  gumbel_mode: "hybrid"
 
-  # 推理模式配置
-  # - threshold: 使用 sigmoid(logits) > threshold 判断
-  # - topk: 保留 top-k 个 token（根据训练统计设置 k）
-  pruner_inference_mode: threshold
-
-  # topk 模式下每层保留的 token 数量
-  # 根据训练时的统计结果设置，训练结束时会输出建议值
-  pruner_topk_ks:
-    4: 138
-    14: 124
-    24: 94
+  # 混合模式三阶段配置（仅 gumbel_mode="hybrid" 时生效）
+  hybrid_phase1_end: 0.5    # 探索期结束点（占总步数比例）
+  hybrid_phase2_end: 0.8    # 稳定期结束点（占总步数比例）
+  hybrid_phase1_temp_start: 1.5   # 探索期起始温度
+  hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期温度）
+  hybrid_phase3_temp: 0.1         # 确定性微调期温度
 
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
   disc_d_d: 512
-  disc_dropout: 0.2
+  disc_dropout: 0.3
   disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
   disc_loss_type: hinge            # 损失类型: bce, wgan, hinge
   disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
@@ -110,14 +105,19 @@ method_settings:
   adapter_bottleneck: 512         # adapter 瓶颈维度
 
   # ==================== Pruner Warmup ====================
-  pruner_warmup_ratio: 0.02  # 前 10% 步数不做对抗训练
+  pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 130  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
+  # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
+  # 0.0 = 不退火，直接使用目标值
+  # 0.3 = 前 30% 训练步数进行余弦退火
+  sparsity_anneal_ratio: 0.3
 
   # ==================== Temperature 配置 ====================
-  # Gumbel-Softmax 温度，控制决策的"软硬"程度
-  temperature: 2.0
+  # 注意：如果使用 gumbel_mode="hybrid"，温度由 hybrid_phase* 参数控制
+  # 以下配置仅在 gumbel_mode="always" 或 "never" 时生效
+  temperature: 1.5
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
 
@@ -126,9 +126,10 @@ method_settings:
   # adv_loss: 让 fake 被判为 real
   # sparsity_loss: 约束保留率到目标值
 
-  task_loss_weight: 1.3
-  adv_loss_weight: 0.5
-  sparsity_weight: 0.7   # 提高到 5.0，让 sparsity loss 有足够影响力
+  task_loss_weight: 1.5
+  adv_loss_weight: 0.4
+  sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
+  entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
@@ -141,10 +142,4 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard"] # 80.64
-
-  # 网格搜索配置（用于搜索最优阈值）
-  grid_search:
-    enable: false  # 是否启用网格搜索
-    # 搜索的阈值列表（每层独立搜索，笛卡尔积）
-    threshold_values: [0.6, 0.5, 0.7]
+  eval_mode: ["hard"]

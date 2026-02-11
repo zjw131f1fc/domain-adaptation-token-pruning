@@ -11,7 +11,6 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 
 
@@ -24,11 +23,8 @@ class CrossAttentionPruner(nn.Module):
         d_model: 输入 hidden states 的维度
         d_internal: 内部特征维度
         n_heads: Cross-attention 头数
-        temperature: Gumbel-Softmax 温度
+        temperature: Gumbel-Sigmoid 温度
         dropout: Dropout 比例
-        threshold: 推理时的剪枝阈值（概率空间，0-1）
-                   保留概率 > threshold 时保留 token
-                   默认 0.5 等价于训练时的行为
     """
 
     def __init__(
@@ -38,18 +34,14 @@ class CrossAttentionPruner(nn.Module):
         n_heads: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
-        threshold: float = 0.5
+        use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
     ):
         super().__init__()
         self.d_model = d_model
         self.d_internal = d_internal
         self.n_heads = n_heads
         self.temperature = temperature
-        self.threshold = threshold
-
-        # 推理模式配置
-        self.inference_mode = 'threshold'  # 'threshold' 或 'topk'
-        self.topk_k = None  # topk 模式下保留的 token 数量
+        self.use_gumbel_noise = use_gumbel_noise
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
@@ -78,9 +70,9 @@ class CrossAttentionPruner(nn.Module):
         # Query aggregation: 将多个 query 的注意力聚合为单一分数
         self.query_aggregator = nn.Linear(self.n_queries, 1)
 
-        # 可学习偏置，初始化为 0 使初始保留率接近 50%
-        # sigmoid(0) = 0.5，softmax([0, 0])[1] = 0.5
-        self.keep_bias = nn.Parameter(torch.tensor(0.0))
+        # 可学习偏置，初始化为正数使初始保留率较高
+        # keep_bias=2.0 时，初始 logits 偏向正值，保留更多 token
+        self.keep_bias = nn.Parameter(torch.tensor(2.0))
 
         # 初始化
         self._init_weights()
@@ -126,13 +118,6 @@ class CrossAttentionPruner(nn.Module):
             baseline_raw = torch.log(q2v_attn.clamp(min=1e-6))
             baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
             baseline = baseline_raw - baseline_mean
-
-            # # DEBUG: 打印 baseline 计算细节
-            # print(f"\n[Baseline DEBUG]")
-            # print(f"  q2v_attn - shape: {q2v_attn.shape}, sum: {q2v_attn.sum().item():.6f}")
-            # print(f"  q2v_attn - mean: {q2v_attn.mean().item():.6f}, min: {q2v_attn.min().item():.6f}, max: {q2v_attn.max().item():.6f}")
-            # print(f"  baseline_raw - mean: {baseline_raw.mean().item():.4f}, min: {baseline_raw.min().item():.4f}, max: {baseline_raw.max().item():.4f}")
-            # print(f"  baseline_mean: {baseline_mean.item():.4f}")
         else:
             baseline = torch.zeros(batch_size, n_vision, device=vision_hidden.device)
 
@@ -162,22 +147,10 @@ class CrossAttentionPruner(nn.Module):
         token_score = self.token_scorer(v).squeeze(-1)  # (batch, n_vision)
 
         # 6. Delta = attn_score + token_score
-        # - attn_score: 基于 cross-attention 的全局重要性修正
-        # - token_score: 基于 token 自身特征的重要性修正
         delta = attn_score + token_score
 
         # === 残差连接: keep_logits = baseline + delta + bias ===
         keep_logits = baseline + delta + self.keep_bias
-
-        # # DEBUG: 打印 pruner 内部各组件的统计信息
-        # print(f"\n[Pruner Internal DEBUG]")
-        # print(f"  n_vision: {n_vision}")
-        # print(f"  baseline - mean: {baseline.mean().item():.4f}, min: {baseline.min().item():.4f}, max: {baseline.max().item():.4f}")
-        # print(f"  attn_score - mean: {attn_score.mean().item():.4f}, min: {attn_score.min().item():.4f}, max: {attn_score.max().item():.4f}")
-        # print(f"  token_score - mean: {token_score.mean().item():.4f}, min: {token_score.min().item():.4f}, max: {token_score.max().item():.4f}")
-        # print(f"  delta - mean: {delta.mean().item():.4f}, min: {delta.min().item():.4f}, max: {delta.max().item():.4f}")
-        # print(f"  keep_bias: {self.keep_bias.item():.4f}")
-        # print(f"  keep_logits - mean: {keep_logits.mean().item():.4f}, min: {keep_logits.min().item():.4f}, max: {keep_logits.max().item():.4f}")
 
         if return_components:
             return keep_logits, {
@@ -191,92 +164,79 @@ class CrossAttentionPruner(nn.Module):
 
         return keep_logits
 
-    def gumbel_softmax_mask(
+    def gumbel_sigmoid_mask(
         self,
         keep_logits: torch.Tensor,
-        temperature: Optional[float] = None
+        temperature: Optional[float] = None,
+        return_debug: bool = False
     ) -> torch.Tensor:
         """将 keep logits 转换为 0/1 hard mask
 
-        使用 Gumbel-Softmax with hard=True 实现可微的离散决策。
+        两种模式：
+        1. use_gumbel_noise=True (Gumbel-Sigmoid):
+           - 训练时: sigmoid((x + logistic_noise) / tau) > 0.5
+           - 有随机性，但训练和推理可能不一致
+        2. use_gumbel_noise=False (纯 STE):
+           - 训练时: sigmoid(x / tau) > 0.5，即 x > 0
+           - 无随机性，训练和推理完全一致
 
         参数:
             keep_logits: (batch, n_vision) - 保留 logits
             temperature: 可选的温度覆盖
+            return_debug: 是否返回 debug 信息
 
         返回:
             hard_mask: (batch, n_vision) - 0/1 mask，dtype 与输入一致
+            debug_info: dict (仅当 return_debug=True)
         """
         temp = temperature if temperature is not None else self.temperature
         input_dtype = keep_logits.dtype
 
         # 在 float32 下计算以避免 bfloat16 精度问题
-        # (bool).to(bfloat16) 可能产生非精确的 0/1 值
         keep_logits_f32 = keep_logits.float()
 
-        # 构建二分类 logits: [drop_logit, keep_logit]
-        drop_logits = torch.zeros_like(keep_logits_f32)
-        stacked = torch.stack([drop_logits, keep_logits_f32], dim=-1)  # (batch, n_vision, 2)
+        debug_info = {}
 
         if self.training:
-            # 训练模式：Gumbel-Softmax with hard=True
-            y = F.gumbel_softmax(stacked, tau=temp, hard=True, dim=-1)
-            hard_mask = y[..., 1]  # 取 keep 的决策
-        else:
-            # 推理模式：根据 inference_mode 选择
-            if self.inference_mode == 'topk' and self.topk_k is not None:
-                # Top-k 模式：保留 sigmoid 最高的 k 个 token
-                hard_mask = self._topk_mask(keep_logits_f32, self.topk_k)
+            if self.use_gumbel_noise:
+                # Gumbel-Sigmoid 模式：加 Logistic noise
+                u = torch.rand_like(keep_logits_f32).clamp(1e-8, 1 - 1e-8)
+                logistic_noise = torch.log(u) - torch.log(1 - u)
+                noisy_logits = keep_logits_f32 + logistic_noise
             else:
-                # 阈值模式：sigmoid(keep_logits) > threshold
-                keep_prob = torch.sigmoid(keep_logits_f32)
-                hard_mask = (keep_prob > self.threshold).float()
+                # 纯 STE 模式：不加 noise
+                logistic_noise = torch.zeros_like(keep_logits_f32)
+                noisy_logits = keep_logits_f32
 
-        # 转回原始 dtype
+            # sigmoid + hard 决策 + STE
+            y_soft = torch.sigmoid(noisy_logits / temp)
+            y_hard = (y_soft > 0.5).float()
+            hard_mask = y_hard - y_soft.detach() + y_soft
+
+            if return_debug:
+                debug_info = {
+                    'use_gumbel_noise': self.use_gumbel_noise,
+                    'logistic_noise_mean': logistic_noise.mean().item(),
+                    'logistic_noise_std': logistic_noise.std().item(),
+                    'noisy_logits_mean': noisy_logits.mean().item(),
+                    'noisy_logits_std': noisy_logits.std().item(),
+                    'y_soft_mean': y_soft.mean().item(),
+                    'temperature': temp,
+                }
+        else:
+            # 推理模式：x > 0 即保留
+            hard_mask = (keep_logits_f32 > 0).float()
+
+        if return_debug:
+            return hard_mask.to(input_dtype), debug_info
         return hard_mask.to(input_dtype)
-
-    def _topk_mask(self, keep_logits: torch.Tensor, k: int) -> torch.Tensor:
-        """生成 top-k mask
-
-        参数:
-            keep_logits: (batch, n_vision) - 保留 logits
-            k: 保留的 token 数量
-
-        返回:
-            hard_mask: (batch, n_vision) - 0/1 mask，dtype 与输入一致
-        """
-        batch_size, n_vision = keep_logits.shape
-        k = min(k, n_vision)  # 确保 k 不超过 token 数量
-
-        keep_prob = torch.sigmoid(keep_logits)
-
-        # 找到 top-k 的阈值
-        topk_values, _ = torch.topk(keep_prob, k, dim=-1)
-        threshold = topk_values[:, -1:]  # 第 k 大的值，形状 (batch, 1)
-
-        # 生成 mask（>= threshold 的保留），保持输入 dtype
-        hard_mask = (keep_prob >= threshold).to(keep_logits.dtype)
-
-        return hard_mask
-
-    def set_inference_mode(self, mode: str):
-        """设置推理模式
-
-        参数:
-            mode: 'threshold' 或 'topk'
-        """
-        assert mode in ('threshold', 'topk'), f"Unknown inference mode: {mode}"
-        self.inference_mode = mode
-
-    def set_topk_k(self, k: int):
-        """设置 topk 模式下保留的 token 数量"""
-        self.topk_k = k
 
     def forward_full(
         self,
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None
+        temperature: Optional[float] = None,
+        return_debug: bool = False
     ) -> Tuple[torch.Tensor, Dict]:
         """完整的前向传播：从 hidden states 到 hard mask
 
@@ -284,28 +244,35 @@ class CrossAttentionPruner(nn.Module):
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
             temperature: 可选的温度覆盖
+            return_debug: 是否返回 debug 信息
 
         返回:
             hard_mask: (batch, n_vision) - 0/1 mask
             info: dict - 中间结果
         """
-        # forward 保持原始 dtype（与模型权重兼容）
-        # mask 生成在 gumbel_softmax_mask 内部用 float32 计算
         keep_logits, components = self.forward(vision_hidden, q2v_attn, return_components=True)
-        hard_mask = self.gumbel_softmax_mask(keep_logits, temperature)
 
-        return hard_mask, {
-            **components,
-            'hard_mask': hard_mask,
-        }
+        if return_debug:
+            hard_mask, debug_info = self.gumbel_sigmoid_mask(keep_logits, temperature, return_debug=True)
+            return hard_mask, {
+                **components,
+                'hard_mask': hard_mask,
+                'gumbel_debug': debug_info,
+            }
+        else:
+            hard_mask = self.gumbel_sigmoid_mask(keep_logits, temperature)
+            return hard_mask, {
+                **components,
+                'hard_mask': hard_mask,
+            }
 
     def set_temperature(self, temperature: float):
-        """设置 Gumbel-Softmax 温度"""
+        """设置 Gumbel-Sigmoid 温度"""
         self.temperature = temperature
 
-    def set_threshold(self, threshold: float):
-        """设置推理时的剪枝阈值"""
-        self.threshold = threshold
+    def set_use_gumbel_noise(self, use_gumbel_noise: bool):
+        """设置是否使用 Gumbel noise"""
+        self.use_gumbel_noise = use_gumbel_noise
 
 
 class LayerPrunerManager(nn.Module):
@@ -320,7 +287,7 @@ class LayerPrunerManager(nn.Module):
         n_heads: Cross-attention 头数
         temperature: 初始温度
         dropout: Dropout 比例
-        thresholds: 每层的推理阈值字典 {layer_idx: threshold}
+        use_gumbel_noise: 是否使用 Gumbel noise（False 则使用纯 STE）
     """
 
     def __init__(
@@ -331,15 +298,11 @@ class LayerPrunerManager(nn.Module):
         n_heads: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
-        thresholds: Optional[Dict[int, float]] = None
+        use_gumbel_noise: bool = True,
     ):
         super().__init__()
         self.layer_indices = layer_indices
         self.d_model = d_model
-
-        # 默认阈值为 0
-        if thresholds is None:
-            thresholds = {}
 
         # 为每层创建独立的 pruner
         self.pruners = nn.ModuleDict({
@@ -349,7 +312,7 @@ class LayerPrunerManager(nn.Module):
                 n_heads=n_heads,
                 temperature=temperature,
                 dropout=dropout,
-                threshold=thresholds.get(idx, 0.5)
+                use_gumbel_noise=use_gumbel_noise,
             )
             for idx in layer_indices
         })
@@ -366,42 +329,14 @@ class LayerPrunerManager(nn.Module):
         for pruner in self.pruners.values():
             pruner.set_temperature(temperature)
 
-    def set_threshold(self, layer_idx: int, threshold: float):
-        """设置指定层的推理阈值"""
-        self.get_pruner(layer_idx).set_threshold(threshold)
-
-    def set_thresholds(self, thresholds: Dict[int, float]):
-        """设置多层的推理阈值"""
-        for layer_idx, threshold in thresholds.items():
-            if layer_idx in self.layer_indices:
-                self.set_threshold(layer_idx, threshold)
+    def set_use_gumbel_noise(self, use_gumbel_noise: bool):
+        """设置所有剪枝器是否使用 Gumbel noise"""
+        for pruner in self.pruners.values():
+            pruner.set_use_gumbel_noise(use_gumbel_noise)
 
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""
         return self.layer_indices
-
-    def set_inference_mode(self, mode: str):
-        """设置所有剪枝器的推理模式
-
-        参数:
-            mode: 'threshold' 或 'topk'
-        """
-        for pruner in self.pruners.values():
-            pruner.set_inference_mode(mode)
-
-    def set_topk_k(self, layer_idx: int, k: int):
-        """设置指定层的 topk k 值"""
-        self.get_pruner(layer_idx).set_topk_k(k)
-
-    def set_topk_ks(self, topk_ks: Dict[int, int]):
-        """设置多层的 topk k 值
-
-        参数:
-            topk_ks: {layer_idx: k} 字典
-        """
-        for layer_idx, k in topk_ks.items():
-            if layer_idx in self.layer_indices:
-                self.set_topk_k(layer_idx, k)
 
 
 # 保持向后兼容的别名

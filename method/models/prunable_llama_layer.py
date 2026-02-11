@@ -248,7 +248,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]
 
         # Pruner 生成 mask（输入维度 = 当前 n_vision，与推理完全一致）
-        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden, q2v_attn_avg)
+        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden, q2v_attn_avg, return_debug=True)
         # hard_mask: (batch, n_vision) - 当前 vision tokens 的 mask
 
         # === 将当前层的 mask scatter 回原始 n_vision_orig 维度（如果需要）===
@@ -350,6 +350,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 'token_score': pruner_info.get('token_score'),
                 'baseline': pruner_info.get('baseline'),
                 'delta': pruner_info.get('delta'),
+                'gumbel_debug': pruner_info.get('gumbel_debug'),  # Gumbel noise debug info
                 'layer_idx': self.layer_idx,
                 'n_vision': n_vision,  # 当前层的 vision token 数量
             }
