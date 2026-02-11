@@ -1323,6 +1323,18 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
             disc_reinit_prob = method_cfg.get('disc_reinit_prob', 0.01)  # 随机模式下的概率
 
+            # random 模式：在循环外部生成随机数，确保所有 rank 都参与 broadcast
+            # 为每层生成一个随机数
+            if disc_reinit_enable and disc_reinit_mode == 'random':
+                rand_tensors = {}
+                for layer_idx in pruning_layers:
+                    rand_tensor = torch.tensor(0.0, device=device)
+                    if is_main_process():
+                        rand_tensor = torch.rand(1, device=device)[0]
+                    if dist.is_initialized():
+                        dist.broadcast(rand_tensor, src=0)
+                    rand_tensors[layer_idx] = rand_tensor.item()
+
             if disc_reinit_enable and 'disc_per_layer' in stats:
                 for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
                     should_reinit = False
@@ -1343,15 +1355,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             reinit_reason = f"acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%}"
 
                     elif disc_reinit_mode == 'random':
-                        # 随机模式：按概率随机重初始化
-                        # 在 rank 0 生成随机数，然后广播给所有进程
-                        rand_tensor = torch.tensor(0.0, device=device)
-                        if is_main_process():
-                            rand_tensor = torch.rand(1, device=device)[0]
-                        if dist.is_initialized():
-                            dist.broadcast(rand_tensor, src=0)
-
-                        if rand_tensor.item() < disc_reinit_prob:
+                        # 随机模式：使用预先生成的随机数
+                        if rand_tensors.get(layer_idx, 1.0) < disc_reinit_prob:
                             should_reinit = True
                             reinit_reason = f"random (prob={disc_reinit_prob})"
 
@@ -1411,26 +1416,9 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     logger.info(f"  Kept ratio: {stats['avg_kept_ratio']:.2%} "
                                f"(target: {stats['target_kept_ratio']:.2%}) [{layer_str}]")
 
-                    # 模拟推理时的累积保留率（Gumbel-Sigmoid: x > 0 即保留）
-                    if result['pruning_infos']:
-                        infer_layer_ratios = []
-                        cumulative_infer_mask = None
-                        for layer_idx in sorted(pruning_layers):
-                            info = result['pruning_infos'].get(layer_idx)
-                            if info and 'keep_logits' in info and info['keep_logits'] is not None:
-                                keep_logits = info['keep_logits'].float()
-                                # 推理时直接用 x > 0 判断
-                                current_infer_mask = (keep_logits > 0).float()
-                                # 累积 mask：当前层 mask * 之前层累积 mask
-                                if cumulative_infer_mask is None:
-                                    cumulative_infer_mask = current_infer_mask
-                                else:
-                                    cumulative_infer_mask = cumulative_infer_mask * current_infer_mask
-                                infer_kept = cumulative_infer_mask.mean().item()
-                                infer_layer_ratios.append(f"L{layer_idx}={infer_kept:.2%}")
-                        if infer_layer_ratios:
-                            infer_str = ", ".join(infer_layer_ratios)
-                            logger.info(f"  Infer ratio (x>0): [{infer_str}]")
+                    # 在 Phase 3 时，训练和推理的保留率应该一致
+                    # 直接使用 stats 中的 L{layer_idx}_kept 即可，不需要重新计算
+                    # （物理删除模式下，每层的 keep_logits 大小不同，不能直接相乘）
 
                 if 'disc_per_layer' in stats:
                     per_layer_strs = []
