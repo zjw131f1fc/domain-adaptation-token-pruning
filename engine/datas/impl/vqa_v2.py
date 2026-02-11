@@ -193,6 +193,10 @@ class VQAV2Preparer(BasePreparer):
         return samples
 
     def _load_val_as_test(self) -> List[Dict[str, Any]]:
+        """加载验证数据作为测试集
+
+        注意：测试集不过滤 "none" 答案，在 judge 中会将 GT 为 "none" 的样本直接记为正确
+        """
         """加载验证数据作为测试集"""
         q_path = os.path.join(self.data_root, 'val_questions.json')
         a_path = os.path.join(self.data_root, 'val_annotations.json')
@@ -244,9 +248,7 @@ class VQAV2Preparer(BasePreparer):
                 train_answer = mc_answer
             else:
                 train_answer = self._get_most_common_answer(answers)
-            # 过滤掉答案为 "none" 的样本（这类样本对训练没有意义）
-            if train_answer.lower().strip() == 'none':
-                continue
+            # 测试集不过滤 "none" 答案，在 judge 中会将 GT 为 "none" 的样本直接记为正确
             # 构建样本
             sample = {
                 'image': img_path,  # 存储路径而非加载图像
@@ -353,6 +355,14 @@ class VQAV2Preparer(BasePreparer):
                     cleaned.append(tok)
             return ' '.join(cleaned)
 
+        def _is_none_answer(ref) -> bool:
+            """检查 GT 是否为 'none' 答案"""
+            if isinstance(ref, list):
+                # 多答案情况：检查是否所有答案都是 none
+                return all(_normalize(ans) == 'none' for ans in ref)
+            else:
+                return _normalize(ref) == 'none'
+
         def _official_score(pred_norm: str, ref_list: List[str]) -> float:
             # 空预测直接返回0分
             if not pred_norm or pred_norm.strip() == "":
@@ -377,6 +387,11 @@ class VQAV2Preparer(BasePreparer):
                     raise ValueError("pred/ref 长度不一致")
                 correct = 0
                 for p_raw, r_raw in zip(pred, ref):
+                    # GT 为 "none" 的样本直接记为正确（测试集不过滤这类样本）
+                    if _is_none_answer(r_raw):
+                        correct += 1.0
+                        continue
+
                     # 预处理：空预测直接计0分
                     p_norm = _normalize(p_raw)
                     if not p_norm or p_norm.strip() == "":
@@ -394,6 +409,10 @@ class VQAV2Preparer(BasePreparer):
                 return {"correct": correct, "total": total, "accuracy": (correct / total) if total > 0 else 0.0}
 
             # 单条评估
+            # GT 为 "none" 的样本直接记为正确
+            if _is_none_answer(ref):
+                return {'correct': 1.0, 'total': 1, 'accuracy': 1.0}
+
             # 预处理：空预测直接返回0分
             pred_norm = _normalize(pred)
             if not pred_norm or pred_norm.strip() == "":
