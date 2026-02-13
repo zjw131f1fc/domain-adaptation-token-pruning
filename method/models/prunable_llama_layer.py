@@ -73,6 +73,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_ends: Optional[list] = None,      # 每个样本的 answer 结束位置
         return_pruning_info: bool = False,
         cumulative_vision_mask: Optional[torch.Tensor] = None,  # 累积 vision mask
+        detach_mask_for_adv: bool = False,  # 是否对 adv_loss 的 h_fake 使用 detached mask
         **kwargs
     ):
         """前向传播
@@ -139,6 +140,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             answer_ends=answer_ends,
             return_pruning_info=return_pruning_info,
             cumulative_vision_mask=cumulative_vision_mask,
+            detach_mask_for_adv=detach_mask_for_adv,
             **kwargs
         )
 
@@ -159,6 +161,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_ends: list,
         return_pruning_info: bool,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
+        detach_mask_for_adv: bool = False,
         **kwargs
     ):
         """剪枝层的前向传播（完全对齐推理）
@@ -317,6 +320,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # === Step 5: 提取 h_real 和 h_fake（answer 位置）===
         h_real_list = []
         h_fake_list = []
+        h_fake_for_adv_list = []  # 用于 adv_loss 的 h_fake（可选 detach mask）
         for i in range(batch_size):
             ans_start, ans_end = answer_starts[i], answer_ends[i]
             gen_start = ans_start - 1
@@ -326,6 +330,37 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         h_real = h_real_list
         h_fake = h_fake_list
+
+        # 如果需要 detach mask for adv，额外计算一个 h_fake_for_adv
+        if detach_mask_for_adv:
+            # 使用 detached mask 重新计算 attn_output_fake_for_adv
+            mask_expanded_detached = hard_mask.detach().unsqueeze(1).unsqueeze(2)
+            mask_vision_detached = mask_expanded_detached.expand(-1, num_heads, seq_len, -1)
+            full_mask_detached = torch.cat([ones_before, mask_vision_detached, ones_after], dim=-1)
+
+            attn_weights_fake_detached = attn_weights * full_mask_detached
+            attn_sum_detached = attn_weights_fake_detached.sum(dim=-1, keepdim=True)
+            attn_weights_fake_detached = (attn_weights_fake_detached / (attn_sum_detached + 1e-8)).to(dtype)
+            attn_output_fake_for_adv = torch.matmul(attn_weights_fake_detached, value_states)
+
+            # Adapter 修正（adapter 的梯度仍然可以传递）
+            if self.adapter is not None:
+                attn_output_fake_for_adv_flat = attn_output_fake_for_adv.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+                attn_output_fake_for_adv_adapted = self.adapter(
+                    attn_output_fake_for_adv_flat,
+                    mask=hard_mask_full.detach(),  # mask 也 detach
+                    query=query_states_flat
+                )
+                attn_output_fake_for_adv = attn_output_fake_for_adv_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+
+            for i in range(batch_size):
+                ans_start, ans_end = answer_starts[i], answer_ends[i]
+                gen_start = ans_start - 1
+                gen_end = ans_end - 1
+                h_fake_for_adv_list.append(attn_output_fake_for_adv[i, :, gen_start:gen_end, :])
+            h_fake_for_adv = h_fake_for_adv_list
+        else:
+            h_fake_for_adv = h_fake  # 不 detach 时，直接使用 h_fake
 
         # === Step 6: 使用 fake attention 作为输出 ===
         attn_output = attn_output_fake
@@ -357,6 +392,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             pruning_info = {
                 'h_real': h_real,
                 'h_fake': h_fake,
+                'h_fake_for_adv': h_fake_for_adv,  # 用于 adv_loss（可选 detach mask）
                 'hard_mask': hard_mask_full,  # (batch, n_vision_orig) - 相对于原始位置
                 'hard_mask_current': hard_mask,  # (batch, n_vision) - 当前层的 mask
                 'q2v_attn': q2v_attn_full,  # (batch, n_vision_orig)

@@ -498,6 +498,9 @@ def train_step(
     # === Forward ===
     model.train()
 
+    # 获取配置项
+    detach_mask_for_adv = method_cfg.get('detach_mask_for_adv', False)
+
     output = model(
         input_ids=inputs['input_ids'],
         pixel_values=inputs['pixel_values'],
@@ -509,6 +512,7 @@ def train_step(
         answer_starts=prep['answer_starts'],
         answer_ends=prep['answer_ends'],
         return_pruning_info=True,
+        detach_mask_for_adv=detach_mask_for_adv,
     )
 
     # === 计算 Losses ===
@@ -538,6 +542,8 @@ def train_step(
     if output.pruning_infos and len(output.pruning_infos) > 0:
         h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
         h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
+        # 用于 adv_loss 的 h_fake（可能 detach 了 mask 的梯度）
+        h_fake_for_adv_dict = {idx: info['h_fake_for_adv'] for idx, info in output.pruning_infos.items()}
 
         loss_type = method_cfg.get('disc_loss_type', 'bce')
         gp_weight = method_cfg.get('disc_gp_weight', 10.0)
@@ -550,7 +556,7 @@ def train_step(
         # 获取 disc_manager（可能被 DDP 包装）
         disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
 
-        adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
+        adv_loss = disc_manager.compute_adv_loss(h_fake_for_adv_dict, loss_type=loss_type)
         losses['adv_loss'] = adv_loss * gan_weight
         stats['raw_adv_loss'] = adv_loss.item()
 
@@ -654,6 +660,23 @@ def train_step(
             losses['entropy_loss'] = entropy_loss
             stats['entropy_loss'] = entropy_loss.item()
 
+    # === L_ATP 损失：强制深层网络剪掉更多令牌 ===
+    # L_ATP = sum(mask.sum()/576 * layer_idx) for each pruning layer
+    atp_weight = method_cfg.get('atp_weight', 0.0)
+    if atp_weight > 0 and output.pruning_infos:
+        L_ATP = torch.tensor(0.0, device=device)
+        n_vision_orig = 576  # 原始 vision token 数量（固定）
+        pruning_layers = sorted(output.pruning_infos.keys())
+        for layer_idx in pruning_layers:
+            if layer_idx in output.pruning_infos:
+                # hard_mask 已经是累积 mask，scatter 回原始 576 维度
+                mask = output.pruning_infos[layer_idx]['hard_mask']  # (batch, 576)
+                # 每个样本的保留率，然后取 batch 平均
+                kept_ratio = mask.sum(dim=-1).mean() / n_vision_orig
+                L_ATP = L_ATP + kept_ratio * layer_idx
+        losses['atp_loss'] = L_ATP
+        stats['atp_loss'] = L_ATP.item()
+
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     adv_weight = method_cfg.get('adv_loss_weight', 0.5)
@@ -694,6 +717,8 @@ def train_step(
         weighted_losses['uniformity_loss'] = losses['uniformity_loss'] * uniformity_weight
     if 'entropy_loss' in losses:
         weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
+    if 'atp_loss' in losses:
+        weighted_losses['atp_loss'] = losses['atp_loss'] * atp_weight
     if 'disc_loss' in losses:
         weighted_losses['disc_loss'] = losses['disc_loss']
 

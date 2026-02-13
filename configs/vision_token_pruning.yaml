@@ -44,7 +44,7 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 20000
+    train: 5000
     test: 100000
   fast_load_no_random: false
   category_priority:
@@ -134,7 +134,9 @@ method_settings:
   sparsity_weight: 0.8   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0.6    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   uniformity_weight: 0 # 均匀性损失：鼓励各层增量剪枝率相近，避免只有第一层剪枝
-
+  atp_weight: 0.05  # L_ATP 损失：强制深层网络剪掉更多令牌，L_ATP = sum(mask.sum()/576 * layer_idx)
+  detach_mask_for_adv: false  # 是否对 adv_loss 阻断 pruner 的梯度（只传到 adapter）
+# 64.81 27.11
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
   task_loss_weight_start: 1.0

@@ -202,6 +202,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         answer_starts: Optional[list] = None,
         answer_ends: Optional[list] = None,
         return_pruning_info: bool = True,
+        detach_mask_for_adv: bool = False,  # 是否对 adv_loss 的 h_fake 使用 detached mask
         **kwargs
     ) -> PrunableLlavaOutput:
         """前向传播（训练时物理删除 vision tokens，与推理完全对齐）
@@ -300,6 +301,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     answer_ends=current_answer_ends,
                     return_pruning_info=True,
                     cumulative_vision_mask=cumulative_vision_mask,
+                    detach_mask_for_adv=detach_mask_for_adv,
                 )
                 if pruning_info is not None:
                     pruning_infos[layer_idx] = pruning_info

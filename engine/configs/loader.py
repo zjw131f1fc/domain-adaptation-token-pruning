@@ -115,6 +115,8 @@ DEFAULT_CONFIG = {
         "adv_loss_weight": 0.5,
         "sparsity_weight": 0.2,
         "uniformity_weight": 0.0,  # 均匀性损失权重，鼓励各层增量剪枝率相近
+        "atp_weight": 0.0,  # L_ATP 损失权重，强制深层网络剪掉更多令牌
+        "detach_mask_for_adv": False,  # 是否对 adv_loss 阻断 pruner 的梯度（只传到 adapter）
         # 动态权重调度
         "loss_weight_warmup_ratio": 0.0,
         "task_loss_weight_start": 1.0,
