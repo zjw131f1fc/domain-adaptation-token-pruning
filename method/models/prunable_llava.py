@@ -308,45 +308,41 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         new_cumulative_mask = pruning_info['hard_mask']
 
                         # === 物理删除 vision tokens 并更新位置 ===
-                        # 提取当前层保留的 vision token 索引（相对于当前 vision 位置）
-                        # cumulative_vision_mask 是相对于原始 n_vision 的，需要转换
+                        # 使用 batch 内的 union mask：任何样本保留的位置都保留
+                        # 这样所有样本的序列长度相同，但 hard_mask_full 对每个样本是正确的
+
                         if cumulative_vision_mask is not None:
-                            # 强制二值化，避免 bfloat16 精度问题
+                            # 强制二值化
                             cumulative_clean = (cumulative_vision_mask > 0.5).to(dtype)
-                            prev_kept_indices = cumulative_clean[0].nonzero(as_tuple=True)[0]
+                            # Union: 任何样本保留的位置
+                            prev_union_mask = (cumulative_clean.sum(dim=0) > 0)
+                            prev_kept_indices = prev_union_mask.nonzero(as_tuple=True)[0]
                             n_prev_kept = len(prev_kept_indices)
                         else:
                             n_prev_kept = n_vision_orig
 
-                        # 当前层的 mask 也需要二值化
+                        # 当前层的 mask 也需要二值化，使用 union
                         new_cumulative_clean = (new_cumulative_mask > 0.5).to(dtype)
-                        current_kept_indices = new_cumulative_clean[0].nonzero(as_tuple=True)[0]
+                        # Union: 任何样本保留的位置
+                        current_union_mask = (new_cumulative_clean.sum(dim=0) > 0)
+                        current_kept_indices = current_union_mask.nonzero(as_tuple=True)[0]
                         n_current_kept = len(current_kept_indices)
 
-                        # 计算这一层删除了多少 tokens
+                        # 计算这一层删除了多少 tokens（基于 union）
                         n_deleted = n_prev_kept - n_current_kept
 
                         if n_deleted > 0:
                             # 物理删除 hidden_states 中的 vision tokens
-                            # hidden_states 的当前 vision 区间是 [current_vision_start, current_vision_end)
-                            # 需要找出哪些位置要保留
-
-                            # 当前的 vision tokens
                             before_vision = hidden_states[:, :current_vision_start, :]
                             vision_part = hidden_states[:, current_vision_start:current_vision_end, :]
                             after_vision = hidden_states[:, current_vision_end:, :]
 
-                            # 相对于当前 vision 区间的保留索引
-                            # cumulative_vision_mask 转换到当前 vision 区间
+                            # 相对于当前 vision 区间的保留索引（基于 union）
                             if cumulative_vision_mask is not None:
                                 # 在之前保留的位置中，找到现在仍然保留的
-                                # prev_kept_indices 对应当前 vision_part 的索引 0, 1, 2, ...
-                                # new_cumulative_mask 在 orig 维度上标记哪些保留
-                                # 需要找到 prev_kept_indices 中哪些在 new_cumulative_mask 中仍然是 1
                                 relative_kept = []
                                 for rel_idx, orig_idx in enumerate(prev_kept_indices):
-                                    # 使用 > 0.5 替代 == 1，避免 bfloat16 精度问题
-                                    if new_cumulative_mask[0, orig_idx] > 0.5:
+                                    if current_union_mask[orig_idx]:
                                         relative_kept.append(rel_idx)
                                 relative_kept = torch.tensor(relative_kept, device=device, dtype=torch.long)
                             else:
@@ -364,7 +360,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             # vision 区间更新
                             current_vision_end = current_vision_start + n_current_kept
 
-                            # question 和 answer 位置更新（它们在 vision 之后，需要减去 offset）
+                            # question 和 answer 位置更新
                             current_question_starts = [qs - offset if qs >= current_vision_start + n_prev_kept else qs
                                                        for qs in current_question_starts]
                             current_question_ends = [qe - offset if qe >= current_vision_start + n_prev_kept else qe
@@ -374,9 +370,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             current_answer_ends = [ae - offset if ae >= current_vision_start + n_prev_kept else ae
                                                    for ae in current_answer_ends]
 
-
-                        # 更新累积 mask（使用二值化后的版本，确保后续层的一致性）
-                        cumulative_vision_mask = new_cumulative_clean
+                        # 更新累积 mask：使用 union mask 扩展到 batch 维度
+                        # 这样后续层知道哪些位置在物理上还存在
+                        cumulative_vision_mask = current_union_mask.unsqueeze(0).expand(batch_size, -1).to(dtype)
 
             else:
                 # 非剪枝层

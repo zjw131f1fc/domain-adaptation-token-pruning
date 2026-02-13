@@ -256,35 +256,28 @@ class PrunableLlamaDecoderLayer(nn.Module):
         if cumulative_vision_mask is not None:
             # cumulative_vision_mask: (batch, n_vision_orig), 1=kept, 0=pruned
             n_vision_orig = cumulative_vision_mask.shape[1]
-            # 强制二值化，避免 bfloat16 精度问题（某些值可能是极小正数，导致 nonzero 和 sum 不一致）
-            # 这不影响梯度，因为 cumulative_vision_mask 只用于位置追踪，梯度通过 hard_mask 流动
+            # 强制二值化，避免 bfloat16 精度问题
             cumulative_vision_mask_clean = (cumulative_vision_mask > 0.5).to(dtype)
-            kept_indices = cumulative_vision_mask_clean[0].nonzero(as_tuple=True)[0]
 
-            # DEBUG: 打印 scatter 前的信息
-            if self.layer_idx <= 20:  # 只打印前几层
-                print(f"[DEBUG scatter L{self.layer_idx}] cumulative_mask.shape={cumulative_vision_mask.shape}, "
-                      f"n_kept_before={len(kept_indices)}, hard_mask.shape={hard_mask.shape}, "
-                      f"hard_mask.sum={hard_mask[0].sum().item():.2f}")
+            # 对每个样本单独 scatter，支持不同样本有不同的 mask
+            hard_mask_full_list = []
+            for b in range(batch_size):
+                kept_indices_b = cumulative_vision_mask_clean[b].nonzero(as_tuple=True)[0]
+                # hard_mask[b] 的长度应该等于 len(kept_indices_b)
+                hm_b = torch.zeros(n_vision_orig, device=device, dtype=dtype)
+                hm_b = hm_b.scatter(0, kept_indices_b, hard_mask[b])
+                hard_mask_full_list.append(hm_b)
+            hard_mask_full = torch.stack(hard_mask_full_list, dim=0)
 
-            # 创建新的累积 mask：在原始维度上，只有当前层保留且之前也保留的才是 1
-            # 使用 scatter 操作保持梯度流（in-place 赋值会断开梯度）
-            hard_mask_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
-            indices = kept_indices.unsqueeze(0).expand(batch_size, -1)
-            hard_mask_full = hard_mask_full.scatter(1, indices, hard_mask)
-
-            # DEBUG: 打印 scatter 后的信息
-            if self.layer_idx <= 20:
-                print(f"[DEBUG scatter L{self.layer_idx}] hard_mask_full.shape={hard_mask_full.shape}, "
-                      f"hard_mask_full.sum={hard_mask_full[0].sum().item():.2f}, "
-                      f"ratio={hard_mask_full[0].mean().item():.4f}")
+            # 同时保存每个样本的 kept_indices 供后续使用
+            kept_indices_per_sample = [
+                cumulative_vision_mask_clean[b].nonzero(as_tuple=True)[0]
+                for b in range(batch_size)
+            ]
         else:
             hard_mask_full = hard_mask
             n_vision_orig = n_vision
-            # DEBUG: 第一个剪枝层
-            if self.layer_idx <= 20:
-                print(f"[DEBUG scatter L{self.layer_idx}] FIRST LAYER: hard_mask.shape={hard_mask.shape}, "
-                      f"sum={hard_mask[0].sum().item():.2f}, ratio={hard_mask[0].mean().item():.4f}")
+            kept_indices_per_sample = None
 
         # === Step 4: 计算 h_real 和 h_fake ===
         # h_real: 完整 attention 聚合
@@ -348,10 +341,12 @@ class PrunableLlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         if return_pruning_info:
-            # 返回原始维度的 q2v_attn
-            if cumulative_vision_mask is not None:
+            # 返回原始维度的 q2v_attn（对每个样本单独处理）
+            if cumulative_vision_mask is not None and kept_indices_per_sample is not None:
                 q2v_attn_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
-                q2v_attn_full[:, kept_indices] = q2v_attn_avg
+                for b in range(batch_size):
+                    kept_indices_b = kept_indices_per_sample[b]
+                    q2v_attn_full[b, kept_indices_b] = q2v_attn_avg[b]
             else:
                 q2v_attn_full = q2v_attn_avg
 
