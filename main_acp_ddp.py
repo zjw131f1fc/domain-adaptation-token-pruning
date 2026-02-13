@@ -1400,7 +1400,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             epoch_stats[k][layer_idx] = [0, 0]
                         epoch_stats[k][layer_idx][0] += real_acc
                         epoch_stats[k][layer_idx][1] += fake_acc
-                else:
+                elif k == 'delta_per_layer':
+                    # delta_per_layer 是列表，跳过累计（只在日志中显示）
+                    pass
+                elif isinstance(v, (int, float)):
                     epoch_stats[k] += v
             n_batches += 1
             global_step += 1
