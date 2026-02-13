@@ -59,7 +59,7 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [2,9,16]
+  pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -80,16 +80,16 @@ method_settings:
   # 阶段1: temp 从 start 退火到 end, noise_scale=1.0
   # 阶段2: temp 固定为 end, noise_scale 从 1.0 平滑退火到 0
   # 阶段3: temp 固定, noise_scale=0 (确定性决策)
-  hybrid_phase1_end: 0.45    # 探索期结束点（占总步数比例）
-  hybrid_phase2_end: 0.9    # 稳定期结束点（占总步数比例）
+  hybrid_phase1_end: 0.33    # 探索期结束点（占总步数比例）
+  hybrid_phase2_end: 0.66    # 稳定期结束点（占总步数比例）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
-  hybrid_phase1_temp_end: 0.2     # 探索期结束温度（也是稳定期温度）
-  hybrid_phase3_temp: 0.2         # 确定性微调期温度
+  hybrid_phase1_temp_end: 0.3     # 探索期结束温度（也是稳定期温度）
+  hybrid_phase3_temp: 0.3         # 确定性微调期温度
 
   # ==================== Discriminator 配置 ====================
   # 每个 answer token 独立判别
   disc_d_d: 512
-  disc_dropout: 0.2
+  disc_dropout: 0.3
   disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
   disc_loss_type: hinge            # 损失类型: bce, wgan, hinge
   disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
@@ -130,10 +130,10 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.5
-  adv_loss_weight: 0.2
-  sparsity_weight: 1.2   # 提高到 5.0，让 sparsity loss 有足够影响力
-  entropy_weight: 0.5    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
-  uniformity_weight: 0.5 # 均匀性损失：鼓励各层增量剪枝率相近，避免只有第一层剪枝
+  adv_loss_weight: 0.5
+  sparsity_weight: 0.8   # 提高到 5.0，让 sparsity loss 有足够影响力
+  entropy_weight: 0.6    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
+  uniformity_weight: 0 # 均匀性损失：鼓励各层增量剪枝率相近，避免只有第一层剪枝
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup
