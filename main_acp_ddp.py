@@ -435,6 +435,7 @@ def train_step(
     # === Gumbel Mode 三阶段调度 ===
     gumbel_mode = method_cfg.get('gumbel_mode', 'never')
     progress = current_step / total_steps if total_steps > 0 else 0
+    noise_scale = 1.0  # 默认值
 
     if gumbel_mode == 'hybrid':
         # 混合三阶段策略
@@ -445,23 +446,28 @@ def train_step(
         phase3_temp = method_cfg.get('hybrid_phase3_temp', 0.1)
 
         if progress < phase1_end:
-            # 阶段1：探索期 - 温度退火 + Gumbel noise
+            # 阶段1：探索期 - 温度退火 + Gumbel noise (scale=1.0)
             phase_progress = progress / phase1_end
             current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
             use_gumbel_noise = True
+            noise_scale = 1.0
             current_phase = 1
         elif progress < phase2_end:
-            # 阶段2：稳定期 - 低温 + Gumbel noise
+            # 阶段2：稳定期 - 低温 + noise 逐渐减小
+            phase2_progress = (progress - phase1_end) / (phase2_end - phase1_end)
             current_temp = phase1_temp_end
             use_gumbel_noise = True
+            noise_scale = 1.0 - phase2_progress  # 从1.0退火到0
             current_phase = 2
         else:
             # 阶段3：确定性微调期 - 关闭 noise，训练=推理
             current_temp = phase3_temp
             use_gumbel_noise = False
+            noise_scale = 0.0
             current_phase = 3
 
         model.set_use_gumbel_noise(use_gumbel_noise)
+        model.set_noise_scale(noise_scale)
     elif gumbel_mode == 'always':
         # 始终使用 Gumbel noise（旧的温度退火逻辑）
         temperature = method_cfg.get('temperature', 1.0)
@@ -510,6 +516,7 @@ def train_step(
     stats = {
         'temperature': current_temp,
         'use_gumbel_noise': use_gumbel_noise,
+        'noise_scale': noise_scale,
     }
     if gumbel_mode == 'hybrid':
         stats['hybrid_phase'] = current_phase
@@ -579,7 +586,7 @@ def train_step(
         weighted_kept = torch.tensor(0.0, device=device)
 
         # Debug: 前几步打印 sparsity 计算详情
-        debug_sparsity = (current_step <= 3)
+        debug_sparsity = (current_step <= 5)
         if debug_sparsity:
             print(f"[DEBUG sparsity] n_vision={n_vision}, target_token_num={target_token_num}, target_ratio={target_ratio:.4f}")
             print(f"[DEBUG sparsity] total_layers={total_layers}, pruning_layers={pruning_layers}")
@@ -591,11 +598,9 @@ def train_step(
                 if debug_sparsity:
                     print(f"[DEBUG sparsity] layers 0-{layer_idx-1}: kept_ratio=1.0, n_layers={n_layers_before}")
 
-            # hard_mask 已经是累积 mask（之前被剪掉的 token 在这里是 0）
-            # 所以 layer_mask.mean() 直接就是累积保留率，不需要额外乘法
+            # hard_mask 是相对于原始 n_vision 维度的累积 mask
             hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            layer_mask = hard_mask.float().mean(dim=0)
-            cumulative_ratio = layer_mask.mean()
+            cumulative_ratio = hard_mask.float().mean()
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
 
             if i < len(pruning_layers) - 1:
@@ -604,20 +609,25 @@ def train_step(
                 n_affected = total_layers - layer_idx
 
             if debug_sparsity:
-                n_kept = (hard_mask[0] > 0.5).sum().item()  # 第一个样本的保留数量
-                print(f"[DEBUG sparsity] L{layer_idx}: hard_mask.shape={hard_mask.shape}, "
-                      f"n_kept(sample0)={n_kept}, cumulative_ratio={cumulative_ratio.item():.4f}, "
-                      f"n_affected={n_affected}")
+                n_kept = (hard_mask[0] > 0.5).sum().item()
+                n_zero = (hard_mask[0] < 0.5).sum().item()
+                mask_sum = hard_mask[0].sum().item()
+                print(f"[DEBUG sparsity] L{layer_idx}: shape={hard_mask.shape}, "
+                      f"n_kept={n_kept}, n_zero={n_zero}, sum={mask_sum:.2f}, "
+                      f"ratio={cumulative_ratio.item():.4f}, expected_dim1={n_vision}")
 
             weighted_kept = weighted_kept + n_affected * cumulative_ratio
+
+            if debug_sparsity:
+                print(f"[DEBUG sparsity] L{layer_idx}: weighted_kept += {n_affected} * {cumulative_ratio.item():.4f} = {(n_affected * cumulative_ratio).item():.4f}")
 
         avg_kept_ratio_tensor = weighted_kept / total_layers
         sparsity_loss = torch.abs(avg_kept_ratio_tensor - target_ratio)
 
         if debug_sparsity:
-            print(f"[DEBUG sparsity] weighted_kept={weighted_kept.item():.4f}, "
-                  f"avg_kept_ratio={avg_kept_ratio_tensor.item():.4f}, "
-                  f"sparsity_loss={sparsity_loss.item():.4f}")
+            print(f"[DEBUG sparsity] FINAL: weighted_kept={weighted_kept.item():.4f}, "
+                  f"total_layers={total_layers}, avg_kept_ratio={avg_kept_ratio_tensor.item():.4f}, "
+                  f"target_ratio={target_ratio:.4f}, sparsity_loss={sparsity_loss.item():.4f}")
 
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
@@ -1400,7 +1410,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 phase_str = ""
                 if 'hybrid_phase' in stats:
                     phase_str = f" [Phase {stats['hybrid_phase']}]"
-                noise_str = "noise=ON" if stats.get('use_gumbel_noise', False) else "noise=OFF"
+                noise_scale_val = stats.get('noise_scale', 1.0)
+                if stats.get('use_gumbel_noise', False):
+                    noise_str = f"noise={noise_scale_val:.2f}"
+                else:
+                    noise_str = "noise=OFF"
                 logger.info(f"Step {global_step}{phase_str}: {loss_str} (temp={stats['temperature']:.2f}, {noise_str})")
 
                 if 'avg_kept_ratio' in stats:

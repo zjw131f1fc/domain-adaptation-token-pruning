@@ -470,6 +470,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         """设置所有 pruner 是否使用 Gumbel noise"""
         self.pruner_manager.set_use_gumbel_noise(use_gumbel_noise)
 
+    def set_noise_scale(self, noise_scale: float):
+        """设置所有 pruner 的 noise 缩放因子"""
+        self.pruner_manager.set_noise_scale(noise_scale)
+
     def get_pruner_parameters(self):
         """获取所有 pruner 的参数"""
         return self.pruner_manager.parameters()

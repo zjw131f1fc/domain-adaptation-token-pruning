@@ -35,6 +35,7 @@ class CrossAttentionPruner(nn.Module):
         temperature: float = 1.0,
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
+        noise_scale: float = 1.0,  # noise 缩放因子，用于平滑退火
     ):
         super().__init__()
         self.d_model = d_model
@@ -42,6 +43,7 @@ class CrossAttentionPruner(nn.Module):
         self.n_heads = n_heads
         self.temperature = temperature
         self.use_gumbel_noise = use_gumbel_noise
+        self.noise_scale = noise_scale
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
@@ -198,10 +200,10 @@ class CrossAttentionPruner(nn.Module):
         debug_info = {}
 
         if self.training:
-            if self.use_gumbel_noise:
-                # Gumbel-Sigmoid 模式：加 Logistic noise
+            if self.use_gumbel_noise and self.noise_scale > 0:
+                # Gumbel-Sigmoid 模式：加 Logistic noise，支持 scale 退火
                 u = torch.rand_like(keep_logits_f32).clamp(1e-8, 1 - 1e-8)
-                logistic_noise = torch.log(u) - torch.log(1 - u)
+                logistic_noise = self.noise_scale * (torch.log(u) - torch.log(1 - u))
                 noisy_logits = keep_logits_f32 + logistic_noise
             else:
                 # 纯 STE 模式：不加 noise
@@ -216,6 +218,7 @@ class CrossAttentionPruner(nn.Module):
             if return_debug:
                 debug_info = {
                     'use_gumbel_noise': self.use_gumbel_noise,
+                    'noise_scale': self.noise_scale,
                     'logistic_noise_mean': logistic_noise.mean().item(),
                     'logistic_noise_std': logistic_noise.std().item(),
                     'noisy_logits_mean': noisy_logits.mean().item(),
@@ -273,6 +276,10 @@ class CrossAttentionPruner(nn.Module):
     def set_use_gumbel_noise(self, use_gumbel_noise: bool):
         """设置是否使用 Gumbel noise"""
         self.use_gumbel_noise = use_gumbel_noise
+
+    def set_noise_scale(self, noise_scale: float):
+        """设置 noise 缩放因子"""
+        self.noise_scale = noise_scale
 
 
 class LayerPrunerManager(nn.Module):
@@ -333,6 +340,11 @@ class LayerPrunerManager(nn.Module):
         """设置所有剪枝器是否使用 Gumbel noise"""
         for pruner in self.pruners.values():
             pruner.set_use_gumbel_noise(use_gumbel_noise)
+
+    def set_noise_scale(self, noise_scale: float):
+        """设置所有剪枝器的 noise 缩放因子"""
+        for pruner in self.pruners.values():
+            pruner.set_noise_scale(noise_scale)
 
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""
