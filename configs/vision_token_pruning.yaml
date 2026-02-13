@@ -13,12 +13,12 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: null # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 7
+    batch_size: 5
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -44,8 +44,8 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 13000
-    test: 3000
+    train: 20000
+    test: 100000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -59,7 +59,7 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [2,8,14]
+  pruning_layers: [2,9,16]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -81,7 +81,7 @@ method_settings:
   # 阶段2: temp 固定为 end, noise_scale 从 1.0 平滑退火到 0
   # 阶段3: temp 固定, noise_scale=0 (确定性决策)
   hybrid_phase1_end: 0.45    # 探索期结束点（占总步数比例）
-  hybrid_phase2_end: 0.85    # 稳定期结束点（占总步数比例）
+  hybrid_phase2_end: 0.9    # 稳定期结束点（占总步数比例）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
   hybrid_phase1_temp_end: 0.2     # 探索期结束温度（也是稳定期温度）
   hybrid_phase3_temp: 0.2         # 确定性微调期温度
@@ -130,9 +130,10 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.5
-  adv_loss_weight: 0.5
-  sparsity_weight: 1.0   # 提高到 5.0，让 sparsity loss 有足够影响力
-  entropy_weight: 0.4    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
+  adv_loss_weight: 0.2
+  sparsity_weight: 1.2   # 提高到 5.0，让 sparsity loss 有足够影响力
+  entropy_weight: 0.5    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
+  uniformity_weight: 0.5 # 均匀性损失：鼓励各层增量剪枝率相近，避免只有第一层剪枝
 
   # 动态权重调度 (可选)
   loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup

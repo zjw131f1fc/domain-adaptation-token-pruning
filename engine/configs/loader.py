@@ -114,6 +114,7 @@ DEFAULT_CONFIG = {
         "task_loss_weight": 1.0,
         "adv_loss_weight": 0.5,
         "sparsity_weight": 0.2,
+        "uniformity_weight": 0.0,  # 均匀性损失权重，鼓励各层增量剪枝率相近
         # 动态权重调度
         "loss_weight_warmup_ratio": 0.0,
         "task_loss_weight_start": 1.0,

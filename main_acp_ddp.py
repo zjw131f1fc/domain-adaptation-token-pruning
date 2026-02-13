@@ -584,6 +584,7 @@ def train_step(
         pruning_layers = sorted(output.pruning_infos.keys())
 
         weighted_kept = torch.tensor(0.0, device=device)
+        cumulative_ratios = []  # 保存每层的累积保留率，用于计算均匀性损失
 
         for i, layer_idx in enumerate(pruning_layers):
             if i == 0:
@@ -593,6 +594,7 @@ def train_step(
             # hard_mask 是相对于原始 n_vision 维度的累积 mask
             hard_mask = output.pruning_infos[layer_idx]['hard_mask']
             cumulative_ratio = hard_mask.float().mean()
+            cumulative_ratios.append(cumulative_ratio)
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
 
             if i < len(pruning_layers) - 1:
@@ -610,6 +612,27 @@ def train_step(
         stats['avg_kept_ratio'] = avg_kept_ratio_tensor.item()
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
+
+        # === 均匀性损失：鼓励各层的增量剪枝率相近 ===
+        uniformity_weight = method_cfg.get('uniformity_weight', 0.0)
+        if uniformity_weight > 0 and len(cumulative_ratios) > 1:
+            # 计算增量剪枝率
+            # delta_i = prev_ratio - curr_ratio（每层额外剪掉的比例）
+            deltas = []
+            prev_ratio = torch.tensor(1.0, device=device)
+            for curr_ratio in cumulative_ratios:
+                delta = prev_ratio - curr_ratio
+                deltas.append(delta)
+                prev_ratio = curr_ratio
+
+            # 计算方差
+            deltas_tensor = torch.stack(deltas)
+            mean_delta = deltas_tensor.mean()
+            uniformity_loss = ((deltas_tensor - mean_delta) ** 2).mean()
+
+            losses['uniformity_loss'] = uniformity_loss
+            stats['uniformity_loss'] = uniformity_loss.item()
+            stats['delta_per_layer'] = [d.item() for d in deltas]
 
     # === Entropy 正则损失：鼓励 logits 生成极端值 ===
     # 最小化 entropy 会让 sigmoid(logits) 接近 0 或 1，使训练和推理行为一致
@@ -635,6 +658,7 @@ def train_step(
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     adv_weight = method_cfg.get('adv_loss_weight', 0.5)
     sparsity_weight = method_cfg.get('sparsity_weight', 0.2)
+    uniformity_weight = method_cfg.get('uniformity_weight', 0.0)
 
     warmup_ratio = method_cfg.get('loss_weight_warmup_ratio', 0.0)
     if warmup_ratio > 0 and progress < warmup_ratio:
@@ -666,6 +690,8 @@ def train_step(
         weighted_losses['adv_loss'] = losses['adv_loss'] * adv_weight
     if 'sparsity_loss' in losses:
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
+    if 'uniformity_loss' in losses:
+        weighted_losses['uniformity_loss'] = losses['uniformity_loss'] * uniformity_weight
     if 'entropy_loss' in losses:
         weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
     if 'disc_loss' in losses:
@@ -1417,6 +1443,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         layer_acc = (real_acc + fake_acc) / 2
                         per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
                     logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
+
+                # 显示每层的增量剪枝率（如果启用了均匀性损失）
+                if 'delta_per_layer' in stats:
+                    delta_strs = [f"Δ{i+1}={d:.2%}" for i, d in enumerate(stats['delta_per_layer'])]
+                    logger.info(f"  Delta per layer: [{', '.join(delta_strs)}]")
 
             # 分布式评估：所有 rank 都参与
             if test_dataset and global_step % eval_every == 0:
