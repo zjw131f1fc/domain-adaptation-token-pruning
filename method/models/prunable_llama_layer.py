@@ -263,9 +263,11 @@ class PrunableLlamaDecoderLayer(nn.Module):
             hard_mask_full_list = []
             for b in range(batch_size):
                 kept_indices_b = cumulative_vision_mask_clean[b].nonzero(as_tuple=True)[0]
-                # hard_mask[b] 的长度应该等于 len(kept_indices_b)
+                n_kept_b = len(kept_indices_b)
+                # hard_mask[b] 的长度是 n_vision（union mask 的保留数）
+                # 但该样本只保留了 n_kept_b 个，所以只取前 n_kept_b 个值
                 hm_b = torch.zeros(n_vision_orig, device=device, dtype=dtype)
-                hm_b = hm_b.scatter(0, kept_indices_b, hard_mask[b])
+                hm_b = hm_b.scatter(0, kept_indices_b, hard_mask[b, :n_kept_b])
                 hard_mask_full_list.append(hm_b)
             hard_mask_full = torch.stack(hard_mask_full_list, dim=0)
 
@@ -346,7 +348,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 q2v_attn_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
                 for b in range(batch_size):
                     kept_indices_b = kept_indices_per_sample[b]
-                    q2v_attn_full[b, kept_indices_b] = q2v_attn_avg[b]
+                    n_kept_b = len(kept_indices_b)
+                    # q2v_attn_avg[b] 长度是 n_vision（union），只取前 n_kept_b 个
+                    q2v_attn_full[b, kept_indices_b] = q2v_attn_avg[b, :n_kept_b]
             else:
                 q2v_attn_full = q2v_attn_avg
 

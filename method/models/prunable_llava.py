@@ -370,9 +370,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             current_answer_ends = [ae - offset if ae >= current_vision_start + n_prev_kept else ae
                                                    for ae in current_answer_ends]
 
-                        # 更新累积 mask：使用 union mask 扩展到 batch 维度
-                        # 这样后续层知道哪些位置在物理上还存在
-                        cumulative_vision_mask = current_union_mask.unsqueeze(0).expand(batch_size, -1).to(dtype)
+                        # 更新累积 mask：保持每个样本自己的 mask
+                        # union mask 只用于物理删除，cumulative_vision_mask 用于 scatter
+                        cumulative_vision_mask = new_cumulative_clean
 
             else:
                 # 非剪枝层
