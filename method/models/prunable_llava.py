@@ -877,12 +877,18 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
 
+            # 计算已被剪掉的 tokens 数量（用于修正 baseline_mean）
+            current_n_vision = current_vision_end - current_vision_start
+            n_pruned_tokens = n_vision - current_n_vision
+
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
-                hard_mask, _ = pruner.forward_full(vision_hidden, q2v_attn_avg)
+                hard_mask, _ = pruner.forward_full(
+                    vision_hidden, q2v_attn_avg,
+                    n_pruned_tokens=n_pruned_tokens
+                )
 
             # Step 2: 用 mask 修改 attention weights（与训练一致）
-            current_n_vision = current_vision_end - current_vision_start
             mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
             # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
@@ -1079,6 +1085,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # 使用 generate 进行后续生成
         # 注意：需要传入已经构建好的 past_key_values
         max_new_tokens = generate_kwargs.pop('max_new_tokens', 32)
+        debug_generate = generate_kwargs.pop('debug_generate', False)
 
         # 获取 attention 配置（用于 decode 阶段）
         first_layer = llm.layers[0]
@@ -1090,10 +1097,33 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         head_dim = first_attn.head_dim
         num_kv_groups = num_heads // num_kv_heads
 
+        # 获取 EOS token ID（LLaVA 模型可能在 text_config 中）
+        eos_token_id = self.base_model.config.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = getattr(self.base_model.config, 'text_config', {})
+            if hasattr(eos_token_id, 'eos_token_id'):
+                eos_token_id = eos_token_id.eos_token_id
+            else:
+                eos_token_id = 2  # 默认 LLaMA EOS token ID
+        if isinstance(eos_token_id, list):
+            eos_token_id = eos_token_id[0]
+
         # 获取下一个 token
         next_token = logits.argmax(dim=-1)  # (batch, 1)
 
+        # Debug: 打印第一个生成的 token
+        if debug_generate:
+            token_id = next_token[0, 0].item()
+            print(f"[DEBUG generate] step 1: token_id={token_id}, eos_token_id={eos_token_id}, is_eos={token_id == eos_token_id}")
+
         generated_tokens = [next_token]
+
+        # 检查第一个 token 是否是 EOS
+        if eos_token_id is not None:
+            if (next_token == eos_token_id).all():
+                generated = torch.cat(generated_tokens, dim=1)
+                output_ids = torch.cat([input_ids, generated], dim=1)
+                return output_ids, kept_stats
 
         for _ in range(max_new_tokens - 1):
             # 准备输入
@@ -1195,11 +1225,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             generated_tokens.append(next_token)
 
-            # 检查是否生成了 EOS
-            eos_token_id = self.base_model.config.eos_token_id
+            # Debug: 打印生成的 token
+            if debug_generate:
+                token_id = next_token[0, 0].item()
+                print(f"[DEBUG generate] step {len(generated_tokens)}: token_id={token_id}")
+
+            # 检查是否生成了 EOS（使用前面已获取的 eos_token_id）
             if eos_token_id is not None:
-                if isinstance(eos_token_id, list):
-                    eos_token_id = eos_token_id[0]
                 if (next_token == eos_token_id).all():
                     break
 

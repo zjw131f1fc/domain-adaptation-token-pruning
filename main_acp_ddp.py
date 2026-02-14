@@ -407,7 +407,7 @@ def compute_task_loss(
             answer_ids = answer_ids + [eos_token_id]
 
         pred_start = answer_starts[i] - 1
-        pred_end = min(pred_start + len(answer_ids), logits.shape[1] - 1)
+        pred_end = min(pred_start + len(answer_ids), logits.shape[1])
 
         if pred_start < 0 or pred_end <= pred_start:
             continue
@@ -832,6 +832,7 @@ def evaluate(
                 question_starts=preprocessed['question_starts'],
                 question_ends=preprocessed['question_ends'],
                 max_new_tokens=32,
+                debug_generate=(step_idx <= 3 and is_main_process()),  # 前 3 个样本打印 debug
             )
 
             if 'avg_kept_ratio' in stats:

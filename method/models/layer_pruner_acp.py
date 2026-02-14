@@ -96,6 +96,7 @@ class CrossAttentionPruner(nn.Module):
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
+        n_pruned_tokens: int = 0,
         return_components: bool = False
     ) -> torch.Tensor:
         """计算 keep logits
@@ -107,6 +108,7 @@ class CrossAttentionPruner(nn.Module):
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - LLM 的 question→vision attention 权重（作为 baseline）
             cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
+            n_pruned_tokens: 已被剪掉的 tokens 数量（推理时物理删除后使用，用于修正 baseline_mean）
             return_components: 是否返回中间结果
 
         返回:
@@ -118,7 +120,19 @@ class CrossAttentionPruner(nn.Module):
         if q2v_attn is not None:
             # 将 attention 转换为 logit 空间（log 变换 + 中心化）
             baseline_raw = torch.log(q2v_attn.clamp(min=1e-6))
-            baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
+
+            # 推理时物理删除后，需要修正 baseline_mean
+            # 被剪掉的 tokens 的 attention = 0，baseline_raw = log(1e-6) ≈ -13.8
+            if n_pruned_tokens > 0:
+                # 修正 baseline_mean：把被剪掉的 tokens 的贡献也算进去
+                import math
+                pruned_baseline = math.log(1e-6)  # ≈ -13.8
+                total_sum = baseline_raw.sum(dim=-1, keepdim=True) + n_pruned_tokens * pruned_baseline
+                total_count = n_vision + n_pruned_tokens
+                baseline_mean = total_sum / total_count
+            else:
+                baseline_mean = baseline_raw.mean(dim=-1, keepdim=True)
+
             baseline = baseline_raw - baseline_mean
         else:
             baseline = torch.zeros(batch_size, n_vision, device=vision_hidden.device)
@@ -246,6 +260,7 @@ class CrossAttentionPruner(nn.Module):
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
+        n_pruned_tokens: int = 0,
         temperature: Optional[float] = None,
         return_debug: bool = False
     ) -> Tuple[torch.Tensor, Dict]:
@@ -255,6 +270,7 @@ class CrossAttentionPruner(nn.Module):
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
             cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
+            n_pruned_tokens: 已被剪掉的 tokens 数量（推理时物理删除后使用）
             temperature: 可选的温度覆盖
             return_debug: 是否返回 debug 信息
 
@@ -265,6 +281,7 @@ class CrossAttentionPruner(nn.Module):
         keep_logits, components = self.forward(
             vision_hidden, q2v_attn,
             cumulative_vision_mask=cumulative_vision_mask,
+            n_pruned_tokens=n_pruned_tokens,
             return_components=True
         )
 

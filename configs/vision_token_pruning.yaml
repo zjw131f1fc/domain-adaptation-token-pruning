@@ -39,15 +39,15 @@ trainer_settings:
         # 进入阶段3时，将当前学习率乘以此系数
         phase3_lr_scale: 0.2
     print_loss_every_batches: 40  # 隔多久打印一次损失
-    eval_every_batches: 2000  # 隔多久评估一次
+    eval_every_batches: 1000  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
-    save_every_batches: 2000 # 隔多久保存一个checkpoint
+    save_every_batches: 1000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 15000
+    train: 150000
     test: 2000
   fast_load_no_random: false
   category_priority:
@@ -130,7 +130,7 @@ method_settings:
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
-  sparsity_anneal_ratio: 0.5
+  sparsity_anneal_ratio: 0.4
 
   # ==================== Temperature 配置 ====================
   # 注意：如果使用 gumbel_mode="hybrid"，温度由 hybrid_phase* 参数控制
