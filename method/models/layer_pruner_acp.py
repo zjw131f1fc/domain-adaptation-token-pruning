@@ -35,6 +35,7 @@ class CrossAttentionPruner(nn.Module):
         temperature: float = 1.0,
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
+        pruning_threshold: float = 0.5,  # sigmoid 后的阈值，用于训练第三阶段和推理
     ):
         super().__init__()
         self.d_model = d_model
@@ -42,6 +43,7 @@ class CrossAttentionPruner(nn.Module):
         self.n_heads = n_heads
         self.temperature = temperature
         self.use_gumbel_noise = use_gumbel_noise
+        self.pruning_threshold = pruning_threshold
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
@@ -234,7 +236,7 @@ class CrossAttentionPruner(nn.Module):
 
             # sigmoid + hard 决策 + STE
             y_soft = torch.sigmoid(noisy_logits / temp)
-            y_hard = (y_soft > 0.5).float()
+            y_hard = (y_soft > self.pruning_threshold).float()
             hard_mask = y_hard - y_soft.detach() + y_soft
 
             if return_debug:
@@ -246,10 +248,12 @@ class CrossAttentionPruner(nn.Module):
                     'noisy_logits_std': noisy_logits.std().item(),
                     'y_soft_mean': y_soft.mean().item(),
                     'temperature': temp,
+                    'pruning_threshold': self.pruning_threshold,
                 }
         else:
-            # 推理模式：x > 0 即保留
-            hard_mask = (keep_logits_f32 > 0).float()
+            # 推理模式：sigmoid(x) > threshold
+            y_soft = torch.sigmoid(keep_logits_f32)
+            hard_mask = (y_soft > self.pruning_threshold).float()
 
         if return_debug:
             return hard_mask.to(input_dtype), debug_info
@@ -307,6 +311,10 @@ class CrossAttentionPruner(nn.Module):
         """设置是否使用 Gumbel noise"""
         self.use_gumbel_noise = use_gumbel_noise
 
+    def set_pruning_threshold(self, threshold: float):
+        """设置 sigmoid 后的剪枝阈值"""
+        self.pruning_threshold = threshold
+
 
 class LayerPrunerManager(nn.Module):
     """多层剪枝器管理器
@@ -332,6 +340,7 @@ class LayerPrunerManager(nn.Module):
         temperature: float = 1.0,
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,
+        pruning_threshold: float = 0.5,
     ):
         super().__init__()
         self.layer_indices = layer_indices
@@ -346,6 +355,7 @@ class LayerPrunerManager(nn.Module):
                 temperature=temperature,
                 dropout=dropout,
                 use_gumbel_noise=use_gumbel_noise,
+                pruning_threshold=pruning_threshold,
             )
             for idx in layer_indices
         })
@@ -366,6 +376,11 @@ class LayerPrunerManager(nn.Module):
         """设置所有剪枝器是否使用 Gumbel noise"""
         for pruner in self.pruners.values():
             pruner.set_use_gumbel_noise(use_gumbel_noise)
+
+    def set_pruning_threshold(self, threshold: float):
+        """设置所有剪枝器的 sigmoid 阈值"""
+        for pruner in self.pruners.values():
+            pruner.set_pruning_threshold(threshold)
 
     def get_all_layers(self) -> list:
         """返回所有剪枝层的索引"""

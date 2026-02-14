@@ -145,6 +145,9 @@ def load_model(config, device: torch.device, local_rank: int):
     text_adapter_bottleneck = method_cfg.get('text_adapter_bottleneck', 256)
     generator_adapter_bottleneck = method_cfg.get('generator_adapter_bottleneck', 512)
 
+    # 剪枝阈值（sigmoid 后的阈值，用于训练第三阶段和推理）
+    pruning_threshold = method_cfg.get('pruning_threshold', 0.5)
+
     # 模型路径
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
     model_mapping = {
@@ -196,6 +199,7 @@ def load_model(config, device: torch.device, local_rank: int):
         dropout=dropout,
         disc_use_spectral_norm=disc_spectral_norm,
         use_gumbel_noise=use_gumbel_noise,
+        pruning_threshold=pruning_threshold,
     )
 
     # 冻结基础模型
@@ -618,63 +622,82 @@ def train_step(
         pruning_layers = sorted(output.pruning_infos.keys())
         n_pruning_layers = len(pruning_layers)
 
-        # === 影响权重几何递减方案 ===
-        # 每层的影响权重 = 该层影响的后续层数
-        # 早期层影响大，目标保留率更高；晚期层影响小，目标保留率更低
-        influence_weights = [total_layers - layer_idx for layer_idx in pruning_layers]
-        total_influence = sum(influence_weights)
-
-        # 计算累积影响权重（用于确定每层的目标累积保留率）
-        cumulative_influence = []
-        cum = 0
-        for w in influence_weights:
-            cum += w
-            cumulative_influence.append(cum)
+        # === 调和平均近似方案 ===
+        # 原公式：avg = (n0*1 + n1*r1 + n2*r1*r2 + n3*r1*r2*r3) / total_layers
+        # 其中 n_i 是各段的层数，r_i 是各剪枝器的独立保留率
+        # 调和平均近似：hm = n / Σ(1/r_i)，然后 avg_approx = f(hm)
 
         # Debug: 前几步打印 sparsity 计算详情
         debug_sparsity = (current_step <= 3)
+
+        # 收集各层的累积保留率
+        cumulative_ratios = []
+        for layer_idx in pruning_layers:
+            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
+            cumulative_ratio = hard_mask.float().mean()
+            cumulative_ratios.append(cumulative_ratio)
+            stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
+
+        # 计算独立保留率 p_i = cumulative_r_i / cumulative_r_{i-1}
+        independent_ratios = []
+        for i, cum_ratio in enumerate(cumulative_ratios):
+            if i == 0:
+                p_i = cum_ratio  # 第一个剪枝器的独立保留率 = 累积保留率
+            else:
+                # 避免除零
+                prev_cum = cumulative_ratios[i - 1].clamp(min=1e-6)
+                p_i = cum_ratio / prev_cum
+            # clamp 避免极端值
+            p_i = p_i.clamp(min=1e-6, max=1.0)
+            independent_ratios.append(p_i)
+
+        # 计算调和平均
+        # hm = n / Σ(1/p_i)
+        inv_sum = sum(1.0 / p for p in independent_ratios)
+        hm = n_pruning_layers / inv_sum
+
+        # 计算各段的层数
+        # 假设剪枝层是 [L4, L14, L24]，总层数 32
+        # n0 = 4 (L0-L3, 无剪枝)
+        # n1 = 10 (L4-L13, 使用第一个剪枝器)
+        # n2 = 10 (L14-L23, 使用前两个剪枝器)
+        # n3 = 8 (L24-L31, 使用全部剪枝器)
+        n_segments = []
+        for i, layer_idx in enumerate(pruning_layers):
+            if i == 0:
+                n_segments.append(layer_idx)  # n0: 剪枝前的层数
+            if i < n_pruning_layers - 1:
+                n_segments.append(pruning_layers[i + 1] - layer_idx)
+            else:
+                n_segments.append(total_layers - layer_idx)
+
+        # 近似平均保留率：avg_approx = (n0*1 + n1*hm + n2*hm^2 + ... + n_k*hm^k) / total_layers
+        avg_approx = torch.tensor(0.0, device=device)
+        avg_approx = avg_approx + n_segments[0] * 1.0  # 剪枝前的层，保留率=1
+        hm_power = hm
+        for i in range(1, len(n_segments)):
+            avg_approx = avg_approx + n_segments[i] * hm_power
+            hm_power = hm_power * hm
+        avg_approx = avg_approx / total_layers
+
+        # Sparsity loss
+        sparsity_loss = torch.abs(avg_approx - target_ratio)
+
         if debug_sparsity:
             print(f"[DEBUG sparsity] n_vision={n_vision}, target_token_num={target_token_num}, target_ratio={target_ratio:.4f}")
             print(f"[DEBUG sparsity] total_layers={total_layers}, pruning_layers={pruning_layers}")
-            print(f"[DEBUG sparsity] influence_weights={influence_weights}, total={total_influence}")
-            print(f"[DEBUG sparsity] cumulative_influence={cumulative_influence}")
-
-        sparsity_loss = torch.tensor(0.0, device=device)
-
-        for i, layer_idx in enumerate(pruning_layers):
-            # 当前层的目标累积保留率 = target^(cumulative_influence[i] / total_influence)
-            target_cumulative = target_ratio ** (cumulative_influence[i] / total_influence)
-
-            # 实际累积保留率
-            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            cumulative_ratio = hard_mask.float().mean()
-            stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
-            stats[f'L{layer_idx}_target'] = target_cumulative
-
-            # 每层的损失贡献相同
-            layer_loss = torch.abs(cumulative_ratio - target_cumulative)
-            sparsity_loss = sparsity_loss + layer_loss
-
-            if debug_sparsity:
-                n_kept = (hard_mask[0] > 0.5).sum().item()
-                print(f"[DEBUG sparsity] L{layer_idx}: target_cumulative={target_cumulative:.4f}, "
-                      f"actual={cumulative_ratio.item():.4f}, n_kept(sample0)={n_kept}, "
-                      f"layer_loss={layer_loss.item():.4f}")
-
-        sparsity_loss = sparsity_loss / n_pruning_layers
-
-        if debug_sparsity:
-            print(f"[DEBUG sparsity] final sparsity_loss={sparsity_loss.item():.4f}")
+            print(f"[DEBUG sparsity] n_segments={n_segments}")
+            print(f"[DEBUG sparsity] cumulative_ratios={[r.item() for r in cumulative_ratios]}")
+            print(f"[DEBUG sparsity] independent_ratios={[r.item() for r in independent_ratios]}")
+            print(f"[DEBUG sparsity] hm={hm.item():.4f}, avg_approx={avg_approx.item():.4f}")
+            print(f"[DEBUG sparsity] sparsity_loss={sparsity_loss.item():.4f}")
 
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
+        stats['avg_kept_ratio'] = avg_approx.item()
+        stats['harmonic_mean'] = hm.item()
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
-
-        # 计算平均保留率（最后一个剪枝层的累积保留率）
-        last_layer_idx = pruning_layers[-1]
-        last_hard_mask = output.pruning_infos[last_layer_idx]['hard_mask']
-        stats['avg_kept_ratio'] = last_hard_mask.float().mean().item()
 
     # === Entropy 正则损失：鼓励 logits 生成极端值 ===
     # 最小化 entropy 会让 sigmoid(logits) 接近 0 或 1，使训练和推理行为一致

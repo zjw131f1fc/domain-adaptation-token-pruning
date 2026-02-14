@@ -114,6 +114,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         dropout: float = 0.1,
         disc_use_spectral_norm: bool = False,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
+        pruning_threshold: float = 0.5,  # sigmoid 后的剪枝阈值
     ):
         super().__init__()
 
@@ -137,6 +138,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             temperature=temperature,
             dropout=dropout,
             use_gumbel_noise=use_gumbel_noise,
+            pruning_threshold=pruning_threshold,
         )
 
         # 创建 Discriminators
