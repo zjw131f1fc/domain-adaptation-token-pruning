@@ -616,53 +616,58 @@ def train_step(
 
         total_layers = len(model.base_model.language_model.layers)
         pruning_layers = sorted(output.pruning_infos.keys())
+        n_pruning_layers = len(pruning_layers)
 
-        weighted_kept = torch.tensor(0.0, device=device)
+        # === 影响权重几何递减方案 ===
+        # 每层的影响权重 = 该层影响的后续层数
+        # 早期层影响大，目标保留率更高；晚期层影响小，目标保留率更低
+        influence_weights = [total_layers - layer_idx for layer_idx in pruning_layers]
+        total_influence = sum(influence_weights)
+
+        # 计算累积影响权重（用于确定每层的目标累积保留率）
+        cumulative_influence = []
+        cum = 0
+        for w in influence_weights:
+            cum += w
+            cumulative_influence.append(cum)
 
         # Debug: 前几步打印 sparsity 计算详情
         debug_sparsity = (current_step <= 3)
         if debug_sparsity:
             print(f"[DEBUG sparsity] n_vision={n_vision}, target_token_num={target_token_num}, target_ratio={target_ratio:.4f}")
             print(f"[DEBUG sparsity] total_layers={total_layers}, pruning_layers={pruning_layers}")
+            print(f"[DEBUG sparsity] influence_weights={influence_weights}, total={total_influence}")
+            print(f"[DEBUG sparsity] cumulative_influence={cumulative_influence}")
+
+        sparsity_loss = torch.tensor(0.0, device=device)
 
         for i, layer_idx in enumerate(pruning_layers):
-            if i == 0:
-                n_layers_before = layer_idx
-                weighted_kept = weighted_kept + n_layers_before * 1.0
-                if debug_sparsity:
-                    print(f"[DEBUG sparsity] layers 0-{layer_idx-1}: kept_ratio=1.0, n_layers={n_layers_before}")
+            # 当前层的目标累积保留率 = target^(cumulative_influence[i] / total_influence)
+            target_cumulative = target_ratio ** (cumulative_influence[i] / total_influence)
 
-            # hard_mask 已经是累积 mask（之前被剪掉的 token 在这里是 0）
-            # 所以 layer_mask.mean() 直接就是累积保留率，不需要额外乘法
+            # 实际累积保留率
             hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            layer_mask = hard_mask.float().mean(dim=0)
-            cumulative_ratio = layer_mask.mean()
+            cumulative_ratio = hard_mask.float().mean()
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
+            stats[f'L{layer_idx}_target'] = target_cumulative
 
-            if i < len(pruning_layers) - 1:
-                n_affected = pruning_layers[i + 1] - layer_idx
-            else:
-                n_affected = total_layers - layer_idx
+            # 每层的损失贡献相同
+            layer_loss = torch.abs(cumulative_ratio - target_cumulative)
+            sparsity_loss = sparsity_loss + layer_loss
 
             if debug_sparsity:
-                n_kept = (hard_mask[0] > 0.5).sum().item()  # 第一个样本的保留数量
-                print(f"[DEBUG sparsity] L{layer_idx}: hard_mask.shape={hard_mask.shape}, "
-                      f"n_kept(sample0)={n_kept}, cumulative_ratio={cumulative_ratio.item():.4f}, "
-                      f"n_affected={n_affected}")
+                n_kept = (hard_mask[0] > 0.5).sum().item()
+                print(f"[DEBUG sparsity] L{layer_idx}: target_cumulative={target_cumulative:.4f}, "
+                      f"actual={cumulative_ratio.item():.4f}, n_kept(sample0)={n_kept}, "
+                      f"layer_loss={layer_loss.item():.4f}")
 
-            weighted_kept = weighted_kept + n_affected * cumulative_ratio
-
-        avg_kept_ratio_tensor = weighted_kept / total_layers
-        sparsity_loss = torch.abs(avg_kept_ratio_tensor - target_ratio)
+        sparsity_loss = sparsity_loss / n_pruning_layers
 
         if debug_sparsity:
-            print(f"[DEBUG sparsity] weighted_kept={weighted_kept.item():.4f}, "
-                  f"avg_kept_ratio={avg_kept_ratio_tensor.item():.4f}, "
-                  f"sparsity_loss={sparsity_loss.item():.4f}")
+            print(f"[DEBUG sparsity] final sparsity_loss={sparsity_loss.item():.4f}")
 
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
-        stats['avg_kept_ratio'] = avg_kept_ratio_tensor.item()
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
 
@@ -1225,10 +1230,15 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info("  Loaded pruner_manager state")
 
-            if 'adapter_state_dict' in checkpoint:
+            if 'adapter_state_dict' in checkpoint and not model.use_separated_adapters:
                 model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
                 if is_main_process():
                     logger.info("  Loaded adapter_manager state")
+
+            if 'separated_adapter_state_dict' in checkpoint and model.use_separated_adapters:
+                model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
+                if is_main_process():
+                    logger.info("  Loaded separated_adapter_manager state")
 
             if 'disc_state_dict' in checkpoint:
                 model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
@@ -1555,11 +1565,15 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 ckpt_data = {
                     'step': global_step,
                     'pruner_state_dict': model.pruner_manager.state_dict(),
-                    'adapter_state_dict': model.adapter_manager.state_dict(),
                     'disc_state_dict': model.disc_manager.state_dict(),
                     'pruner_optimizer': pruner_optimizer.state_dict(),
                     'disc_optimizer': disc_optimizer.state_dict(),
                 }
+                # 根据 adapter 类型保存
+                if model.use_separated_adapters:
+                    ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
+                else:
+                    ckpt_data['adapter_state_dict'] = model.adapter_manager.state_dict()
                 if pruner_scheduler is not None:
                     ckpt_data['pruner_scheduler'] = pruner_scheduler.state_dict()
                 if disc_scheduler is not None:
@@ -1577,12 +1591,16 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     # 最终保存（只在主进程）
     if is_main_process():
         final_path = save_dir / "checkpoint_final.pt"
-        torch.save({
+        final_ckpt = {
             'step': global_step,
             'pruner_state_dict': model.pruner_manager.state_dict(),
-            'adapter_state_dict': model.adapter_manager.state_dict(),
             'disc_state_dict': model.disc_manager.state_dict(),
-        }, final_path)
+        }
+        if model.use_separated_adapters:
+            final_ckpt['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
+        else:
+            final_ckpt['adapter_state_dict'] = model.adapter_manager.state_dict()
+        torch.save(final_ckpt, final_path)
         logger.info(f"Training completed. Final checkpoint saved to {final_path}")
 
     # 汇总训练期间每层的保留数量统计（分布式聚合）

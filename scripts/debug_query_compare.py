@@ -378,13 +378,44 @@ def main():
     for handle in handles:
         handle.remove()
 
-    # 打印生成结果
-    generated = processor.decode(output_ids[0], skip_special_tokens=True)
+    # 比较最终生成的 token
     print(f"\n" + "=" * 60)
-    print("GENERATION RESULT")
+    print("COMPARING GENERATED TOKENS")
     print("=" * 60)
+
+    # 训练模式：取 answer_start 位置的 logits，argmax 得到预测 token
+    answer_start = prep_train['answer_starts'][0]
+    train_logits = output_train.logits[0, answer_start - 1, :]  # 预测 answer_start 位置的 token
+    train_pred_token = train_logits.argmax().item()
+    train_pred_text = processor.tokenizer.decode([train_pred_token])
+
+    # 推理模式：生成的第一个新 token
+    # output_ids 包含整个序列（prompt + generated）
+    infer_pred_token = output_ids[0, -1].item()  # 最后一个 token 是生成的
+    infer_pred_text = processor.tokenizer.decode([infer_pred_token])
+
     print(f"Expected answer: {sample['answer']}")
-    print(f"Generated: {generated}")
+    print(f"Train mode prediction (argmax at answer_start-1):")
+    print(f"  token_id={train_pred_token}, text='{train_pred_text}'")
+    print(f"Inference mode prediction (generated token):")
+    print(f"  token_id={infer_pred_token}, text='{infer_pred_text}'")
+
+    if train_pred_token == infer_pred_token:
+        print(f"\n[TOKEN MATCH] Train and inference produce the same token!")
+    else:
+        print(f"\n[TOKEN MISMATCH!] Train and inference produce different tokens!")
+        # 打印 top-5 对比
+        print(f"\nTrain mode top-5:")
+        train_top5 = train_logits.topk(5)
+        for i, (val, idx) in enumerate(zip(train_top5.values, train_top5.indices)):
+            print(f"  {i+1}. token_id={idx.item()}, text='{processor.tokenizer.decode([idx.item()])}', logit={val.item():.4f}")
+
+        # 推理模式也获取 logits 来对比
+        print(f"\nNote: To compare inference logits, need to modify generate to return logits")
+
+    # 打印完整生成结果
+    generated = processor.decode(output_ids[0], skip_special_tokens=True)
+    print(f"\nFull generated text: {generated}")
     if "ASSISTANT:" in generated:
         pred = generated.split("ASSISTANT:")[-1].strip()
         print(f"Predicted answer: {pred}")

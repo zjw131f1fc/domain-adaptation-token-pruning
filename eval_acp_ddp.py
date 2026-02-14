@@ -66,7 +66,12 @@ def load_checkpoint(
         if logger:
             logger.info("  Loaded pruner_manager state")
 
-    if 'adapter_state_dict' in checkpoint:
+    # 支持分离式 Adapter
+    if 'separated_adapter_state_dict' in checkpoint and model.use_separated_adapters:
+        model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
+        if logger:
+            logger.info("  Loaded separated_adapter_manager state")
+    elif 'adapter_state_dict' in checkpoint and not model.use_separated_adapters:
         model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
         if logger:
             logger.info("  Loaded adapter_manager state")
