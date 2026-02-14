@@ -998,11 +998,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
                 new_hidden_states_list.append(new_hidden)
 
-                # 更新 position_ids（重新编号）
-                new_seq_len = new_hidden.shape[0]
-                new_pos_ids = torch.arange(new_seq_len, device=device)
-                new_position_ids_list.append(new_pos_ids)
-
                 # 更新 kept_indices（记录哪些原始位置被保留）
                 old_kept = kept_indices[i]
                 new_kept = (
@@ -1011,6 +1006,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     old_kept[current_vision_end:]
                 )
                 new_kept_indices_list.append(new_kept)
+
+                # 更新 position_ids（保持原位置，不重新编号）
+                new_pos_ids = torch.tensor(new_kept, device=device, dtype=torch.long)
+                new_position_ids_list.append(new_pos_ids)
 
             # Pad to same length (batch 内可能长度不同)
             max_new_len = max(h.shape[0] for h in new_hidden_states_list)

@@ -1,8 +1,14 @@
 #!/usr/bin/env python
-"""对比训练和推理时 adapter 收到的 query 是否一致
+"""对比训练和推理时的行为是否一致
 
 用法:
-    python scripts/debug_query_compare.py
+    python scripts/debug_query_compare.py                    # 两个模式都跑
+    python scripts/debug_query_compare.py --mode query       # 对比 adapter query
+    python scripts/debug_query_compare.py --mode retention   # 对比保留 token 和 logits
+
+模式说明:
+    - query: 对比训练和推理时 adapter 收到的 query 是否一致
+    - retention: 对比训练 (mask) 和推理 (eval) 模式下保留的 token 和 logits 是否一致
 """
 
 import os
@@ -10,6 +16,7 @@ os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
+import argparse
 from pathlib import Path
 
 # 检查实际加载的包路径
@@ -27,7 +34,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
-def load_model_and_processor(device):
+def load_model_and_processor(device, checkpoint_path=None, pruning_threshold=0.5, use_gumbel_noise=True, temperature=1.0):
     """加载模型"""
     from transformers import LlavaForConditionalGeneration, AutoProcessor
     from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
@@ -53,11 +60,34 @@ def load_model_and_processor(device):
         pruner_n_heads=4,
         adapter_bottleneck=512,
         adapter_type='lightweight',
-        temperature=1.0,
+        temperature=temperature,
         dropout=0.15,
+        use_gumbel_noise=use_gumbel_noise,
+        pruning_threshold=pruning_threshold,
     )
 
     model.freeze_base_model()
+
+    # 加载 checkpoint
+    if checkpoint_path and Path(checkpoint_path).exists():
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        if 'pruner_state_dict' in checkpoint:
+            model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
+            print("  Loaded pruner_manager state")
+
+        if 'adapter_state_dict' in checkpoint:
+            model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
+            print("  Loaded adapter_manager state")
+
+        if 'separated_adapter_state_dict' in checkpoint:
+            if hasattr(model, 'separated_adapter_manager') and model.separated_adapter_manager is not None:
+                model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
+                print("  Loaded separated_adapter_manager state")
+
+        print(f"  Checkpoint step: {checkpoint.get('step', 'unknown')}")
+
     print("Model loaded.")
 
     return model, processor
@@ -421,5 +451,237 @@ def main():
         print(f"Predicted answer: {pred}")
 
 
+def main_retention(args, model=None, processor=None, train_dataset=None):
+    """对比训练第三阶段和推理时的保留率和保留的具体 token"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(f"Pruning threshold: {args.pruning_threshold}")
+
+    # 加载模型（如果没有传入）
+    if model is None or processor is None:
+        model, processor = load_model_and_processor(
+            device,
+            checkpoint_path=args.checkpoint,
+            pruning_threshold=args.pruning_threshold,
+            use_gumbel_noise=False,  # 第三阶段不使用 noise
+            temperature=0.1,
+        )
+
+    # 加载样本（如果没有传入）
+    if train_dataset is None:
+        from engine.configs.loader import load_config
+        from engine.datas.loader import load_dataset
+
+        config = load_config(override_file="configs/vision_token_pruning.yaml")
+        config.dataset_settings['split'] = {'train': 100, 'test': 100}
+        data_bundle = load_dataset(config)
+        train_dataset = data_bundle['splits']['train']
+
+    print("\n" + "=" * 70)
+    print("对比两次 eval 模式运行的 mask 决策和 logits 一致性")
+    print("=" * 70)
+
+    all_train_ratios = {layer: [] for layer in model.pruning_layers}
+    all_infer_ratios = {layer: [] for layer in model.pruning_layers}
+    all_mask_match = []
+    all_logits_diff = []
+
+    for sample_idx in range(min(args.num_samples, len(train_dataset))):
+        sample = train_dataset[sample_idx]
+        print(f"\n--- Sample {sample_idx + 1}: Q='{sample['question'][:50]}...', A='{sample['answer']}' ---")
+
+        # 预处理（推理模式，不包含答案，两边都用这个）
+        prep = preprocess_sample(sample, processor, device, mode="inference")
+        inputs = prep['inputs']
+
+        # ========== 训练模式 (mask, 不做物理删除) ==========
+        # 注意：用 eval 模式消除 dropout 影响，只测试 mask 决策逻辑
+        model.eval()
+        model.pruner_manager.set_use_gumbel_noise(False)  # 关闭 noise
+        model.pruner_manager.set_temperature(0.1)
+
+        with torch.no_grad():
+            output_train = model(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                attention_mask=inputs['attention_mask'],
+                vision_start=prep['vision_start'],
+                vision_end=prep['vision_end'],
+                question_starts=prep['question_starts'],
+                question_ends=prep['question_ends'],
+                answer_starts=prep['answer_starts'] if 'answer_starts' in prep else [prep['question_ends'][0]],
+                answer_ends=prep['answer_ends'] if 'answer_ends' in prep else [prep['question_ends'][0] + 1],
+                return_pruning_info=True,
+            )
+
+        # 收集训练模式的 mask
+        train_masks = {}
+        train_ratios = {}
+        for layer_idx in model.pruning_layers:
+            if layer_idx in output_train.pruning_infos:
+                hard_mask = output_train.pruning_infos[layer_idx]['hard_mask']
+                train_masks[layer_idx] = hard_mask.clone()
+                ratio = hard_mask.float().mean().item()
+                train_ratios[layer_idx] = ratio
+                all_train_ratios[layer_idx].append(ratio)
+
+        # 训练模式的 logits（最后一个位置，用于预测下一个 token）
+        train_logits = output_train.logits[0, -1, :].clone()
+
+        # ========== 第二次运行 (验证确定性) ==========
+        # 两边都用 eval 模式，验证 mask 决策是否确定性
+        model.eval()
+
+        with torch.no_grad():
+            output_infer = model(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                attention_mask=inputs.get('attention_mask'),
+                vision_start=prep['vision_start'],
+                vision_end=prep['vision_end'],
+                question_starts=prep['question_starts'],
+                question_ends=prep['question_ends'],
+                answer_starts=prep['answer_starts'] if 'answer_starts' in prep else [prep['question_ends'][0]],
+                answer_ends=prep['answer_ends'] if 'answer_ends' in prep else [prep['question_ends'][0] + 1],
+                return_pruning_info=True,
+            )
+
+        # 收集推理模式的 mask
+        infer_masks = {}
+        infer_ratios = {}
+        for layer_idx in model.pruning_layers:
+            if layer_idx in output_infer.pruning_infos:
+                hard_mask = output_infer.pruning_infos[layer_idx]['hard_mask']
+                infer_masks[layer_idx] = hard_mask.clone()
+                ratio = hard_mask.float().mean().item()
+                infer_ratios[layer_idx] = ratio
+                all_infer_ratios[layer_idx].append(ratio)
+
+        # 推理模式的 logits
+        infer_logits = output_infer.logits[0, -1, :].clone()
+
+        # ========== 对比 ==========
+        print(f"\n  [保留率对比]")
+        print(f"  {'Layer':<8} {'Train':>12} {'Infer':>12} {'Diff':>12}")
+        print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12}")
+        for layer_idx in model.pruning_layers:
+            t_ratio = train_ratios.get(layer_idx, 0)
+            i_ratio = infer_ratios.get(layer_idx, 0)
+            diff = abs(t_ratio - i_ratio)
+            match = "OK" if diff < 0.001 else "!!"
+            print(f"  L{layer_idx:<6} {t_ratio:>11.2%} {i_ratio:>11.2%} {diff:>11.6f} {match}")
+
+        # 对比具体保留的 token
+        print(f"\n  [保留 token 对比]")
+        sample_mask_match = True
+        for layer_idx in model.pruning_layers:
+            t_mask = train_masks.get(layer_idx)
+            i_mask = infer_masks.get(layer_idx)
+            if t_mask is not None and i_mask is not None:
+                # 对比 mask 是否完全一致
+                mask_equal = torch.equal(t_mask, i_mask)
+                if mask_equal:
+                    print(f"  L{layer_idx}: mask 完全一致 ✓")
+                else:
+                    sample_mask_match = False
+                    diff_count = (t_mask != i_mask).sum().item()
+                    print(f"  L{layer_idx}: mask 不一致! 差异数量: {diff_count}")
+                    # 打印前几个不一致的位置
+                    diff_indices = (t_mask[0] != i_mask[0]).nonzero(as_tuple=True)[0][:5]
+                    for idx in diff_indices:
+                        print(f"    位置 {idx.item()}: train={t_mask[0, idx].item()}, infer={i_mask[0, idx].item()}")
+        all_mask_match.append(sample_mask_match)
+
+        # 对比 logits
+        print(f"\n  [Logits 对比]")
+        logits_diff = (train_logits.float() - infer_logits.float()).abs()
+        max_diff = logits_diff.max().item()
+        mean_diff = logits_diff.mean().item()
+        all_logits_diff.append(max_diff)
+
+        print(f"  max_diff: {max_diff:.6f}, mean_diff: {mean_diff:.6f}")
+
+        # 对比 top-5 预测
+        train_top5 = train_logits.topk(5)
+        infer_top5 = infer_logits.topk(5)
+
+        print(f"  Train top-5: {[processor.tokenizer.decode([idx.item()]) for idx in train_top5.indices]}")
+        print(f"  Infer top-5: {[processor.tokenizer.decode([idx.item()]) for idx in infer_top5.indices]}")
+
+        if train_top5.indices[0] == infer_top5.indices[0]:
+            print(f"  Top-1 预测一致 ✓")
+        else:
+            print(f"  Top-1 预测不一致!")
+
+        if max_diff < 1e-3:
+            print(f"  Logits 数值一致 (max_diff < 1e-3) ✓")
+        elif max_diff < 1e-1:
+            print(f"  Logits 数值接近 (max_diff < 0.1)")
+        else:
+            print(f"  Logits 数值差异较大!")
+
+    # ========== 汇总统计 ==========
+    print("\n" + "=" * 70)
+    print("汇总统计")
+    print("=" * 70)
+
+    print(f"\n[保留率]")
+    print(f"{'Layer':<8} {'Train Mean':>12} {'Infer Mean':>12} {'Diff':>12}")
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12}")
+
+    for layer_idx in model.pruning_layers:
+        t_mean = sum(all_train_ratios[layer_idx]) / len(all_train_ratios[layer_idx]) if all_train_ratios[layer_idx] else 0
+        i_mean = sum(all_infer_ratios[layer_idx]) / len(all_infer_ratios[layer_idx]) if all_infer_ratios[layer_idx] else 0
+        diff = abs(t_mean - i_mean)
+        match = "OK" if diff < 0.001 else "!!"
+        print(f"L{layer_idx:<6} {t_mean:>11.2%} {i_mean:>11.2%} {diff:>11.6f} {match}")
+
+    print(f"\n[Mask 一致性]")
+    match_count = sum(all_mask_match)
+    print(f"  {match_count}/{len(all_mask_match)} 样本的 mask 完全一致")
+
+    print(f"\n[Logits 差异]")
+    print(f"  max_diff 平均: {sum(all_logits_diff)/len(all_logits_diff):.6f}")
+    print(f"  max_diff 最大: {max(all_logits_diff):.6f}")
+
+    if all(all_mask_match) and max(all_logits_diff) < 1e-3:
+        print(f"\n✓ 两次运行的 mask 决策和 logits 完全一致!")
+    else:
+        print(f"\n✗ 两次运行存在差异，可能有非确定性因素!")
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="对比训练和推理")
+    parser.add_argument("--mode", type=str, default="both", choices=["query", "retention", "both"],
+                        help="模式: query=对比adapter query, retention=对比保留率, both=两个都跑")
+    parser.add_argument("--checkpoint", type=str,
+                        default="outputs/tasks/20260215-0233_vqa-vqav2_llava157b_dcc0/checkpoints/checkpoint_final.pt",
+                        help="Checkpoint 路径")
+    parser.add_argument("--pruning_threshold", type=float, default=0.5,
+                        help="Sigmoid 阈值 (默认 0.5)")
+    parser.add_argument("--num_samples", type=int, default=5,
+                        help="测试样本数量")
+    args = parser.parse_args()
+
+    # 共享数据加载
+    from engine.configs.loader import load_config
+    from engine.datas.loader import load_dataset
+
+    print("加载数据集...")
+    config = load_config(override_file="configs/vision_token_pruning.yaml")
+    config.dataset_settings['split'] = {'train': 100, 'test': 100}
+    data_bundle = load_dataset(config)
+    train_dataset = data_bundle['splits']['train']
+    print(f"数据集加载完成，共 {len(train_dataset)} 条样本")
+
+    if args.mode in ["query", "both"]:
+        print("\n" + "=" * 70)
+        print("模式 1: 对比 Adapter Query")
+        print("=" * 70)
+        main()
+
+    if args.mode in ["retention", "both"]:
+        print("\n" + "=" * 70)
+        print("模式 2: 验证 eval 模式下 mask 决策的确定性")
+        print("=" * 70)
+        main_retention(args, train_dataset=train_dataset)

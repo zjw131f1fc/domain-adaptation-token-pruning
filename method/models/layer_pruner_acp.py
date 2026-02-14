@@ -251,8 +251,9 @@ class CrossAttentionPruner(nn.Module):
                     'pruning_threshold': self.pruning_threshold,
                 }
         else:
-            # 推理模式：sigmoid(x) > threshold
-            y_soft = torch.sigmoid(keep_logits_f32)
+            # 推理模式：sigmoid(x / temp) > threshold
+            # 注意：必须除以温度，与训练时保持一致
+            y_soft = torch.sigmoid(keep_logits_f32 / temp)
             hard_mask = (y_soft > self.pruning_threshold).float()
 
         if return_debug:
