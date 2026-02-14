@@ -140,6 +140,10 @@ def load_model(config, device: torch.device, local_rank: int):
     # Adapter 配置
     adapter_type = method_cfg.get('adapter_type', 'lightweight')
     adapter_bottleneck = method_cfg.get('adapter_bottleneck', None)
+    use_separated_adapters = method_cfg.get('use_separated_adapters', False)
+    vision_adapter_bottleneck = method_cfg.get('vision_adapter_bottleneck', 256)
+    text_adapter_bottleneck = method_cfg.get('text_adapter_bottleneck', 256)
+    generator_adapter_bottleneck = method_cfg.get('generator_adapter_bottleneck', 512)
 
     # 模型路径
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
@@ -184,6 +188,10 @@ def load_model(config, device: torch.device, local_rank: int):
         disc_d_hidden=disc_d_hidden,
         adapter_bottleneck=adapter_bottleneck,
         adapter_type=adapter_type,
+        use_separated_adapters=use_separated_adapters,
+        vision_adapter_bottleneck=vision_adapter_bottleneck,
+        text_adapter_bottleneck=text_adapter_bottleneck,
+        generator_adapter_bottleneck=generator_adapter_bottleneck,
         temperature=temperature,
         dropout=dropout,
         disc_use_spectral_norm=disc_spectral_norm,
@@ -518,6 +526,9 @@ def train_step(
     # === Forward ===
     model.train()
 
+    # 是否阻止 adv_loss 梯度流向 pruner
+    detach_adv_from_pruner = method_cfg.get('detach_adv_from_pruner', False)
+
     output = model(
         input_ids=inputs['input_ids'],
         pixel_values=inputs['pixel_values'],
@@ -529,6 +540,7 @@ def train_step(
         answer_starts=prep['answer_starts'],
         answer_ends=prep['answer_ends'],
         return_pruning_info=True,
+        detach_h_fake_for_adv=detach_adv_from_pruner,
     )
 
     # === 计算 Losses ===

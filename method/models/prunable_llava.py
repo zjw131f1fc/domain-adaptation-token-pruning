@@ -21,7 +21,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaDecoderLay
 from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer
-from .adapter import AdapterManager
+from .adapter import AdapterManager, SeparatedAdapterManager
 
 
 def build_vision_pruning_attention_mask(
@@ -106,6 +106,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         disc_d_hidden: int = 256,
         adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
         adapter_type: str = 'lightweight',    # adapter 类型: 'simple' 或 'lightweight'
+        use_separated_adapters: bool = False,  # 是否使用分离式 Adapter
+        vision_adapter_bottleneck: int = 256,  # vision adapter 瓶颈维度
+        text_adapter_bottleneck: int = 256,    # text adapter 瓶颈维度
+        generator_adapter_bottleneck: int = 512,  # generator adapter 瓶颈维度
         temperature: float = 1.0,
         dropout: float = 0.1,
         disc_use_spectral_norm: bool = False,
@@ -146,13 +150,27 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         )
 
         # 创建 Adapters
-        self.adapter_manager = AdapterManager(
-            layer_indices=pruning_layers,
-            hidden_size=self.hidden_size,
-            bottleneck_dim=adapter_bottleneck,
-            adapter_type=adapter_type,
-            n_vision=576,  # LLaVA 1.5 的 vision token 数量
-        )
+        self.use_separated_adapters = use_separated_adapters
+        if use_separated_adapters:
+            self.separated_adapter_manager = SeparatedAdapterManager(
+                layer_indices=pruning_layers,
+                hidden_size=self.hidden_size,
+                vision_bottleneck_dim=vision_adapter_bottleneck,
+                text_bottleneck_dim=text_adapter_bottleneck,
+                answer_bottleneck_dim=generator_adapter_bottleneck,
+                n_vision=576,
+                dropout=dropout,
+            )
+            self.adapter_manager = None
+        else:
+            self.adapter_manager = AdapterManager(
+                layer_indices=pruning_layers,
+                hidden_size=self.hidden_size,
+                bottleneck_dim=adapter_bottleneck,
+                adapter_type=adapter_type,
+                n_vision=576,  # LLaVA 1.5 的 vision token 数量
+            )
+            self.separated_adapter_manager = None
 
         # 替换剪枝层
         self._replace_pruning_layers()
@@ -165,22 +183,33 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             original_layer = llm.layers[layer_idx]
             pruner = self.pruner_manager.get_pruner(layer_idx)
             discriminator = self.disc_manager.get_discriminator(layer_idx)
-            adapter = self.adapter_manager.get_adapter(layer_idx)
 
-            # 将 pruner, discriminator, adapter 移动到与原始层相同的设备和 dtype
+            # 将 pruner, discriminator 移动到与原始层相同的设备和 dtype
             layer_param = next(original_layer.parameters())
             layer_device = layer_param.device
             layer_dtype = layer_param.dtype
             pruner.to(device=layer_device, dtype=layer_dtype)
             discriminator.to(device=layer_device, dtype=layer_dtype)
-            adapter.to(device=layer_device, dtype=layer_dtype)
+
+            # 根据配置选择 adapter 类型
+            if self.use_separated_adapters:
+                separated_adapters = self.separated_adapter_manager.get_adapters(layer_idx)
+                # 移动三个 adapter 到正确的设备
+                for adapter in separated_adapters:
+                    adapter.to(device=layer_device, dtype=layer_dtype)
+                adapter = None
+            else:
+                adapter = self.adapter_manager.get_adapter(layer_idx)
+                adapter.to(device=layer_device, dtype=layer_dtype)
+                separated_adapters = None
 
             llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
                 original_layer=original_layer,
                 layer_idx=layer_idx,
                 pruner=pruner,
                 discriminator=discriminator,
-                adapter=adapter
+                adapter=adapter,
+                separated_adapters=separated_adapters
             )
 
     def _restore_original_layers(self):
@@ -245,6 +274,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         answer_starts: Optional[list] = None,
         answer_ends: Optional[list] = None,
         return_pruning_info: bool = True,
+        detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
         **kwargs
     ) -> PrunableLlavaOutput:
         """前向传播（训练时物理删除 vision tokens，与推理完全对齐）
@@ -350,6 +380,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     answer_ends=answer_ends,
                     return_pruning_info=True,
                     cumulative_vision_mask=cumulative_vision_mask,
+                    detach_h_fake_for_adv=detach_h_fake_for_adv,
                 )
                 if pruning_info is not None:
                     pruning_infos[layer_idx] = pruning_info
@@ -435,7 +466,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
     def get_adapter_parameters(self):
         """获取所有 adapter 的参数"""
-        return self.adapter_manager.parameters()
+        if self.use_separated_adapters:
+            return self.separated_adapter_manager.parameters()
+        else:
+            return self.adapter_manager.parameters()
 
     def freeze_base_model(self):
         """冻结基础模型参数（但保持 pruner, discriminator, adapter 可训练）"""
@@ -448,7 +482,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             param.requires_grad = True
         for param in self.disc_manager.parameters():
             param.requires_grad = True
-        for param in self.adapter_manager.parameters():
+        for param in self.get_adapter_parameters():
             param.requires_grad = True
 
     def unfreeze_base_model(self):

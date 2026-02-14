@@ -132,3 +132,55 @@ class AdapterManager(nn.Module):
 
     def get_adapter(self, layer_idx: int):
         return self.adapters[str(layer_idx)]
+
+
+class SeparatedAdapterManager(nn.Module):
+    """分离式 Adapter 管理器 - 为 vision/text/answer tokens 使用独立的 Adapter"""
+
+    def __init__(
+        self,
+        layer_indices: list,
+        hidden_size: int,
+        vision_bottleneck_dim: int = 256,
+        text_bottleneck_dim: int = 256,
+        answer_bottleneck_dim: int = 512,
+        n_vision: int = 576,
+        dropout: float = 0.15,
+        **kwargs
+    ):
+        super().__init__()
+        self.layer_indices = layer_indices
+
+        # 每层有三个独立的 Adapter
+        self.vision_adapters = nn.ModuleDict()
+        self.text_adapters = nn.ModuleDict()
+        self.answer_adapters = nn.ModuleDict()
+
+        for idx in layer_indices:
+            self.vision_adapters[str(idx)] = LightweightAdapter(
+                hidden_size=hidden_size,
+                bottleneck_dim=vision_bottleneck_dim,
+                n_vision=n_vision,
+                dropout=dropout
+            )
+            self.text_adapters[str(idx)] = LightweightAdapter(
+                hidden_size=hidden_size,
+                bottleneck_dim=text_bottleneck_dim,
+                n_vision=n_vision,
+                dropout=dropout
+            )
+            self.answer_adapters[str(idx)] = LightweightAdapter(
+                hidden_size=hidden_size,
+                bottleneck_dim=answer_bottleneck_dim,
+                n_vision=n_vision,
+                dropout=dropout
+            )
+
+    def get_adapters(self, layer_idx: int):
+        """返回指定层的三个 Adapter"""
+        idx_str = str(layer_idx)
+        return (
+            self.vision_adapters[idx_str],
+            self.text_adapters[idx_str],
+            self.answer_adapters[idx_str]
+        )

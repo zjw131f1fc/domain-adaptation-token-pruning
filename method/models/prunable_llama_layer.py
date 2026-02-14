@@ -34,6 +34,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         pruner: LayerPruner 实例（None 表示非剪枝层）
         discriminator: LayerDiscriminator 实例（None 表示非剪枝层）
         adapter: PruningAdapter 实例（None 表示非剪枝层）
+        separated_adapters: (vision_adapter, text_adapter, answer_adapter) 元组
     """
 
     def __init__(
@@ -42,7 +43,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
         layer_idx: int,
         pruner: Optional[nn.Module] = None,
         discriminator: Optional[nn.Module] = None,
-        adapter: Optional[nn.Module] = None
+        adapter: Optional[nn.Module] = None,
+        separated_adapters: Optional[Tuple[nn.Module, nn.Module, nn.Module]] = None
     ):
         super().__init__()
         self.original_layer = original_layer
@@ -50,6 +52,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         self.pruner = pruner
         self.discriminator = discriminator
         self.adapter = adapter
+        self.separated_adapters = separated_adapters  # (vision, text, answer)
         self.is_pruning_layer = pruner is not None
 
         # 从原始层获取配置
@@ -73,6 +76,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_ends: Optional[list] = None,      # 每个样本的 answer 结束位置
         return_pruning_info: bool = False,
         cumulative_vision_mask: Optional[torch.Tensor] = None,  # 累积 vision mask
+        detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
         **kwargs
     ):
         """前向传播
@@ -139,6 +143,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             answer_ends=answer_ends,
             return_pruning_info=return_pruning_info,
             cumulative_vision_mask=cumulative_vision_mask,
+            detach_h_fake_for_adv=detach_h_fake_for_adv,
             **kwargs
         )
 
@@ -159,6 +164,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_ends: list,
         return_pruning_info: bool,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
+        detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
         **kwargs
     ):
         """剪枝层的前向传播（完全对齐推理）
@@ -277,7 +283,10 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         # h_fake: 当前层 mask 剪枝后的 attention 聚合
         # 使用 post-softmax mask + renormalize（与推理一致，更接近物理删除效果）
-        mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+        # 如果 detach_h_fake_for_adv=True，则 detach hard_mask，阻止 adv_loss 梯度流向 pruner
+        # 但保持 adapter 的梯度流（因为 adapter 在 mask 之后处理）
+        hard_mask_for_fake = hard_mask.detach() if detach_h_fake_for_adv else hard_mask
+        mask_expanded = hard_mask_for_fake.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
         # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
         ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start,
@@ -295,16 +304,49 @@ class PrunableLlamaDecoderLayer(nn.Module):
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
         # === Step 4.5: Adapter 修正 ===
-        if self.adapter is not None:
+        if self.separated_adapters is not None:
+            # 分离式 Adapter：对 vision/text/generator 分别处理
+            vision_adapter, text_adapter, generator_adapter = self.separated_adapters
+            attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+            adapted_output = attn_output_fake_flat.clone()
+
+            # Vision tokens: [vision_start, vision_end)
+            vision_slice = attn_output_fake_flat[:, vision_start:vision_end, :]
+            vision_query = query_states_flat[:, vision_start:vision_end, :]
+            adapted_vision = vision_adapter(vision_slice, mask=hard_mask_full, query=vision_query)
+            adapted_output[:, vision_start:vision_end, :] = adapted_vision
+
+            # Text tokens (question): 每个样本可能不同
+            for i in range(batch_size):
+                q_start, q_end = question_starts[i], question_ends[i]
+                text_slice = attn_output_fake_flat[i:i+1, q_start:q_end, :]
+                text_query = query_states_flat[i:i+1, q_start:q_end, :]
+                adapted_text = text_adapter(text_slice, mask=hard_mask_full[i:i+1], query=text_query)
+                adapted_output[i, q_start:q_end, :] = adapted_text.squeeze(0)
+
+            # Generator tokens: 生成 answer 的 token [ans_start-1, ans_end-1)
+            for i in range(batch_size):
+                gen_start = answer_starts[i] - 1
+                gen_end = answer_ends[i] - 1
+                gen_slice = attn_output_fake_flat[i:i+1, gen_start:gen_end, :]
+                gen_query = query_states_flat[i:i+1, gen_start:gen_end, :]
+                adapted_gen = generator_adapter(gen_slice, mask=hard_mask_full[i:i+1], query=gen_query)
+                adapted_output[i, gen_start:gen_end, :] = adapted_gen.squeeze(0)
+
+            attn_output_fake = adapted_output.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+        elif self.adapter is not None:
+            # 统一 Adapter（向后兼容）
             attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
             attn_output_fake_adapted = self.adapter(
                 attn_output_fake_flat,
-                mask=hard_mask_full,  # 使用原始维度的 mask
+                mask=hard_mask_full,
                 query=query_states_flat
             )
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
         # === Step 5: 提取 h_real 和 h_fake（answer 位置）===
+        # 注意：如果 detach_h_fake_for_adv=True，hard_mask 已经被 detach，
+        # 所以 adv_loss 梯度不会流向 pruner，但可以流向 adapter
         h_real_list = []
         h_fake_list = []
         for i in range(batch_size):

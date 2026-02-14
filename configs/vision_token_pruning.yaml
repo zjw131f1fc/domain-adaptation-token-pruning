@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: outputs/tasks/20260213-0119_vqa-vqav2_llava157b_9ffc/checkpoints/checkpoint_step20000.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
@@ -39,16 +39,16 @@ trainer_settings:
         # 进入阶段3时，将当前学习率乘以此系数
         phase3_lr_scale: 0.2
     print_loss_every_batches: 40  # 隔多久打印一次损失
-    eval_every_batches: 100  # 隔多久评估一次
+    eval_every_batches: 2000  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
-    save_every_batches: 5000 # 隔多久保存一个checkpoint
+    save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 30000
-    test: 200
+    train: 15000
+    test: 2000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -81,7 +81,7 @@ method_settings:
 
   # 跳过阶段1，直接从阶段2开始（用于恢复训练或快速实验）
   # 启用后：温度直接使用低温，稀疏度直接使用目标值（不退火）
-  skip_phase1: true
+  skip_phase1: false
 
   # 混合模式三阶段配置（仅 gumbel_mode="hybrid" 时生效）
   hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
@@ -109,7 +109,18 @@ method_settings:
   # - simple: 简单 MLP adapter
   # - lightweight: Mask-Aware FiLM adapter（轻量级，根据剪枝 pattern 动态调整）
   adapter_type: lightweight
-  adapter_bottleneck: 512         # adapter 瓶颈维度
+  adapter_bottleneck: 512         # adapter 瓶颈维度（统一 adapter 模式）
+
+  # 分离式 Adapter：为 vision/text/generator tokens 使用独立的 Adapter
+  use_separated_adapters: true   # 是否启用分离式 Adapter
+  vision_adapter_bottleneck: 512  # vision tokens adapter 瓶颈维度
+  text_adapter_bottleneck: 512    # text tokens adapter 瓶颈维度
+  generator_adapter_bottleneck: 512  # generator tokens adapter 瓶颈维度（生成 answer 的 token）
+
+  # Adversarial Loss 梯度控制
+  # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
+  # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
+  detach_adv_from_pruner: true
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
@@ -149,4 +160,4 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard"]
+  eval_mode: ["hard"]
