@@ -38,6 +38,7 @@ from .impl.mmb import MMBenchPreparer
 from .impl.scienceqa import ScienceQAPreparer
 from .impl.gqa import GQAPreparer
 from .impl.seed_bench import SEEDBenchPreparer
+from .impl.vizwiz import VizWizPreparer
 
 DATASET_REGISTRY: Dict[str, Type[Any]] = {
     "vqa-mme": MMEPreparer,
@@ -47,6 +48,7 @@ DATASET_REGISTRY: Dict[str, Type[Any]] = {
     "vqa-sqa": ScienceQAPreparer,
     "vqa-gqa": GQAPreparer,
     "vqa-seed": SEEDBenchPreparer,
+    "vqa-vizwiz": VizWizPreparer,
 }
 
 
