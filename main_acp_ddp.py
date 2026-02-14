@@ -671,6 +671,11 @@ def train_step(
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
 
+        # 计算平均保留率（最后一个剪枝层的累积保留率）
+        last_layer_idx = pruning_layers[-1]
+        last_hard_mask = output.pruning_infos[last_layer_idx]['hard_mask']
+        stats['avg_kept_ratio'] = last_hard_mask.float().mean().item()
+
     # === Entropy 正则损失：鼓励 logits 生成极端值 ===
     # 最小化 entropy 会让 sigmoid(logits) 接近 0 或 1，使训练和推理行为一致
     entropy_weight = method_cfg.get('entropy_weight', 0.0)

@@ -914,13 +914,39 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         scattered_mask[i, pos] = hard_mask[i, j]
 
             # Step 5: 应用 Adapter（使用 scatter 后的 mask，与训练一致）
-            adapter = self.adapter_manager.get_adapter(layer_idx)
-            if adapter is not None:
-                attn_output = adapter(
-                    attn_output,
-                    mask=scattered_mask,
-                    query=query_states_flat
-                )
+            if self.use_separated_adapters:
+                # 分离式 Adapter：对 vision/text/generator 分别处理
+                vision_adapter, text_adapter, generator_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
+                adapted_output = attn_output.clone()
+
+                # Vision tokens: [current_vision_start, current_vision_end)
+                vision_slice = attn_output[:, current_vision_start:current_vision_end, :]
+                vision_query = query_states_flat[:, current_vision_start:current_vision_end, :]
+                adapted_vision = vision_adapter(vision_slice, mask=scattered_mask, query=vision_query)
+                adapted_output[:, current_vision_start:current_vision_end, :] = adapted_vision
+
+                # Text tokens (除最后一个): [current_vision_end, current_seq_len-1)
+                if current_vision_end < current_seq_len - 1:
+                    text_slice = attn_output[:, current_vision_end:current_seq_len-1, :]
+                    text_query = query_states_flat[:, current_vision_end:current_seq_len-1, :]
+                    adapted_text = text_adapter(text_slice, mask=scattered_mask, query=text_query)
+                    adapted_output[:, current_vision_end:current_seq_len-1, :] = adapted_text
+
+                # Generator token (最后一个，用于生成第一个 answer token)
+                gen_slice = attn_output[:, current_seq_len-1:current_seq_len, :]
+                gen_query = query_states_flat[:, current_seq_len-1:current_seq_len, :]
+                adapted_gen = generator_adapter(gen_slice, mask=scattered_mask, query=gen_query)
+                adapted_output[:, current_seq_len-1:current_seq_len, :] = adapted_gen
+
+                attn_output = adapted_output
+            else:
+                adapter = self.adapter_manager.get_adapter(layer_idx)
+                if adapter is not None:
+                    attn_output = adapter(
+                        attn_output,
+                        mask=scattered_mask,
+                        query=query_states_flat
+                    )
 
             # Step 6: 更新累积 vision mask（用于后续层的物理删除）
             # 直接使用 scattered_mask 作为新的累积 mask
@@ -1133,15 +1159,24 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
                 # 在剪枝层应用 Adapter（使用 Prefill 阶段保存的 padded_mask）
                 if layer_idx in self.pruning_layers:
-                    adapter = self.adapter_manager.get_adapter(layer_idx)
-                    if adapter is not None:
-                        # 从 masks 中获取 scattered_mask（与训练时一致的 scatter 格式）
-                        _, _, scattered_mask = masks[layer_idx]
-                        attn_output_gen = adapter(
+                    # 从 masks 中获取 scattered_mask（与训练时一致的 scatter 格式）
+                    _, _, scattered_mask = masks[layer_idx]
+                    if self.use_separated_adapters:
+                        # 分离式 Adapter：Generate 阶段使用 generator_adapter
+                        _, _, generator_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
+                        attn_output_gen = generator_adapter(
                             attn_output_gen,
                             mask=scattered_mask,
-                            query=query_states_flat_gen  # Decode 阶段的 query
+                            query=query_states_flat_gen
                         )
+                    else:
+                        adapter = self.adapter_manager.get_adapter(layer_idx)
+                        if adapter is not None:
+                            attn_output_gen = adapter(
+                                attn_output_gen,
+                                mask=scattered_mask,
+                                query=query_states_flat_gen  # Decode 阶段的 query
+                            )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)
 
