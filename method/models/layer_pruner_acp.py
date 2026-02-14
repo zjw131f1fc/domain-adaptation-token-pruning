@@ -95,6 +95,7 @@ class CrossAttentionPruner(nn.Module):
         self,
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
+        cumulative_vision_mask: Optional[torch.Tensor] = None,
         return_components: bool = False
     ) -> torch.Tensor:
         """计算 keep logits
@@ -105,6 +106,7 @@ class CrossAttentionPruner(nn.Module):
         参数:
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - LLM 的 question→vision attention 权重（作为 baseline）
+            cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
             return_components: 是否返回中间结果
 
         返回:
@@ -130,10 +132,18 @@ class CrossAttentionPruner(nn.Module):
 
         # 3. Cross-attention: queries attend to vision tokens
         # attn_weights: (batch, n_queries, n_vision)
+        # 构建 key_padding_mask 屏蔽已被剪掉的 tokens
+        if cumulative_vision_mask is not None:
+            # key_padding_mask: (batch, n_vision), True = 忽略该位置
+            key_padding_mask = (cumulative_vision_mask < 0.5)
+        else:
+            key_padding_mask = None
+
         _, attn_weights = self.cross_attn(
             query=queries,
             key=v,
             value=v,
+            key_padding_mask=key_padding_mask,
             need_weights=True,
             average_attn_weights=True  # 对 heads 取平均
         )
@@ -235,6 +245,7 @@ class CrossAttentionPruner(nn.Module):
         self,
         vision_hidden: torch.Tensor,
         q2v_attn: Optional[torch.Tensor] = None,
+        cumulative_vision_mask: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         return_debug: bool = False
     ) -> Tuple[torch.Tensor, Dict]:
@@ -243,6 +254,7 @@ class CrossAttentionPruner(nn.Module):
         参数:
             vision_hidden: (batch, n_vision, d_model) - vision token hidden states
             q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
+            cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
             temperature: 可选的温度覆盖
             return_debug: 是否返回 debug 信息
 
@@ -250,7 +262,11 @@ class CrossAttentionPruner(nn.Module):
             hard_mask: (batch, n_vision) - 0/1 mask
             info: dict - 中间结果
         """
-        keep_logits, components = self.forward(vision_hidden, q2v_attn, return_components=True)
+        keep_logits, components = self.forward(
+            vision_hidden, q2v_attn,
+            cumulative_vision_mask=cumulative_vision_mask,
+            return_components=True
+        )
 
         if return_debug:
             hard_mask, debug_info = self.gumbel_sigmoid_mask(keep_logits, temperature, return_debug=True)

@@ -276,10 +276,13 @@ def preprocess_batch(
     if mode == "train":
         answers = [sample['answer'] for sample in batch]
         prompts = []
+        # 获取 EOS token
+        eos_token = processor.tokenizer.eos_token or "</s>"
         for q, a in zip(questions, answers):
             # 答案首字母大写，与 compute_task_loss 中的处理保持一致
             # ASSISTANT: 后面加空格，compute_task_loss 中 tokenize 时也要加空格前缀
-            prompt = f"USER: <image>\n{q}\nASSISTANT: {a.capitalize()}"
+            # 添加 EOS token，确保模型学会何时停止生成
+            prompt = f"USER: <image>\n{q}\nASSISTANT: {a.capitalize()}{eos_token}"
             prompts.append(prompt)
     else:
         answers = None
@@ -390,6 +393,11 @@ def compute_task_loss(
         if len(answer_ids) == 0:
             continue
 
+        # 添加 EOS token，确保模型学会何时停止生成
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is not None:
+            answer_ids = answer_ids + [eos_token_id]
+
         pred_start = answer_starts[i] - 1
         pred_end = min(pred_start + len(answer_ids), logits.shape[1] - 1)
 
@@ -434,6 +442,7 @@ def train_step(
 
     # === Gumbel Mode 三阶段调度 ===
     gumbel_mode = method_cfg.get('gumbel_mode', 'never')
+    skip_phase1 = method_cfg.get('skip_phase1', False)
     progress = current_step / total_steps if total_steps > 0 else 0
 
     if gumbel_mode == 'hybrid':
@@ -444,22 +453,39 @@ def train_step(
         phase1_temp_end = method_cfg.get('hybrid_phase1_temp_end', 0.1)
         phase3_temp = method_cfg.get('hybrid_phase3_temp', 0.1)
 
-        if progress < phase1_end:
-            # 阶段1：探索期 - 温度退火 + Gumbel noise
-            phase_progress = progress / phase1_end
-            current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
-            use_gumbel_noise = True
-            current_phase = 1
-        elif progress < phase2_end:
-            # 阶段2：稳定期 - 低温 + Gumbel noise
-            current_temp = phase1_temp_end
-            use_gumbel_noise = True
-            current_phase = 2
+        if skip_phase1:
+            # 跳过阶段1，直接从阶段2开始
+            # 重新映射 progress：将 [0, 1] 映射到 [phase1_end, 1]
+            # 这样 progress=0 对应原来的 phase1_end，progress=1 对应原来的 1
+            effective_progress = phase1_end + progress * (1 - phase1_end)
+            if effective_progress < phase2_end:
+                # 阶段2：稳定期 - 低温 + Gumbel noise
+                current_temp = phase1_temp_end
+                use_gumbel_noise = True
+                current_phase = 2
+            else:
+                # 阶段3：确定性微调期 - 关闭 noise，训练=推理
+                current_temp = phase3_temp
+                use_gumbel_noise = False
+                current_phase = 3
         else:
-            # 阶段3：确定性微调期 - 关闭 noise，训练=推理
-            current_temp = phase3_temp
-            use_gumbel_noise = False
-            current_phase = 3
+            # 正常三阶段
+            if progress < phase1_end:
+                # 阶段1：探索期 - 温度退火 + Gumbel noise
+                phase_progress = progress / phase1_end
+                current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
+                use_gumbel_noise = True
+                current_phase = 1
+            elif progress < phase2_end:
+                # 阶段2：稳定期 - 低温 + Gumbel noise
+                current_temp = phase1_temp_end
+                use_gumbel_noise = True
+                current_phase = 2
+            else:
+                # 阶段3：确定性微调期 - 关闭 noise，训练=推理
+                current_temp = phase3_temp
+                use_gumbel_noise = False
+                current_phase = 3
 
         model.set_use_gumbel_noise(use_gumbel_noise)
     elif gumbel_mode == 'always':
@@ -514,11 +540,10 @@ def train_step(
     if gumbel_mode == 'hybrid':
         stats['hybrid_phase'] = current_phase
 
-    # 1. Task Loss（使用物理删除后调整的 answer_starts）
-    adjusted_answer_starts = output.adjusted_answer_starts if output.adjusted_answer_starts else prep['answer_starts']
+    # 1. Task Loss（不做物理删除，位置不变，直接使用原始 answer_starts）
     task_loss = compute_task_loss(
         output.logits,
-        adjusted_answer_starts,
+        prep['answer_starts'],
         prep['answers'],
         processor.tokenizer,
         device,
@@ -563,8 +588,12 @@ def train_step(
         final_target_ratio = target_token_num / n_vision
 
         # 剪枝目标退火：从 100% 保留逐渐退火到目标值
+        # 如果 skip_phase1=True，跳过退火，直接使用目标值
         sparsity_anneal_ratio = method_cfg.get('sparsity_anneal_ratio', 0.0)
-        if sparsity_anneal_ratio > 0 and progress < sparsity_anneal_ratio:
+        if skip_phase1:
+            # 跳过阶段1，直接使用目标稀疏度
+            target_ratio = final_target_ratio
+        elif sparsity_anneal_ratio > 0 and progress < sparsity_anneal_ratio:
             # 使用余弦退火：从 1.0 平滑过渡到 final_target_ratio
             anneal_progress = progress / sparsity_anneal_ratio
             # 余弦退火：(1 + cos(π * t)) / 2 从 1 到 0
@@ -823,8 +852,14 @@ def evaluate(
 
         if 'answers' in sample:
             references.append(sample['answers'])
+            gt = sample['answers']
         else:
             references.append(sample['answer'])
+            gt = sample['answer']
+
+        # 打印前 10 个样本的预测和 ground truth
+        if step_idx <= 10 and is_main_process():
+            print(f"[Eval {step_idx}] Pred: {pred!r} | GT: {gt!r}")
 
         # 聚合评估需要保留样本信息（只保留必要字段，不保留图像以避免显存累积）
         if requires_aggregate_eval:
@@ -1241,6 +1276,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                    f"batches_per_epoch={total_batches_per_epoch}")
         logger.info(f"Total steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
         logger.info(f"World size: {world_size}, Effective batch size: {batch_size * world_size}")
+        # 显示 skip_phase1 状态
+        skip_phase1 = method_cfg.get('skip_phase1', False)
+        if skip_phase1:
+            logger.info(f"[skip_phase1=True] Starting from Phase 2, skipping temperature and sparsity annealing")
 
     # 保存目录
     save_dir = Path(config.global_settings.get('save_dir', './outputs/checkpoints'))
@@ -1253,6 +1292,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
+
+    # 阶段切换学习率缩放（用于 hybrid 模式）
+    prev_phase = 0  # 跟踪上一步的阶段
+    phase3_lr_scaled = False  # 是否已经缩放过阶段3的学习率
+    phase3_lr_scale = lr_scheduler_cfg.get('phase3_lr_scale', 1.0)  # 阶段3学习率缩放系数
 
     for epoch in range(epochs):
         # 设置 epoch 以确保不同 epoch 的 shuffle 不同
@@ -1315,6 +1359,21 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 pruner_scheduler.step()
             if disc_scheduler is not None:
                 disc_scheduler.step()
+
+            # 阶段切换学习率缩放（hybrid 模式）
+            current_phase = stats.get('hybrid_phase', 0)
+            if current_phase == 3 and prev_phase != 3 and not phase3_lr_scaled and phase3_lr_scale < 1.0:
+                # 进入阶段3，缩放学习率
+                for param_group in pruner_optimizer.param_groups:
+                    param_group['lr'] *= phase3_lr_scale
+                for param_group in disc_optimizer.param_groups:
+                    param_group['lr'] *= phase3_lr_scale
+                phase3_lr_scaled = True
+                if is_main_process():
+                    new_pruner_lr = pruner_optimizer.param_groups[0]['lr']
+                    new_disc_lr = disc_optimizer.param_groups[0]['lr']
+                    logger.info(f"[Phase 3] LR scaled by {phase3_lr_scale}: pruner_lr={new_pruner_lr:.2e}, disc_lr={new_disc_lr:.2e}")
+            prev_phase = current_phase
 
             # 判别器重新初始化
             # 注意：需要在所有进程间同步决策，避免死锁

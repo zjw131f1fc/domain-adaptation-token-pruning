@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
+  checkpoint: outputs/tasks/20260213-0119_vqa-vqav2_llava157b_9ffc/checkpoints/checkpoint_step20000.pt  # 例如: "./outputs/checkpoints/checkpoint_final.pt"
 
 trainer_settings:
   dl_settings:
@@ -25,7 +25,7 @@ trainer_settings:
     optimizers:
       layer_pruners:
         type: "adam"
-        lr: 5.0e-05  # 提高学习率，让 pruner 更快学习
+        lr: 1.0e-04  # 提高学习率，让 pruner 更快学习
         weight_decay: 0.01  # 防止过拟合
       discriminator:
         type: "adam"
@@ -35,8 +35,11 @@ trainer_settings:
         type: "cosine"  # 'none', 'cosine', 'linear'
         warmup_ratio: 0.1  # warmup 步数占总步数的比例
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
+        # 阶段3学习率缩放（仅 gumbel_mode="hybrid" 时生效）
+        # 进入阶段3时，将当前学习率乘以此系数
+        phase3_lr_scale: 0.2
     print_loss_every_batches: 40  # 隔多久打印一次损失
-    eval_every_batches: 5000  # 隔多久评估一次
+    eval_every_batches: 100  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 5000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null # 不要开
@@ -44,8 +47,8 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: "all"
-    test: 3000
+    train: 30000
+    test: 200
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -76,8 +79,12 @@ method_settings:
   #     阶段3 确定性微调期 (phase2_end - 100%): 关闭 noise，训练=推理，消除 gap
   gumbel_mode: "hybrid"
 
+  # 跳过阶段1，直接从阶段2开始（用于恢复训练或快速实验）
+  # 启用后：温度直接使用低温，稀疏度直接使用目标值（不退火）
+  skip_phase1: true
+
   # 混合模式三阶段配置（仅 gumbel_mode="hybrid" 时生效）
-  hybrid_phase1_end: 0.5    # 探索期结束点（占总步数比例）
+  hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
   hybrid_phase2_end: 0.8    # 稳定期结束点（占总步数比例）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
   hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期温度）
@@ -108,11 +115,11 @@ method_settings:
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 64  # 目标保留的 vision token 数量
+  target_token_num: 128  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
-  sparsity_anneal_ratio: 0.3
+  sparsity_anneal_ratio: 0.5
 
   # ==================== Temperature 配置 ====================
   # 注意：如果使用 gumbel_mode="hybrid"，温度由 hybrid_phase* 参数控制
@@ -126,9 +133,9 @@ method_settings:
   # adv_loss: 让 fake 被判为 real
   # sparsity_loss: 约束保留率到目标值
 
-  task_loss_weight: 1.5
-  adv_loss_weight: 0.4
-  sparsity_weight: 0.5   # 提高到 5.0，让 sparsity loss 有足够影响力
+  task_loss_weight: 2.0
+  adv_loss_weight: 0.5
+  sparsity_weight: 1.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
 
   # 动态权重调度 (可选)
@@ -142,4 +149,4 @@ method_settings:
   sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard"]
+  eval_mode: ["origin", "hard"]

@@ -222,13 +222,19 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # === Step 2: 计算 Attention Weights ===
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
 
-        # 创建 causal mask
+        # 使用传入的 attention_mask（包含 causal + vision pruning）
         kv_len = key_states.shape[-2]
-        causal_mask = torch.triu(
-            torch.full((seq_len, kv_len), float('-inf'), device=device, dtype=dtype),
-            diagonal=1
-        )
-        attn_scores = attn_scores + causal_mask
+        if attention_mask is not None:
+            # attention_mask: (batch, 1, seq_len, kv_len), 0=参与, -inf=不参与
+            attn_scores = attn_scores + attention_mask
+        else:
+            # Fallback: 仅 causal mask
+            min_val = torch.finfo(dtype).min
+            causal_mask = torch.triu(
+                torch.full((seq_len, kv_len), min_val, device=device, dtype=dtype),
+                diagonal=1
+            )
+            attn_scores = attn_scores + causal_mask
 
         # Softmax
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(dtype)
@@ -247,28 +253,23 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 提取 vision tokens 的 hidden states
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]
 
-        # Pruner 生成 mask（输入维度 = 当前 n_vision，与推理完全一致）
-        hard_mask, pruner_info = self.pruner.forward_full(vision_hidden, q2v_attn_avg, return_debug=True)
-        # hard_mask: (batch, n_vision) - 当前 vision tokens 的 mask
+        # Pruner 生成 mask，传递 cumulative_vision_mask 用于屏蔽已被剪掉的 tokens
+        hard_mask, pruner_info = self.pruner.forward_full(
+            vision_hidden, q2v_attn_avg,
+            cumulative_vision_mask=cumulative_vision_mask,
+            return_debug=True
+        )
+        # hard_mask: (batch, n_vision) - 当前层的 mask 决策
 
-        # === 将当前层的 mask scatter 回原始 n_vision_orig 维度（如果需要）===
-        # cumulative_vision_mask 告诉我们当前 n_vision tokens 对应原始的哪些位置
+        # === 计算累积 mask（不做物理删除，维度保持不变）===
         if cumulative_vision_mask is not None:
-            # cumulative_vision_mask: (batch, n_vision_orig), 1=kept, 0=pruned
-            n_vision_orig = cumulative_vision_mask.shape[1]
-            # 强制二值化，避免 bfloat16 精度问题（某些值可能是极小正数，导致 nonzero 和 sum 不一致）
-            # 这不影响梯度，因为 cumulative_vision_mask 只用于位置追踪，梯度通过 hard_mask 流动
-            cumulative_vision_mask_clean = (cumulative_vision_mask > 0.5).to(dtype)
-            kept_indices = cumulative_vision_mask_clean[0].nonzero(as_tuple=True)[0]
-
-            # 创建新的累积 mask：在原始维度上，只有当前层保留且之前也保留的才是 1
-            # 使用 scatter 操作保持梯度流（in-place 赋值会断开梯度）
-            hard_mask_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
-            indices = kept_indices.unsqueeze(0).expand(batch_size, -1)
-            hard_mask_full = hard_mask_full.scatter(1, indices, hard_mask)
+            # hard_mask: (batch, n_vision) - 当前层的决策
+            # cumulative_vision_mask: (batch, n_vision) - 之前的累积 mask
+            # 新的累积 mask = 当前决策 AND 之前累积（乘法实现）
+            hard_mask_full = hard_mask * cumulative_vision_mask
         else:
             hard_mask_full = hard_mask
-            n_vision_orig = n_vision
+        n_vision_orig = n_vision  # 维度不变
 
         # === Step 4: 计算 h_real 和 h_fake ===
         # h_real: 完整 attention 聚合
@@ -332,19 +333,15 @@ class PrunableLlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         if return_pruning_info:
-            # 返回原始维度的 q2v_attn
-            if cumulative_vision_mask is not None:
-                q2v_attn_full = torch.zeros(batch_size, n_vision_orig, device=device, dtype=dtype)
-                q2v_attn_full[:, kept_indices] = q2v_attn_avg
-            else:
-                q2v_attn_full = q2v_attn_avg
+            # q2v_attn 维度已经是 (batch, n_vision)，不需要转换
+            q2v_attn_full = q2v_attn_avg
 
             pruning_info = {
                 'h_real': h_real,
                 'h_fake': h_fake,
-                'hard_mask': hard_mask_full,  # (batch, n_vision_orig) - 相对于原始位置
+                'hard_mask': hard_mask_full,  # (batch, n_vision) - 累积 mask
                 'hard_mask_current': hard_mask,  # (batch, n_vision) - 当前层的 mask
-                'q2v_attn': q2v_attn_full,  # (batch, n_vision_orig)
+                'q2v_attn': q2v_attn_full,  # (batch, n_vision)
                 'keep_logits': pruner_info.get('keep_logits'),
                 'attn_score': pruner_info.get('attn_score'),
                 'token_score': pruner_info.get('token_score'),
@@ -352,7 +349,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 'delta': pruner_info.get('delta'),
                 'gumbel_debug': pruner_info.get('gumbel_debug'),  # Gumbel noise debug info
                 'layer_idx': self.layer_idx,
-                'n_vision': n_vision,  # 当前层的 vision token 数量
+                'n_vision': n_vision,  # vision token 数量（不变）
             }
             return hidden_states, pruning_info
 
