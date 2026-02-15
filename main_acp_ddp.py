@@ -631,21 +631,34 @@ def train_step(
         # 收集各层的累积保留率
         cumulative_ratios = []
         for layer_idx in pruning_layers:
-            hard_mask = output.pruning_infos[layer_idx]['hard_mask']
-            cumulative_ratio = hard_mask.float().mean()
+            cumulative_mask = output.pruning_infos[layer_idx]['cumulative_mask']
+            # DEBUG: 检查 cumulative_mask 的值
+            if debug_sparsity:
+                print(f"[DEBUG sparsity L{layer_idx}] cumulative_mask: min={cumulative_mask.min().item():.4f}, max={cumulative_mask.max().item():.4f}, mean={cumulative_mask.mean().item():.4f}")
+                if torch.isnan(cumulative_mask).any() or torch.isinf(cumulative_mask).any():
+                    print(f"  WARNING: cumulative_mask has NaN/Inf!")
+            cumulative_ratio = cumulative_mask.float().mean()
             cumulative_ratios.append(cumulative_ratio)
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
 
-        # 计算独立保留率 p_i = cumulative_r_i / cumulative_r_{i-1}
+        # 计算独立保留率 p_i = 当前层的 current_mask 的平均值
+        # 不再使用除法 cumulative_r_i / cumulative_r_{i-1}，避免梯度计算问题
         independent_ratios = []
-        for i, cum_ratio in enumerate(cumulative_ratios):
-            if i == 0:
-                p_i = cum_ratio
+        for i, layer_idx in enumerate(pruning_layers):
+            current_mask = output.pruning_infos[layer_idx].get('current_mask')
+            if current_mask is None:
+                # 向后兼容：如果没有 current_mask，使用除法计算
+                if i == 0:
+                    p_i = cumulative_ratios[i]
+                else:
+                    prev_cum = cumulative_ratios[i - 1].clamp(min=1e-6)
+                    p_i = cumulative_ratios[i] / prev_cum
             else:
-                prev_cum = cumulative_ratios[i - 1].clamp(min=1e-6)
-                p_i = cum_ratio / prev_cum
+                p_i = current_mask.float().mean()
             p_i = p_i.clamp(min=1e-6, max=1.0)
             independent_ratios.append(p_i)
+            if debug_sparsity:
+                print(f"[DEBUG sparsity] p_{i} (L{layer_idx}) = {p_i.item():.4f}")
 
         # 计算各段的层数 [n0, n1, n2, n3]
         n_segments = []
@@ -697,6 +710,7 @@ def train_step(
 
             stats['harmonic_mean'] = hm.item()
 
+        # DEBUG: 启用 sparsity_loss 来排查 NaN 梯度来源
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
         # 显示平均每层保留率（与 sparsity loss 约束的目标一致）
@@ -731,11 +745,11 @@ def train_step(
                 continue
 
             # 使用当前层的 mask（不是累积 mask）
-            hard_mask_current = output.pruning_infos[layer_idx].get('hard_mask_current')
-            if hard_mask_current is None:
-                hard_mask_current = output.pruning_infos[layer_idx].get('hard_mask')
-            if hard_mask_current is not None:
-                layer_kept_ratio = hard_mask_current.float().mean()
+            current_mask = output.pruning_infos[layer_idx].get('current_mask')
+            if current_mask is None:
+                current_mask = output.pruning_infos[layer_idx].get('cumulative_mask')
+            if current_mask is not None:
+                layer_kept_ratio = current_mask.float().mean()
                 tightening_loss_total = tightening_loss_total + layer_weight * layer_kept_ratio
                 stats[f'L{layer_idx}_tightening'] = layer_kept_ratio.item()
 
@@ -918,8 +932,8 @@ def evaluate(
                     )
                 for layer_idx in pruning_layers:
                     if layer_idx in output_train.pruning_infos:
-                        hard_mask = output_train.pruning_infos[layer_idx]['hard_mask']
-                        debug_train_ratios[layer_idx] = hard_mask.float().mean().item()
+                        cumulative_mask = output_train.pruning_infos[layer_idx]['cumulative_mask']
+                        debug_train_ratios[layer_idx] = cumulative_mask.float().mean().item()
 
             output_ids, stats = model.generate_with_hard_pruning(
                 input_ids=inputs['input_ids'],
@@ -1469,6 +1483,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
             pruner_has_grad = pruner_total.requires_grad
             if pruner_has_grad:
+                # DEBUG: 检查 loss 值
+                if torch.isnan(pruner_total) or torch.isinf(pruner_total):
+                    print(f"[DEBUG backward] pruner_total has NaN/Inf: {pruner_total.item()}")
+                    for k, v in losses.items():
+                        if k != 'disc_loss':
+                            print(f"  {k}: {v.item()}, requires_grad={v.requires_grad}")
                 pruner_total.backward(retain_graph=True)
 
             disc_optimizer.zero_grad()
@@ -1564,10 +1584,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             # 统计每层保留的 token 数量（用于训练结束后推荐 topk_ks）
             if result['pruning_infos']:
                 for layer_idx, info in result['pruning_infos'].items():
-                    if 'hard_mask' in info:
-                        # hard_mask: (batch, n_vision), 计算每个样本保留的 token 数量
-                        hard_mask = info['hard_mask']
-                        n_kept_per_sample = hard_mask.sum(dim=-1)  # (batch,)
+                    if 'cumulative_mask' in info:
+                        # cumulative_mask: (batch, n_vision), 计算每个样本保留的 token 数量
+                        cumulative_mask = info['cumulative_mask']
+                        n_kept_per_sample = cumulative_mask.sum(dim=-1)  # (batch,)
                         layer_kept_counts[layer_idx].extend(n_kept_per_sample.tolist())
 
             # 累计统计

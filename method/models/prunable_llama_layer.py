@@ -142,7 +142,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             answer_starts=answer_starts,
             answer_ends=answer_ends,
             return_pruning_info=return_pruning_info,
-            cumulative_vision_mask=cumulative_vision_mask,
+            cumulative_mask=cumulative_vision_mask,  # 兼容旧参数名
             detach_h_fake_for_adv=detach_h_fake_for_adv,
             **kwargs
         )
@@ -163,22 +163,22 @@ class PrunableLlamaDecoderLayer(nn.Module):
         answer_starts: list,
         answer_ends: list,
         return_pruning_info: bool,
-        cumulative_vision_mask: Optional[torch.Tensor] = None,
+        cumulative_mask: Optional[torch.Tensor] = None,  # 之前层的累积 mask
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
         **kwargs
     ):
-        """剪枝层的前向传播（完全对齐推理）
+        """剪枝层的前向传播
 
-        注意：物理删除由外层 (prunable_llava.py) 管理。
-        这里收到的 hidden_states 已经是之前层删除后的序列。
-        vision_start/end 是当前序列中 vision tokens 的位置。
-        cumulative_vision_mask 用于追踪哪些原始 tokens 仍然保留（用于 scatter 回原始维度）。
+        Args:
+            cumulative_mask: 之前层的累积 mask (batch, n_vision)，1=保留，0=已剪掉
 
-        核心步骤：
-        1. 在当前（可能已删除部分 tokens 的）序列上计算 attention
-        2. 提取 q2v_attn 并通过 pruner 生成当前层的 mask
-        3. 计算 h_real 和 h_fake
-        4. 返回 mask 供外层做物理删除
+        Returns:
+            hidden_states: 输出 hidden states
+            pruning_info: {
+                'current_mask': 当前层的决策 (batch, n_vision)
+                'cumulative_mask': 新的累积 mask = cumulative_mask * current_mask
+                ...
+            }
         """
         layer = self.original_layer
         attn = layer.self_attn
@@ -259,36 +259,37 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # 提取 vision tokens 的 hidden states
         vision_hidden = hidden_states_normed[:, vision_start:vision_end, :]
 
-        # Pruner 生成 mask，传递 cumulative_vision_mask 用于屏蔽已被剪掉的 tokens
-        hard_mask, pruner_info = self.pruner.forward_full(
+        # Pruner 生成当前层的 mask
+        current_mask, pruner_info = self.pruner.forward_full(
             vision_hidden, q2v_attn_avg,
-            cumulative_vision_mask=cumulative_vision_mask,
+            cumulative_vision_mask=cumulative_mask,
             return_debug=True
         )
-        # hard_mask: (batch, n_vision) - 当前层的 mask 决策
+        # current_mask: (batch, n_vision) - 当前层的决策
 
-        # === 计算累积 mask（不做物理删除，维度保持不变）===
-        if cumulative_vision_mask is not None:
-            # hard_mask: (batch, n_vision) - 当前层的决策
-            # cumulative_vision_mask: (batch, n_vision) - 之前的累积 mask
-            # 新的累积 mask = 当前决策 AND 之前累积（乘法实现）
-            hard_mask_full = hard_mask * cumulative_vision_mask
+        # === 计算新的累积 mask ===
+        # new_cumulative_mask = cumulative_mask * current_mask
+        if cumulative_mask is not None:
+            new_cumulative_mask = cumulative_mask * current_mask
         else:
-            hard_mask_full = hard_mask
-        n_vision_orig = n_vision  # 维度不变
+            new_cumulative_mask = current_mask
 
         # === Step 4: 计算 h_real 和 h_fake ===
         # h_real: 完整 attention 聚合
         attn_output_real = torch.matmul(attn_weights, value_states)
 
         # h_fake: 当前层 mask 剪枝后的 attention 聚合
-        # 使用 post-softmax mask + renormalize（与推理一致，更接近物理删除效果）
-        # 如果 detach_h_fake_for_adv=True，则 detach hard_mask，阻止 adv_loss 梯度流向 pruner
-        # 但保持 adapter 的梯度流（因为 adapter 在 mask 之后处理）
-        hard_mask_for_fake = hard_mask.detach() if detach_h_fake_for_adv else hard_mask
-        mask_expanded = hard_mask_for_fake.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+        # 使用 post-softmax mask + renormalize（与推理一致）
+        # 如果 detach_h_fake_for_adv=True，则 detach mask，阻止 adv_loss 梯度流向 pruner
+        if detach_h_fake_for_adv:
+            current_mask_for_fake = current_mask.detach()
+            cumulative_mask_for_adapter = new_cumulative_mask.detach()
+        else:
+            current_mask_for_fake = current_mask
+            cumulative_mask_for_adapter = new_cumulative_mask
+        mask_expanded = current_mask_for_fake.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
 
-        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
+        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 current_mask）
         ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start,
                                  device=device, dtype=dtype)
         ones_after = torch.ones(batch_size, num_heads, seq_len, kv_len - vision_end,
@@ -313,7 +314,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             # Vision tokens: [vision_start, vision_end)
             vision_slice = attn_output_fake_flat[:, vision_start:vision_end, :]
             vision_query = query_states_flat[:, vision_start:vision_end, :]
-            adapted_vision = vision_adapter(vision_slice, mask=hard_mask_full, query=vision_query)
+            adapted_vision = vision_adapter(vision_slice, mask=cumulative_mask_for_adapter, query=vision_query)
             adapted_output[:, vision_start:vision_end, :] = adapted_vision
 
             # Text tokens (question): 每个样本可能不同
@@ -321,7 +322,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 q_start, q_end = question_starts[i], question_ends[i]
                 text_slice = attn_output_fake_flat[i:i+1, q_start:q_end, :]
                 text_query = query_states_flat[i:i+1, q_start:q_end, :]
-                adapted_text = text_adapter(text_slice, mask=hard_mask_full[i:i+1], query=text_query)
+                adapted_text = text_adapter(text_slice, mask=cumulative_mask_for_adapter[i:i+1], query=text_query)
                 adapted_output[i, q_start:q_end, :] = adapted_text.squeeze(0)
 
             # Generator tokens (answer): 使用 text_adapter
@@ -330,7 +331,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 gen_end = answer_ends[i] - 1
                 gen_slice = attn_output_fake_flat[i:i+1, gen_start:gen_end, :]
                 gen_query = query_states_flat[i:i+1, gen_start:gen_end, :]
-                adapted_gen = text_adapter(gen_slice, mask=hard_mask_full[i:i+1], query=gen_query)
+                adapted_gen = text_adapter(gen_slice, mask=cumulative_mask_for_adapter[i:i+1], query=gen_query)
                 adapted_output[i, gen_start:gen_end, :] = adapted_gen.squeeze(0)
 
             attn_output_fake = adapted_output.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
@@ -339,14 +340,12 @@ class PrunableLlamaDecoderLayer(nn.Module):
             attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
             attn_output_fake_adapted = self.adapter(
                 attn_output_fake_flat,
-                mask=hard_mask_full,
+                mask=cumulative_mask_for_adapter,
                 query=query_states_flat
             )
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
         # === Step 5: 提取 h_real 和 h_fake（answer 位置）===
-        # 注意：如果 detach_h_fake_for_adv=True，hard_mask 已经被 detach，
-        # 所以 adv_loss 梯度不会流向 pruner，但可以流向 adapter
         h_real_list = []
         h_fake_list = []
         for i in range(batch_size):
@@ -375,23 +374,20 @@ class PrunableLlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         if return_pruning_info:
-            # q2v_attn 维度已经是 (batch, n_vision)，不需要转换
-            q2v_attn_full = q2v_attn_avg
-
             pruning_info = {
                 'h_real': h_real,
                 'h_fake': h_fake,
-                'hard_mask': hard_mask_full,  # (batch, n_vision) - 累积 mask
-                'hard_mask_current': hard_mask,  # (batch, n_vision) - 当前层的 mask
-                'q2v_attn': q2v_attn_full,  # (batch, n_vision)
+                'cumulative_mask': new_cumulative_mask,  # 新的累积 mask
+                'current_mask': current_mask,            # 当前层的决策
+                'q2v_attn': q2v_attn_avg,
                 'keep_logits': pruner_info.get('keep_logits'),
                 'attn_score': pruner_info.get('attn_score'),
                 'token_score': pruner_info.get('token_score'),
                 'baseline': pruner_info.get('baseline'),
                 'delta': pruner_info.get('delta'),
-                'gumbel_debug': pruner_info.get('gumbel_debug'),  # Gumbel noise debug info
+                'gumbel_debug': pruner_info.get('gumbel_debug'),
                 'layer_idx': self.layer_idx,
-                'n_vision': n_vision,  # vision token 数量（不变）
+                'n_vision': n_vision,
             }
             return hidden_states, pruning_info
 

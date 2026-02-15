@@ -328,16 +328,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=llm.config)
 
-        # === 累积 mask：用于让后续层知道之前哪些 vision tokens 被剪掉了 ===
+        # === 累积 mask：追踪哪些 vision tokens 被剪掉 ===
         n_vision_orig = vision_end - vision_start if (vision_start is not None and vision_end is not None) else 0
         if n_vision_orig > 0:
-            cumulative_vision_mask = torch.ones(
+            cumulative_mask = torch.ones(
                 batch_size, n_vision_orig,
                 device=device,
                 dtype=dtype
             )
         else:
-            cumulative_vision_mask = None
+            cumulative_mask = None
 
         # === 当前状态（不做物理删除，位置保持不变）===
         hidden_states = inputs_embeds
@@ -351,9 +351,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             position_embeddings = llm.rotary_emb(hidden_states, position_ids)
 
             # 构建 attention_mask（包含 causal + vision pruning）
-            if cumulative_vision_mask is not None and n_vision_orig > 0:
+            if cumulative_mask is not None and n_vision_orig > 0:
                 attention_mask_4d = build_vision_pruning_attention_mask(
-                    cumulative_vision_mask, vision_start, vision_end,
+                    cumulative_mask, vision_start, vision_end,
                     orig_seq_len, dtype, device
                 )
             else:
@@ -381,16 +381,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     answer_starts=answer_starts,
                     answer_ends=answer_ends,
                     return_pruning_info=True,
-                    cumulative_vision_mask=cumulative_vision_mask,
+                    cumulative_vision_mask=cumulative_mask,
                     detach_h_fake_for_adv=detach_h_fake_for_adv,
                 )
                 if pruning_info is not None:
                     pruning_infos[layer_idx] = pruning_info
-                    # 更新累积 mask（不做物理删除）
-                    # 使用 detach() 断开梯度，cumulative_vision_mask 只用于位置追踪
-                    # 梯度应该只通过当前层的 hard_mask 流动
-                    if 'hard_mask' in pruning_info:
-                        cumulative_vision_mask = pruning_info['hard_mask'].detach()
+                    # 用新的累积 mask 更新
+                    if 'cumulative_mask' in pruning_info:
+                        cumulative_mask = pruning_info['cumulative_mask'].clone()
 
             else:
                 # 非剪枝层
@@ -554,8 +552,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         total_kept_ratio = 0
 
         for layer_idx, info in output.pruning_infos.items():
-            hard_mask = info['hard_mask']  # (batch, n_vision)
-            kept_ratio = hard_mask.mean()
+            cumulative_mask = info['cumulative_mask']  # (batch, n_vision)
+            kept_ratio = cumulative_mask.mean()
             total_kept_ratio += kept_ratio.item()
             sparsity_loss = sparsity_loss + torch.abs(kept_ratio - target_ratio)
 

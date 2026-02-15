@@ -83,7 +83,8 @@ class LightweightAdapter(nn.Module):
         condition = torch.zeros_like(h)  # (batch, seq, bottleneck)
 
         if mask is not None:
-            mask_emb = self.mask_encoder(mask.to(dtype=x.dtype))  # (batch, bottleneck)
+            mask_input = mask.to(dtype=x.dtype)
+            mask_emb = self.mask_encoder(mask_input)  # (batch, bottleneck)
             condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
         if query is not None:
@@ -94,6 +95,7 @@ class LightweightAdapter(nn.Module):
         gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)
         beta = self.beta_net(condition)
         h = gamma * h + beta
+
         h = self.dropout(h)  # Dropout after FiLM
 
         return x + self.up(h)
