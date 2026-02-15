@@ -392,7 +392,6 @@ def compute_task_loss(
     answers: List[str],
     tokenizer,
     device: torch.device,
-    debug: bool = False
 ) -> torch.Tensor:
     """计算 task loss (cross entropy)"""
     batch_size = logits.shape[0]
@@ -419,16 +418,6 @@ def compute_task_loss(
         pred_logits = logits[i, pred_start:pred_end]
         target_len = min(len(answer_ids), pred_end - pred_start)
         targets = torch.tensor(answer_ids[:target_len], device=device)
-
-        # Debug: 打印实际参与计算的 pred_logits 和 targets
-        if debug and i == 0:
-            pred_token_ids = pred_logits.argmax(dim=-1).tolist()
-            target_ids = targets.tolist()
-            print(f"[DEBUG task_loss] answer='{answer}'")
-            print(f"[DEBUG task_loss] pred_start={pred_start}, pred_end={pred_end}, logits.shape={logits.shape}")
-            print(f"[DEBUG task_loss] targets (answer_ids): {target_ids} -> '{tokenizer.decode(target_ids)}'")
-            print(f"[DEBUG task_loss] pred_token_ids (argmax): {pred_token_ids} -> '{tokenizer.decode(pred_token_ids)}'")
-            print(f"[DEBUG task_loss] match: {pred_token_ids == target_ids}")
 
         loss = F.cross_entropy(pred_logits, targets)
         total_loss = total_loss + loss
@@ -547,10 +536,6 @@ def train_step(
         detach_h_fake_for_adv=detach_adv_from_pruner,
     )
 
-    # DEBUG: 打印 forward 完成
-    if os.environ.get('DEBUG_PRUNING', '0') == '1':
-        print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] model.forward done")
-
     # === 计算 Losses ===
     losses = {}
     stats = {
@@ -567,14 +552,9 @@ def train_step(
         prep['answers'],
         processor.tokenizer,
         device,
-        debug=(current_step <= 3)  # 前几步打印调试信息
     )
     losses['task_loss'] = task_loss
     stats['raw_task_loss'] = task_loss.item()
-
-    # DEBUG: 打印 task_loss 完成
-    if os.environ.get('DEBUG_PRUNING', '0') == '1':
-        print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] compute_task_loss done")
 
     # 2. 如果有剪枝信息，计算 GAN 相关 losses
     if output.pruning_infos and len(output.pruning_infos) > 0:
@@ -592,25 +572,13 @@ def train_step(
         # 获取 disc_manager（可能被 DDP 包装）
         disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
 
-        # DEBUG
-        if os.environ.get('DEBUG_PRUNING', '0') == '1':
-            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing adv_loss...")
-
         adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
         losses['adv_loss'] = adv_loss * gan_weight
         stats['raw_adv_loss'] = adv_loss.item()
 
-        # DEBUG
-        if os.environ.get('DEBUG_PRUNING', '0') == '1':
-            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing disc_loss...")
-
         disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
         losses['disc_loss'] = disc_loss * gan_weight
         stats['raw_disc_loss'] = disc_loss.item()
-
-        # DEBUG
-        if os.environ.get('DEBUG_PRUNING', '0') == '1':
-            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing disc_accuracy...")
 
         acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
         stats['disc_accuracy'] = acc_info['overall']
@@ -645,18 +613,10 @@ def train_step(
         # 获取 sparsity loss 模式
         sparsity_loss_mode = method_cfg.get('sparsity_loss_mode', 'exact')  # 'exact' 或 'harmonic'
 
-        # Debug: 前几步打印 sparsity 计算详情
-        debug_sparsity = (current_step <= 3)
-
         # 收集各层的累积保留率
         cumulative_ratios = []
         for layer_idx in pruning_layers:
             cumulative_mask = output.pruning_infos[layer_idx]['cumulative_mask']
-            # DEBUG: 检查 cumulative_mask 的值
-            if debug_sparsity:
-                print(f"[DEBUG sparsity L{layer_idx}] cumulative_mask: min={cumulative_mask.min().item():.4f}, max={cumulative_mask.max().item():.4f}, mean={cumulative_mask.mean().item():.4f}")
-                if torch.isnan(cumulative_mask).any() or torch.isinf(cumulative_mask).any():
-                    print(f"  WARNING: cumulative_mask has NaN/Inf!")
             cumulative_ratio = cumulative_mask.float().mean()
             cumulative_ratios.append(cumulative_ratio)
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
@@ -677,8 +637,6 @@ def train_step(
                 p_i = current_mask.float().mean()
             p_i = p_i.clamp(min=1e-6, max=1.0)
             independent_ratios.append(p_i)
-            if debug_sparsity:
-                print(f"[DEBUG sparsity] p_{i} (L{layer_idx}) = {p_i.item():.4f}")
 
         # 计算各段的层数 [n0, n1, n2, n3]
         n_segments = []
@@ -702,11 +660,6 @@ def train_step(
             avg_kept = avg_kept / total_layers
             sparsity_loss = torch.abs(avg_kept - target_ratio)
 
-            if debug_sparsity:
-                print(f"[DEBUG sparsity] mode=exact, n_vision={n_vision}, target_ratio={target_ratio:.4f}")
-                print(f"[DEBUG sparsity] n_segments={n_segments}, independent_ratios={[r.item() for r in independent_ratios]}")
-                print(f"[DEBUG sparsity] avg_kept={avg_kept.item():.4f}, sparsity_loss={sparsity_loss.item():.4f}")
-
         else:  # harmonic
             # === 调和平均近似方案 ===
             # hm = n / Σ(1/p_i)
@@ -723,14 +676,8 @@ def train_step(
             avg_approx = avg_approx / total_layers
             sparsity_loss = torch.abs(avg_approx - target_ratio)
 
-            if debug_sparsity:
-                print(f"[DEBUG sparsity] mode=harmonic, n_vision={n_vision}, target_ratio={target_ratio:.4f}")
-                print(f"[DEBUG sparsity] n_segments={n_segments}, independent_ratios={[r.item() for r in independent_ratios]}")
-                print(f"[DEBUG sparsity] hm={hm.item():.4f}, avg_approx={avg_approx.item():.4f}, sparsity_loss={sparsity_loss.item():.4f}")
-
             stats['harmonic_mean'] = hm.item()
 
-        # DEBUG: 启用 sparsity_loss 来排查 NaN 梯度来源
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
         # 显示平均每层保留率（与 sparsity loss 约束的目标一致）
@@ -1495,56 +1442,20 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             losses = result['losses']
             stats = result['stats']
 
-            # DEBUG: 打印 backward 前状态
-            if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                      f"compute_losses_and_stats done, starting backward...")
-
             # === 先 backward 所有 loss，再同步梯度，再 step ===
             pruner_optimizer.zero_grad()
             pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
             pruner_has_grad = pruner_total.requires_grad
             if pruner_has_grad:
-                # DEBUG: 检查 loss 值
-                if torch.isnan(pruner_total) or torch.isinf(pruner_total):
-                    print(f"[DEBUG backward] pruner_total has NaN/Inf: {pruner_total.item()}")
-                    for k, v in losses.items():
-                        if k != 'disc_loss':
-                            print(f"  {k}: {v.item()}, requires_grad={v.requires_grad}")
-                if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                          f"pruner_total.backward starting...")
                 pruner_total.backward(retain_graph=True)
-                if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                          f"pruner_total.backward done")
 
             disc_optimizer.zero_grad()
             disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
             if disc_has_grad:
-                if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                          f"disc_loss.backward starting...")
                 losses['disc_loss'].backward()
-                if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                          f"disc_loss.backward done")
-
-            # DEBUG: 打印梯度状态
-            if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                n_pruner_grads = sum(1 for p in model.get_pruner_parameters() if p.grad is not None)
-                n_adapter_grads = sum(1 for p in model.get_adapter_parameters() if p.grad is not None)
-                n_disc_grads = sum(1 for p in model.get_discriminator_parameters() if p.grad is not None)
-                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
-                      f"Before sync_gradients: pruner_grads={n_pruner_grads}, "
-                      f"adapter_grads={n_adapter_grads}, disc_grads={n_disc_grads}")
 
             # === 同步梯度（关键步骤！）===
             sync_gradients(model)
-
-            # DEBUG: 打印同步后状态
-            if os.environ.get('DEBUG_PRUNING', '0') == '1':
-                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] sync_gradients done")
 
             if disc_has_grad:
                 if grad_clip:

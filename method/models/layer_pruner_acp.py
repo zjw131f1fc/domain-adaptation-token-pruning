@@ -195,18 +195,6 @@ class CrossAttentionPruner(nn.Module):
         else:
             key_padding_mask = None
 
-        # DEBUG: 打印 cross_attn 输入
-        import os
-        if os.environ.get('DEBUG_PRUNING', '0') == '1':
-            import torch.distributed as dist
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            print(f"[Rank {rank}][Pruner] queries: min={queries.min().item():.4f}, max={queries.max().item():.4f}")
-            print(f"[Rank {rank}][Pruner] v (vision): min={v.min().item():.4f}, max={v.max().item():.4f}, "
-                  f"has_nan={v.isnan().any().item()}, has_inf={v.isinf().any().item()}")
-            if key_padding_mask is not None:
-                print(f"[Rank {rank}][Pruner] key_padding_mask: n_masked={key_padding_mask.sum().item()}/{key_padding_mask.numel()}")
-            print(f"[Rank {rank}][Pruner] Calling cross_attn...")
-
         _, attn_weights = self.cross_attn(
             query=queries,
             key=v,
@@ -215,12 +203,6 @@ class CrossAttentionPruner(nn.Module):
             need_weights=True,
             average_attn_weights=True  # 对 heads 取平均
         )
-
-        # DEBUG: 打印 cross_attn 输出
-        if os.environ.get('DEBUG_PRUNING', '0') == '1':
-            print(f"[Rank {rank}][Pruner] cross_attn done. attn_weights: "
-                  f"min={attn_weights.min().item():.4f}, max={attn_weights.max().item():.4f}, "
-                  f"has_nan={attn_weights.isnan().any().item()}")
 
         # 4. Aggregate attention weights from multiple queries
         # (batch, n_queries, n_vision) -> (batch, n_vision, n_queries) -> (batch, n_vision, 1)
