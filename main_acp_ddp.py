@@ -547,6 +547,10 @@ def train_step(
         detach_h_fake_for_adv=detach_adv_from_pruner,
     )
 
+    # DEBUG: 打印 forward 完成
+    if os.environ.get('DEBUG_PRUNING', '0') == '1':
+        print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] model.forward done")
+
     # === 计算 Losses ===
     losses = {}
     stats = {
@@ -568,6 +572,10 @@ def train_step(
     losses['task_loss'] = task_loss
     stats['raw_task_loss'] = task_loss.item()
 
+    # DEBUG: 打印 task_loss 完成
+    if os.environ.get('DEBUG_PRUNING', '0') == '1':
+        print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] compute_task_loss done")
+
     # 2. 如果有剪枝信息，计算 GAN 相关 losses
     if output.pruning_infos and len(output.pruning_infos) > 0:
         h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
@@ -584,13 +592,25 @@ def train_step(
         # 获取 disc_manager（可能被 DDP 包装）
         disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
 
+        # DEBUG
+        if os.environ.get('DEBUG_PRUNING', '0') == '1':
+            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing adv_loss...")
+
         adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
         losses['adv_loss'] = adv_loss * gan_weight
         stats['raw_adv_loss'] = adv_loss.item()
 
+        # DEBUG
+        if os.environ.get('DEBUG_PRUNING', '0') == '1':
+            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing disc_loss...")
+
         disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
         losses['disc_loss'] = disc_loss * gan_weight
         stats['raw_disc_loss'] = disc_loss.item()
+
+        # DEBUG
+        if os.environ.get('DEBUG_PRUNING', '0') == '1':
+            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] computing disc_accuracy...")
 
         acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
         stats['disc_accuracy'] = acc_info['overall']
