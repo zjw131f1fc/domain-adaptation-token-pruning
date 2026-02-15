@@ -18,7 +18,7 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 4
+    batch_size: 3  # 64: 3 128 192 :4
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
