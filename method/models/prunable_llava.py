@@ -174,51 +174,71 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             )
             self.separated_adapter_manager = None
 
-        # 替换剪枝层
-        self._replace_pruning_layers()
+        # 替换所有层为 PrunableLlamaDecoderLayer（剪枝层有 pruner，非剪枝层没有）
+        self._replace_all_layers()
 
-    def _replace_pruning_layers(self):
-        """替换特定层为可剪枝层"""
+    def _replace_all_layers(self):
+        """替换所有层为 PrunableLlamaDecoderLayer
+
+        剪枝层：有 pruner, discriminator, adapter
+        非剪枝层：没有 pruner，但可以应用 cumulative_mask（post-softmax masking）
+        """
         llm = self.base_model.model.language_model
+        num_layers = len(llm.layers)
 
-        for layer_idx in self.pruning_layers:
+        for layer_idx in range(num_layers):
             original_layer = llm.layers[layer_idx]
-            pruner = self.pruner_manager.get_pruner(layer_idx)
-            discriminator = self.disc_manager.get_discriminator(layer_idx)
 
-            # 将 pruner, discriminator 移动到与原始层相同的设备和 dtype
+            # 跳过已经是 PrunableLlamaDecoderLayer 的层
+            if isinstance(original_layer, PrunableLlamaDecoderLayer):
+                continue
+
+            # 获取设备和 dtype
             layer_param = next(original_layer.parameters())
             layer_device = layer_param.device
             layer_dtype = layer_param.dtype
-            pruner.to(device=layer_device, dtype=layer_dtype)
-            discriminator.to(device=layer_device, dtype=layer_dtype)
 
-            # 根据配置选择 adapter 类型
-            if self.use_separated_adapters:
-                separated_adapters = self.separated_adapter_manager.get_adapters(layer_idx)
-                # 移动三个 adapter 到正确的设备
-                for adapter in separated_adapters:
+            if layer_idx in self.pruning_layers:
+                # 剪枝层：有 pruner, discriminator, adapter
+                pruner = self.pruner_manager.get_pruner(layer_idx)
+                discriminator = self.disc_manager.get_discriminator(layer_idx)
+                pruner.to(device=layer_device, dtype=layer_dtype)
+                discriminator.to(device=layer_device, dtype=layer_dtype)
+
+                if self.use_separated_adapters:
+                    separated_adapters = self.separated_adapter_manager.get_adapters(layer_idx)
+                    for adapter in separated_adapters:
+                        adapter.to(device=layer_device, dtype=layer_dtype)
+                    adapter = None
+                else:
+                    adapter = self.adapter_manager.get_adapter(layer_idx)
                     adapter.to(device=layer_device, dtype=layer_dtype)
-                adapter = None
-            else:
-                adapter = self.adapter_manager.get_adapter(layer_idx)
-                adapter.to(device=layer_device, dtype=layer_dtype)
-                separated_adapters = None
+                    separated_adapters = None
 
-            llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
-                original_layer=original_layer,
-                layer_idx=layer_idx,
-                pruner=pruner,
-                discriminator=discriminator,
-                adapter=adapter,
-                separated_adapters=separated_adapters
-            )
+                llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
+                    original_layer=original_layer,
+                    layer_idx=layer_idx,
+                    pruner=pruner,
+                    discriminator=discriminator,
+                    adapter=adapter,
+                    separated_adapters=separated_adapters
+                )
+            else:
+                # 非剪枝层：没有 pruner，但可以应用 cumulative_mask
+                llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
+                    original_layer=original_layer,
+                    layer_idx=layer_idx,
+                    pruner=None,
+                    discriminator=None,
+                    adapter=None,
+                    separated_adapters=None
+                )
 
     def _restore_original_layers(self):
         """还原为原始层（用于保存模型等场景）"""
         llm = self.base_model.model.language_model
 
-        for layer_idx in self.pruning_layers:
+        for layer_idx in range(len(llm.layers)):
             prunable_layer = llm.layers[layer_idx]
             if isinstance(prunable_layer, PrunableLlamaDecoderLayer):
                 llm.layers[layer_idx] = prunable_layer.original_layer
@@ -345,30 +365,24 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # === 遍历所有层 ===
         pruning_infos = {}
 
+        # 构建 causal mask（所有层共用，不包含 vision pruning）
+        min_val = torch.finfo(dtype).min
+        causal_mask = torch.triu(
+            torch.full((orig_seq_len, orig_seq_len), min_val, device=device, dtype=dtype),
+            diagonal=1
+        ).unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
         for layer_idx, decoder_layer in enumerate(llm.layers):
             # position_ids 保持不变（不做物理删除）
             position_ids = torch.arange(orig_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             position_embeddings = llm.rotary_emb(hidden_states, position_ids)
 
-            # 构建 attention_mask（包含 causal + vision pruning）
-            if cumulative_mask is not None and n_vision_orig > 0:
-                attention_mask_4d = build_vision_pruning_attention_mask(
-                    cumulative_mask, vision_start, vision_end,
-                    orig_seq_len, dtype, device
-                )
-            else:
-                # 仅 causal mask
-                min_val = torch.finfo(dtype).min
-                attention_mask_4d = torch.triu(
-                    torch.full((orig_seq_len, orig_seq_len), min_val, device=device, dtype=dtype),
-                    diagonal=1
-                ).unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
-
             if isinstance(decoder_layer, PrunableLlamaDecoderLayer) and return_pruning_info:
-                # 剪枝层
+                # PrunableLlamaDecoderLayer（剪枝层或非剪枝层）
+                # 使用 causal mask，vision pruning 通过 post-softmax masking 实现
                 hidden_states, pruning_info = decoder_layer(
                     hidden_states,
-                    attention_mask=attention_mask_4d,
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                     use_cache=use_cache,
@@ -391,34 +405,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         cumulative_mask = pruning_info['cumulative_mask'].clone()
 
             else:
-                # 非剪枝层
-                if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
-                    hidden_states = decoder_layer(
-                        hidden_states,
-                        attention_mask=attention_mask_4d,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=use_cache,
-                        cache_position=None,
-                        position_embeddings=position_embeddings,
-                        vision_start=vision_start,
-                        vision_end=vision_end,
-                        question_starts=question_starts,
-                        question_ends=question_ends,
-                        answer_starts=answer_starts,
-                        answer_ends=answer_ends,
-                        return_pruning_info=False,
-                    )
-                else:
-                    hidden_states = decoder_layer(
-                        hidden_states,
-                        attention_mask=attention_mask_4d,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=use_cache,
-                        cache_position=torch.arange(orig_seq_len, device=device),
-                        position_embeddings=position_embeddings,
-                    )
+                # 非 PrunableLlamaDecoderLayer（不应该发生，因为所有层都被替换了）
+                hidden_states = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=torch.arange(orig_seq_len, device=device),
+                    position_embeddings=position_embeddings,
+                )
 
 
         # Final LayerNorm

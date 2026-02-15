@@ -94,22 +94,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
             hidden_states: (batch, seq, hidden_size)
             pruning_info: dict（如果 return_pruning_info=True）
         """
-        if not self.is_pruning_layer:
-            # 非剪枝层：直接调用原始 layer
-            output = self.original_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs
-            )
-            if return_pruning_info:
-                return output, None
-            return output
-
         # 如果没有提供剪枝参数（如 generate 调用），直接调用原始 layer
         if vision_start is None or vision_end is None:
             output = self.original_layer(
@@ -125,6 +109,38 @@ class PrunableLlamaDecoderLayer(nn.Module):
             if return_pruning_info:
                 return output, None
             return output
+
+        if not self.is_pruning_layer:
+            # 非剪枝层：如果有 cumulative_mask，应用 post-softmax masking
+            if cumulative_vision_mask is not None and return_pruning_info:
+                return self._forward_with_mask_only(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    vision_start=vision_start,
+                    vision_end=vision_end,
+                    cumulative_mask=cumulative_vision_mask,
+                    **kwargs
+                )
+            else:
+                # 没有 cumulative_mask，直接调用原始 layer
+                output = self.original_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs
+                )
+                if return_pruning_info:
+                    return output, None
+                return output
 
         # === 剪枝层的特殊处理（训练模式）===
         return self._forward_with_pruning(
@@ -146,6 +162,118 @@ class PrunableLlamaDecoderLayer(nn.Module):
             detach_h_fake_for_adv=detach_h_fake_for_adv,
             **kwargs
         )
+
+    def _forward_with_mask_only(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: Optional[Any],
+        use_cache: bool,
+        cache_position: Optional[torch.LongTensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        vision_start: int,
+        vision_end: int,
+        cumulative_mask: torch.Tensor,
+        **kwargs
+    ):
+        """非剪枝层应用 cumulative_mask 的前向传播（post-softmax masking）
+
+        Args:
+            cumulative_mask: 累积 mask (batch, n_vision)，1=保留，0=已剪掉
+
+        Returns:
+            hidden_states: 输出 hidden states
+            None: 非剪枝层不返回 pruning_info
+        """
+        layer = self.original_layer
+        attn = layer.self_attn
+
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        n_vision = vision_end - vision_start
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # 获取配置
+        num_heads = attn.config.num_attention_heads
+        num_kv_heads = attn.config.num_key_value_heads
+        head_dim = attn.head_dim
+        num_kv_groups = num_heads // num_kv_heads
+
+        # === Step 1: LayerNorm + Q/K/V 投影 ===
+        residual = hidden_states
+        hidden_states_normed = layer.input_layernorm(hidden_states)
+
+        query_states = attn.q_proj(hidden_states_normed)
+        key_states = attn.k_proj(hidden_states_normed)
+        value_states = attn.v_proj(hidden_states_normed)
+
+        # Reshape
+        query_states = query_states.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Handle KV cache if needed
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # Repeat KV for GQA
+        key_states = repeat_kv(key_states, num_kv_groups)
+        value_states = repeat_kv(value_states, num_kv_groups)
+
+        # === Step 2: 计算 Attention Weights ===
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
+
+        # 仅使用 causal mask（不使用 -inf 的 vision pruning mask）
+        kv_len = key_states.shape[-2]
+        min_val = torch.finfo(dtype).min
+        causal_mask = torch.triu(
+            torch.full((seq_len, kv_len), min_val, device=device, dtype=dtype),
+            diagonal=1
+        )
+        attn_scores = attn_scores + causal_mask
+
+        # Softmax
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(dtype)
+
+        # === Step 3: 应用 post-softmax masking ===
+        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 cumulative_mask）
+        mask_expanded = cumulative_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+        ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start,
+                                 device=device, dtype=dtype)
+        ones_after = torch.ones(batch_size, num_heads, seq_len, kv_len - vision_end,
+                                device=device, dtype=dtype)
+        mask_vision = mask_expanded.expand(-1, num_heads, seq_len, -1)
+        full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
+
+        # 应用 mask 并重新归一化
+        attn_weights_masked = attn_weights * full_mask
+        attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
+        attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
+
+        # === Step 4: 计算 attention output ===
+        attn_output = torch.matmul(attn_weights_masked, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = attn.o_proj(attn_output)
+
+        # 残差连接
+        hidden_states = residual + attn_output
+
+        # === Step 5: MLP ===
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states, None
 
     def _forward_with_pruning(
         self,
@@ -228,7 +356,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         # === Step 2: 计算 Attention Weights ===
         attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1)) * attn.scaling
 
-        # 使用传入的 attention_mask（包含 causal + vision pruning）
+        # 使用传入的 attention_mask（仅 causal mask，vision pruning 通过 post-softmax masking 实现）
         kv_len = key_states.shape[-2]
         if attention_mask is not None:
             # attention_mask: (batch, 1, seq_len, kv_len), 0=参与, -inf=不参与
