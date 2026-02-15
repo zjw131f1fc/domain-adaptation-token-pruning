@@ -1212,9 +1212,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
 
-    # 启用 anomaly detection
-    torch.autograd.set_detect_anomaly(True)
-
     # 设置随机种子（每个进程使用不同的种子以获得不同的数据顺序）
     seed = config.global_settings.get('seed', 42)
     torch.manual_seed(seed + rank)

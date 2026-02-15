@@ -1080,7 +1080,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # 使用 generate 进行后续生成
         # 注意：需要传入已经构建好的 past_key_values
         max_new_tokens = generate_kwargs.pop('max_new_tokens', 32)
-        debug_generate = generate_kwargs.pop('debug_generate', False)
 
         # 获取 attention 配置（用于 decode 阶段）
         first_layer = llm.layers[0]
@@ -1105,11 +1104,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
         # 获取下一个 token
         next_token = logits.argmax(dim=-1)  # (batch, 1)
-
-        # Debug: 打印第一个生成的 token
-        if debug_generate:
-            token_id = next_token[0, 0].item()
-            print(f"[DEBUG generate] step 1: token_id={token_id}, eos_token_id={eos_token_id}, is_eos={token_id == eos_token_id}")
 
         generated_tokens = [next_token]
 
@@ -1219,11 +1213,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             next_token = logits.argmax(dim=-1)
 
             generated_tokens.append(next_token)
-
-            # Debug: 打印生成的 token
-            if debug_generate:
-                token_id = next_token[0, 0].item()
-                print(f"[DEBUG generate] step {len(generated_tokens)}: token_id={token_id}")
 
             # 检查是否生成了 EOS（使用前面已获取的 eos_token_id）
             if eos_token_id is not None:
