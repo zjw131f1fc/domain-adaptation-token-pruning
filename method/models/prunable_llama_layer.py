@@ -389,22 +389,27 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         # 提取 question tokens 的 hidden states（用于条件化 pruner，仅在启用时）
         question_hidden = None
+        question_lengths = None
         if self.pruner.use_question_condition:
             question_hidden_list = []
+            question_lengths_list = []
             for i in range(batch_size):
                 q_start, q_end = question_starts[i], question_ends[i]
                 question_hidden_list.append(hidden_states_normed[i, q_start:q_end, :])
+                question_lengths_list.append(q_end - q_start)
             # Pad to same length for batching
             max_q_len = max(qh.shape[0] for qh in question_hidden_list)
             question_hidden = torch.zeros(batch_size, max_q_len, hidden_size, device=device, dtype=dtype)
             for i, qh in enumerate(question_hidden_list):
                 question_hidden[i, :qh.shape[0], :] = qh
+            question_lengths = torch.tensor(question_lengths_list, device=device, dtype=torch.long)
 
         # Pruner 生成当前层的 mask
         current_mask, pruner_info = self.pruner.forward_full(
             vision_hidden, q2v_attn_avg,
             cumulative_vision_mask=cumulative_mask,
             question_hidden=question_hidden,
+            question_lengths=question_lengths,
             return_debug=True
         )
         # current_mask: (batch, n_vision) - 当前层的决策

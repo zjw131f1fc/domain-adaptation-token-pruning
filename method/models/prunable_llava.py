@@ -899,8 +899,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # 提取 question tokens 的 hidden states（用于条件化 pruner，仅在启用时）
             question_hidden = None
+            question_lengths = None
             if self.use_question_condition:
                 question_hidden_list = []
+                question_lengths_list = []
                 for i in range(batch_size):
                     orig_q_start, orig_q_end = question_starts[i], question_ends[i]
                     current_q_start = None
@@ -915,11 +917,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     if current_q_end is None:
                         current_q_end = current_seq_len
                     question_hidden_list.append(hidden_normed_for_pruning[i, current_q_start:current_q_end, :])
+                    question_lengths_list.append(current_q_end - current_q_start)
                 # Pad to same length for batching
                 max_q_len = max(qh.shape[0] for qh in question_hidden_list)
                 question_hidden = torch.zeros(batch_size, max_q_len, hidden_size, device=device, dtype=dtype)
                 for i, qh in enumerate(question_hidden_list):
                     question_hidden[i, :qh.shape[0], :] = qh
+                question_lengths = torch.tensor(question_lengths_list, device=device, dtype=torch.long)
 
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
@@ -928,6 +932,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     vision_hidden_padded, q2v_attn_padded,
                     cumulative_vision_mask=cumulative_vision_mask,
                     question_hidden=question_hidden,
+                    question_lengths=question_lengths,
                     n_pruned_tokens=0  # 不需要修正 baseline，因为已经用 mask 处理
                 )
 
