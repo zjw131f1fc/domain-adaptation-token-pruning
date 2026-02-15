@@ -68,6 +68,7 @@ method_settings:
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
   pruner_d_internal: 512   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
+  pruner_n_queries: 4      # Pruning queries 数量（更多 = 更多"看图角度"，成本增加很小）
   pruner_dropout: 0.1
   use_question_condition: false  # 是否使用 question embedding 条件化 pruner
 

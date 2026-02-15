@@ -32,6 +32,7 @@ class CrossAttentionPruner(nn.Module):
         d_model: int,
         d_internal: int = 128,
         n_heads: int = 4,
+        n_queries: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
@@ -42,14 +43,14 @@ class CrossAttentionPruner(nn.Module):
         self.d_model = d_model
         self.d_internal = d_internal
         self.n_heads = n_heads
+        self.n_queries = n_queries
         self.temperature = temperature
         self.use_gumbel_noise = use_gumbel_noise
         self.pruning_threshold = pruning_threshold
         self.use_question_condition = use_question_condition
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
-        self.n_queries = 4
-        self.pruning_queries = nn.Parameter(torch.randn(1, self.n_queries, d_internal) * 0.02)
+        self.pruning_queries = nn.Parameter(torch.randn(1, n_queries, d_internal) * 0.02)
 
         # Question embedding projection (用于条件化 pruning queries)
         if use_question_condition:
@@ -372,6 +373,7 @@ class LayerPrunerManager(nn.Module):
         d_model: 输入 hidden states 的维度
         d_internal: 内部特征维度
         n_heads: Cross-attention 头数
+        n_queries: Pruning queries 数量
         temperature: 初始温度
         dropout: Dropout 比例
         use_gumbel_noise: 是否使用 Gumbel noise（False 则使用纯 STE）
@@ -384,6 +386,7 @@ class LayerPrunerManager(nn.Module):
         d_model: int,
         d_internal: int = 128,
         n_heads: int = 4,
+        n_queries: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,
@@ -401,6 +404,7 @@ class LayerPrunerManager(nn.Module):
                 d_model=d_model,
                 d_internal=d_internal,
                 n_heads=n_heads,
+                n_queries=n_queries,
                 temperature=temperature,
                 dropout=dropout,
                 use_gumbel_noise=use_gumbel_noise,

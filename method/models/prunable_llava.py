@@ -103,6 +103,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruning_layers: List[int] = [4, 14, 24],
         pruner_d_internal: int = 128,
         pruner_n_heads: int = 4,
+        pruner_n_queries: int = 4,
         disc_d_hidden: int = 256,
         adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
         adapter_type: str = 'lightweight',    # adapter 类型: 'simple' 或 'lightweight'
@@ -138,6 +139,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             d_model=self.hidden_size,
             d_internal=pruner_d_internal,
             n_heads=pruner_n_heads,
+            n_queries=pruner_n_queries,
             temperature=temperature,
             dropout=dropout,
             use_gumbel_noise=use_gumbel_noise,
