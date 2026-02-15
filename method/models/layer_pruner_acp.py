@@ -123,10 +123,15 @@ class CrossAttentionPruner(nn.Module):
             # 将 attention 转换为 logit 空间（log 变换 + 中心化）
             baseline_raw = torch.log(q2v_attn.clamp(min=1e-6))
 
-            # 推理时物理删除后，需要修正 baseline_mean
-            # 被剪掉的 tokens 的 attention = 0，baseline_raw = log(1e-6) ≈ -13.8
-            if n_pruned_tokens > 0:
-                # 修正 baseline_mean：把被剪掉的 tokens 的贡献也算进去
+            # 计算 baseline_mean：只考虑当前保留的位置
+            if cumulative_vision_mask is not None:
+                # 只对 mask 为 1 的位置计算 mean
+                masked_baseline = baseline_raw * cumulative_vision_mask
+                baseline_sum = masked_baseline.sum(dim=-1, keepdim=True)
+                mask_count = cumulative_vision_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+                baseline_mean = baseline_sum / mask_count
+            elif n_pruned_tokens > 0:
+                # 推理时物理删除后，需要修正 baseline_mean（旧逻辑，保留兼容）
                 import math
                 pruned_baseline = math.log(1e-6)  # ≈ -13.8
                 total_sum = baseline_raw.sum(dim=-1, keepdim=True) + n_pruned_tokens * pruned_baseline

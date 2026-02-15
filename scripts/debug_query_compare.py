@@ -519,23 +519,27 @@ def main_retention(args, model=None, processor=None, train_dataset=None):
         for layer_idx in model.pruning_layers:
             if layer_idx in output_train.pruning_infos:
                 info = output_train.pruning_infos[layer_idx]
-                hard_mask = info['hard_mask']
-                ratio = hard_mask.float().mean().item()
-                train_ratios[layer_idx] = ratio
-                all_train_ratios[layer_idx].append(ratio)
+                # 使用 current_mask（当前层的决策），不是 hard_mask
+                current_mask = info.get('current_mask')
+                if current_mask is None:
+                    current_mask = info.get('hard_mask')
+                if current_mask is not None:
+                    ratio = current_mask.float().mean().item()
+                    train_ratios[layer_idx] = ratio
+                    all_train_ratios[layer_idx].append(ratio)
 
-                # Debug: keep_logits 统计
-                keep_logits = info.get('keep_logits')
-                if keep_logits is not None:
-                    train_debug[layer_idx] = {
-                        'logits_shape': keep_logits.shape,
-                        'logits_mean': keep_logits.float().mean().item(),
-                        'logits_std': keep_logits.float().std().item(),
-                        'logits_min': keep_logits.float().min().item(),
-                        'logits_max': keep_logits.float().max().item(),
-                        'mask_sum': hard_mask.sum().item(),
-                        'mask_shape': hard_mask.shape,
-                    }
+                    # Debug: keep_logits 统计
+                    keep_logits = info.get('keep_logits')
+                    if keep_logits is not None:
+                        train_debug[layer_idx] = {
+                            'logits_shape': keep_logits.shape,
+                            'logits_mean': keep_logits.float().mean().item(),
+                            'logits_std': keep_logits.float().std().item(),
+                            'logits_min': keep_logits.float().min().item(),
+                            'logits_max': keep_logits.float().max().item(),
+                            'mask_sum': current_mask.sum().item(),
+                            'mask_shape': current_mask.shape,
+                        }
 
         # ========== 推理路径 (generate_with_hard_pruning, 物理删除) ==========
         model.eval()

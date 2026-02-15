@@ -871,18 +871,45 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 q2v_attn_list.append(q2v_avg_i)
             q2v_attn_avg = torch.stack(q2v_attn_list, dim=0)
 
-            vision_hidden = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
+            vision_hidden_current = hidden_normed_for_pruning[:, current_vision_start:current_vision_end, :]
 
-            # 计算已被剪掉的 tokens 数量（用于修正 baseline_mean）
+            # === 为了与训练路径一致，将 vision_hidden 和 q2v_attn 填充回原始 576 维 ===
+            # 训练时：pruner 看到 576 tokens，用 key_padding_mask 屏蔽已剪掉的
+            # 推理时：也要填充回 576 tokens，用相同的 key_padding_mask
             current_n_vision = current_vision_end - current_vision_start
-            n_pruned_tokens = n_vision - current_n_vision
+
+            # 创建 576 维的 vision_hidden（已剪掉的位置填 0）
+            vision_hidden_padded = torch.zeros(batch_size, n_vision, hidden_size, device=device, dtype=dtype)
+            # 创建 576 维的 q2v_attn（已剪掉的位置填 0）
+            q2v_attn_padded = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
+
+            for i in range(batch_size):
+                # 找到 cumulative_vision_mask 中为 1 的位置（即当前保留的原始位置）
+                kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                for j, pos in enumerate(kept_positions):
+                    if j < current_n_vision:
+                        vision_hidden_padded[i, pos] = vision_hidden_current[i, j]
+                        q2v_attn_padded[i, pos] = q2v_attn_avg[i, j]
 
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
-                hard_mask, _ = pruner.forward_full(
-                    vision_hidden, q2v_attn_avg,
-                    n_pruned_tokens=n_pruned_tokens
+                # 传入 cumulative_vision_mask，与训练路径一致
+                hard_mask_padded, _ = pruner.forward_full(
+                    vision_hidden_padded, q2v_attn_padded,
+                    cumulative_vision_mask=cumulative_vision_mask,
+                    n_pruned_tokens=0  # 不需要修正 baseline，因为已经用 mask 处理
                 )
+
+            # 确保已剪掉的位置是 0（pruner 可能在那些位置输出非零值）
+            hard_mask_padded = hard_mask_padded * cumulative_vision_mask
+
+            # 从 padded mask 中提取当前保留位置的 mask
+            hard_mask_list = []
+            for i in range(batch_size):
+                kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
+                hard_mask_i = hard_mask_padded[i, kept_positions]
+                hard_mask_list.append(hard_mask_i)
+            hard_mask = torch.stack(hard_mask_list, dim=0)
 
             # Step 2: 用 mask 修改 attention weights（与训练一致）
             mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
@@ -905,15 +932,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
 
-            # Step 4: 将当前层的 hard_mask scatter 到原始 n_vision 维度（与训练时一致）
-            # 训练时使用 cumulative_vision_mask 的保留位置来 scatter，推理时也要一致
-            # hard_mask: (batch, current_n_vision) -> scattered_mask: (batch, n_vision)
-            scattered_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
-            for i in range(batch_size):
-                kept_positions = cumulative_vision_mask[i].nonzero(as_tuple=True)[0]
-                for j, pos in enumerate(kept_positions):
-                    if j < hard_mask.shape[1]:
-                        scattered_mask[i, pos] = hard_mask[i, j]
+            # Step 4: scattered_mask 直接使用 hard_mask_padded（已经是 576 维）
+            # hard_mask_padded 在已剪掉的位置是 0，在当前决策位置是 0/1
+            scattered_mask = hard_mask_padded
 
             # Step 5: 应用 Adapter（使用 scatter 后的 mask，与训练一致）
             if self.use_separated_adapters:
