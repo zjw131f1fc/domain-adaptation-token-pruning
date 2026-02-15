@@ -36,6 +36,7 @@ class CrossAttentionPruner(nn.Module):
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的阈值，用于训练第三阶段和推理
+        use_question_condition: bool = False,  # 是否使用 question embedding 条件化
     ):
         super().__init__()
         self.d_model = d_model
@@ -44,13 +45,17 @@ class CrossAttentionPruner(nn.Module):
         self.temperature = temperature
         self.use_gumbel_noise = use_gumbel_noise
         self.pruning_threshold = pruning_threshold
+        self.use_question_condition = use_question_condition
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.n_queries = 4
         self.pruning_queries = nn.Parameter(torch.randn(1, self.n_queries, d_internal) * 0.02)
 
         # Question embedding projection (用于条件化 pruning queries)
-        self.question_proj = nn.Linear(d_model, d_internal)
+        if use_question_condition:
+            self.question_proj = nn.Linear(d_model, d_internal)
+        else:
+            self.question_proj = None
 
         # Vision token projection
         self.vision_proj = nn.Linear(d_model, d_internal)
@@ -89,8 +94,9 @@ class CrossAttentionPruner(nn.Module):
         nn.init.zeros_(self.vision_proj.bias)
 
         # Question projection: 小权重初始化
-        nn.init.xavier_uniform_(self.question_proj.weight, gain=0.1)
-        nn.init.zeros_(self.question_proj.bias)
+        if self.question_proj is not None:
+            nn.init.xavier_uniform_(self.question_proj.weight, gain=0.1)
+            nn.init.zeros_(self.question_proj.bias)
 
         # Token scorer 最后一层零初始化，让初始输出接近 0
         nn.init.zeros_(self.token_scorer[-1].weight)
@@ -159,7 +165,7 @@ class CrossAttentionPruner(nn.Module):
 
         # 2. Expand pruning queries 并融入 question embedding
         queries = self.pruning_queries.expand(batch_size, -1, -1)  # (batch, n_queries, d_internal)
-        if question_hidden is not None:
+        if self.use_question_condition and question_hidden is not None:
             # 均值池化 question tokens
             question_emb = question_hidden.mean(dim=1)  # (batch, d_model)
             question_proj = self.question_proj(question_emb)  # (batch, d_internal)
@@ -353,6 +359,7 @@ class LayerPrunerManager(nn.Module):
         temperature: 初始温度
         dropout: Dropout 比例
         use_gumbel_noise: 是否使用 Gumbel noise（False 则使用纯 STE）
+        use_question_condition: 是否使用 question embedding 条件化
     """
 
     def __init__(
@@ -365,10 +372,12 @@ class LayerPrunerManager(nn.Module):
         dropout: float = 0.1,
         use_gumbel_noise: bool = True,
         pruning_threshold: float = 0.5,
+        use_question_condition: bool = False,
     ):
         super().__init__()
         self.layer_indices = layer_indices
         self.d_model = d_model
+        self.use_question_condition = use_question_condition
 
         # 为每层创建独立的 pruner
         self.pruners = nn.ModuleDict({
@@ -380,6 +389,7 @@ class LayerPrunerManager(nn.Module):
                 dropout=dropout,
                 use_gumbel_noise=use_gumbel_noise,
                 pruning_threshold=pruning_threshold,
+                use_question_condition=use_question_condition,
             )
             for idx in layer_indices
         })

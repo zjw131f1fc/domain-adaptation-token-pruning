@@ -18,14 +18,14 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 6
+    batch_size: 4
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
     optimizers:
       layer_pruners:
         type: "adam"
-        lr: 5.0e-05  # 提高学习率，让 pruner 更快学习
+        lr: 8.0e-05  # 提高学习率，让 pruner 更快学习
         weight_decay: 0.01  # 防止过拟合
       discriminator:
         type: "adam"
@@ -39,16 +39,16 @@ trainer_settings:
         # 进入阶段3时，将当前学习率乘以此系数
         phase3_lr_scale: 0.5
     print_loss_every_batches: 40  # 隔多久打印一次损失
-    eval_every_batches: 100  # 隔多久评估一次
+    eval_every_batches: 300  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
-    grad_clip_max_norm: null # 不要开
+    grad_clip_max_norm: null
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 8000
-    test: 50
+    train: 10000
+    test: 100
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -69,6 +69,7 @@ method_settings:
   pruner_d_internal: 512   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
   pruner_dropout: 0.1
+  use_question_condition: false  # 是否使用 question embedding 条件化 pruner
 
   # Gumbel noise 模式配置
   # - "always": 始终使用 Gumbel noise（有随机性，训练和推理可能不一致）
@@ -77,7 +78,7 @@ method_settings:
   #     阶段1 探索期 (0% - phase1_end): 温度退火 + Gumbel noise，探索哪些 token 重要
   #     阶段2 稳定期 (phase1_end - phase2_end): 低温 + Gumbel noise，精细化决策
   #     阶段3 确定性微调期 (phase2_end - 100%): 关闭 noise，训练=推理，消除 gap
-  gumbel_mode: "always"
+  gumbel_mode: "hybrid"
 
   # 跳过阶段1，直接从阶段2开始（用于恢复训练或快速实验）
   # 启用后：温度直接使用低温，稀疏度直接使用目标值（不退火）
@@ -91,7 +92,6 @@ method_settings:
   hybrid_phase3_temp: 0.3         # 确定性微调期温度
 
   # ==================== Discriminator 配置 ====================
-  # 每个 answer token 独立判别
   disc_d_d: 512
   disc_dropout: 0.2
   disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
@@ -126,11 +126,11 @@ method_settings:
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 130  # 目标保留的 vision token 数量
+  target_token_num: 128  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
-  sparsity_anneal_ratio: 0.0
+  sparsity_anneal_ratio: 0.3
   # Sparsity loss 计算模式：
   # - 'exact': 精确加权平均，梯度比例约 14:3.7:1
   # - 'harmonic': 调和平均近似，梯度比例约 4:1.4:1（更均匀）
@@ -143,7 +143,7 @@ method_settings:
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
-  eval_temperature: 0.1
+  eval_temperature: 0.3
 
   # ==================== 损失权重 ====================
   # task_loss: Cross entropy on answer tokens
@@ -151,13 +151,13 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 2.0
-  adv_loss_weight: 0.5
-  sparsity_weight: 2.0   # 提高到 5.0，让 sparsity loss 有足够影响力
+  adv_loss_weight: 0.1
+  sparsity_weight: 1.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens
   # 可以是单个值（所有层相同）或 list（对应 pruning_layers 的每一层）
   # 例如 pruning_layers: [4, 14, 24] 时，tightening_weights: [0.1, 0.2, 0.3]
-  tightening_weights: [0.5,1.0,1.5]  # 空 list 表示不启用
+  tightening_weights: []  # 空 list 表示不启用
 
   # # 动态权重调度 (可选)
   # loss_weight_warmup_ratio: 0.0  # 0 表示不使用 warmup

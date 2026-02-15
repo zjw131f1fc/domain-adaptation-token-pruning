@@ -115,6 +115,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         disc_use_spectral_norm: bool = False,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的剪枝阈值
+        use_question_condition: bool = False,  # 是否使用 question embedding 条件化 pruner
     ):
         super().__init__()
 
@@ -122,6 +123,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.base_model = base_model
         self.config = base_model.config
         self.pruning_layers = pruning_layers
+        self.use_question_condition = use_question_condition
 
         # 获取 LLM 配置
         llm_config = self.config.text_config
@@ -139,6 +141,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             dropout=dropout,
             use_gumbel_noise=use_gumbel_noise,
             pruning_threshold=pruning_threshold,
+            use_question_condition=use_question_condition,
         )
 
         # 创建 Discriminators
@@ -891,27 +894,29 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         vision_hidden_padded[i, pos] = vision_hidden_current[i, j]
                         q2v_attn_padded[i, pos] = q2v_attn_avg[i, j]
 
-            # 提取 question tokens 的 hidden states（用于条件化 pruner）
-            question_hidden_list = []
-            for i in range(batch_size):
-                orig_q_start, orig_q_end = question_starts[i], question_ends[i]
-                current_q_start = None
-                current_q_end = None
-                for new_idx, orig_idx in enumerate(kept_indices[i]):
-                    if orig_idx == orig_q_start and current_q_start is None:
-                        current_q_start = new_idx
-                    if orig_idx == orig_q_end - 1:
-                        current_q_end = new_idx + 1
-                if current_q_start is None:
-                    current_q_start = current_vision_end
-                if current_q_end is None:
-                    current_q_end = current_seq_len
-                question_hidden_list.append(hidden_normed_for_pruning[i, current_q_start:current_q_end, :])
-            # Pad to same length for batching
-            max_q_len = max(qh.shape[0] for qh in question_hidden_list)
-            question_hidden = torch.zeros(batch_size, max_q_len, hidden_size, device=device, dtype=dtype)
-            for i, qh in enumerate(question_hidden_list):
-                question_hidden[i, :qh.shape[0], :] = qh
+            # 提取 question tokens 的 hidden states（用于条件化 pruner，仅在启用时）
+            question_hidden = None
+            if self.use_question_condition:
+                question_hidden_list = []
+                for i in range(batch_size):
+                    orig_q_start, orig_q_end = question_starts[i], question_ends[i]
+                    current_q_start = None
+                    current_q_end = None
+                    for new_idx, orig_idx in enumerate(kept_indices[i]):
+                        if orig_idx == orig_q_start and current_q_start is None:
+                            current_q_start = new_idx
+                        if orig_idx == orig_q_end - 1:
+                            current_q_end = new_idx + 1
+                    if current_q_start is None:
+                        current_q_start = current_vision_end
+                    if current_q_end is None:
+                        current_q_end = current_seq_len
+                    question_hidden_list.append(hidden_normed_for_pruning[i, current_q_start:current_q_end, :])
+                # Pad to same length for batching
+                max_q_len = max(qh.shape[0] for qh in question_hidden_list)
+                question_hidden = torch.zeros(batch_size, max_q_len, hidden_size, device=device, dtype=dtype)
+                for i, qh in enumerate(question_hidden_list):
+                    question_hidden[i, :qh.shape[0], :] = qh
 
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
