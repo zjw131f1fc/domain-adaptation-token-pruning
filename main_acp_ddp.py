@@ -1493,8 +1493,21 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             if disc_has_grad:
                 losses['disc_loss'].backward()
 
+            # DEBUG: 打印梯度状态
+            if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                n_pruner_grads = sum(1 for p in model.get_pruner_parameters() if p.grad is not None)
+                n_adapter_grads = sum(1 for p in model.get_adapter_parameters() if p.grad is not None)
+                n_disc_grads = sum(1 for p in model.get_discriminator_parameters() if p.grad is not None)
+                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                      f"Before sync_gradients: pruner_grads={n_pruner_grads}, "
+                      f"adapter_grads={n_adapter_grads}, disc_grads={n_disc_grads}")
+
             # === 同步梯度（关键步骤！）===
             sync_gradients(model)
+
+            # DEBUG: 打印同步后状态
+            if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] sync_gradients done")
 
             if disc_has_grad:
                 if grad_clip:

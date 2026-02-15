@@ -316,6 +316,20 @@ class PrunableLlamaDecoderLayer(nn.Module):
         device = hidden_states.device
         dtype = hidden_states.dtype
 
+        # DEBUG: 打印输入状态
+        import os
+        if os.environ.get('DEBUG_PRUNING', '0') == '1':
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            print(f"[Rank {rank}][Layer {self.layer_idx}] hidden_states: "
+                  f"min={hidden_states.min().item():.4f}, max={hidden_states.max().item():.4f}, "
+                  f"has_nan={hidden_states.isnan().any().item()}, has_inf={hidden_states.isinf().any().item()}")
+            if cumulative_mask is not None:
+                print(f"[Rank {rank}][Layer {self.layer_idx}] cumulative_mask: "
+                      f"sum={cumulative_mask.sum().item():.0f}/{cumulative_mask.numel()}")
+            else:
+                print(f"[Rank {rank}][Layer {self.layer_idx}] cumulative_mask: None")
+
         # 获取配置
         num_heads = attn.config.num_attention_heads
         num_kv_heads = attn.config.num_key_value_heads

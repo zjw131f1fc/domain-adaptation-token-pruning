@@ -39,16 +39,16 @@ trainer_settings:
         # 进入阶段3时，将当前学习率乘以此系数
         phase3_lr_scale: 0.5
     print_loss_every_batches: 40  # 隔多久打印一次损失
-    eval_every_batches: 300  # 隔多久评估一次
+    eval_every_batches: 4000  # 隔多久评估一次
     eval_max_samples: 20000000 # 每次评估使用多少数据
-    save_every_batches: 2000 # 隔多久保存一个checkpoint
+    save_every_batches: 4000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 10000
-    test: 100
+    train: 200000
+    test: 2000
   fast_load_no_random: false
   category_priority:
     enable: true
@@ -62,13 +62,14 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [4,14,24]
+  pruning_layers: [2,13,25]
+  # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
   pruner_d_internal: 512   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
-  pruner_n_queries: 4      # Pruning queries 数量（更多 = 更多"看图角度"，成本增加很小）
+  pruner_n_queries: 32      # Pruning queries 数量（更多 = 更多"看图角度"，成本增加很小）
   pruner_dropout: 0.1
   use_question_condition: false  # 是否使用 question embedding 条件化 pruner
 
@@ -132,11 +133,11 @@ method_settings:
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
-  sparsity_anneal_ratio: 0.3
+  sparsity_anneal_ratio: 0.15
   # Sparsity loss 计算模式：
   # - 'exact': 精确加权平均，梯度比例约 14:3.7:1
   # - 'harmonic': 调和平均近似，梯度比例约 4:1.4:1（更均匀）
@@ -158,7 +159,7 @@ method_settings:
 
   task_loss_weight: 2.0
   adv_loss_weight: 0.1
-  sparsity_weight: 1.0   # 提高到 5.0，让 sparsity loss 有足够影响力
+  sparsity_weight: 1.2   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens
   # 可以是单个值（所有层相同）或 list（对应 pruning_layers 的每一层）
