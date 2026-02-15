@@ -452,10 +452,11 @@ def main():
 
 
 def main_retention(args, model=None, processor=None, train_dataset=None):
-    """对比训练第三阶段和推理时的保留率和保留的具体 token"""
+    """对比训练路径 (model()) 和推理路径 (generate_with_hard_pruning()) 的保留率"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Pruning threshold: {args.pruning_threshold}")
+    print(f"Temperature: {args.temperature}")
 
     # 加载模型（如果没有传入）
     if model is None or processor is None:
@@ -464,7 +465,7 @@ def main_retention(args, model=None, processor=None, train_dataset=None):
             checkpoint_path=args.checkpoint,
             pruning_threshold=args.pruning_threshold,
             use_gumbel_noise=False,  # 第三阶段不使用 noise
-            temperature=0.1,
+            temperature=args.temperature,
         )
 
     # 加载样本（如果没有传入）
@@ -478,27 +479,25 @@ def main_retention(args, model=None, processor=None, train_dataset=None):
         train_dataset = data_bundle['splits']['train']
 
     print("\n" + "=" * 70)
-    print("对比两次 eval 模式运行的 mask 决策和 logits 一致性")
+    print("对比训练路径 model() vs 推理路径 generate_with_hard_pruning()")
     print("=" * 70)
 
     all_train_ratios = {layer: [] for layer in model.pruning_layers}
     all_infer_ratios = {layer: [] for layer in model.pruning_layers}
-    all_mask_match = []
-    all_logits_diff = []
+    all_ratio_diffs = {layer: [] for layer in model.pruning_layers}
 
     for sample_idx in range(min(args.num_samples, len(train_dataset))):
         sample = train_dataset[sample_idx]
         print(f"\n--- Sample {sample_idx + 1}: Q='{sample['question'][:50]}...', A='{sample['answer']}' ---")
 
-        # 预处理（推理模式，不包含答案，两边都用这个）
+        # 预处理（推理模式，不包含答案）
         prep = preprocess_sample(sample, processor, device, mode="inference")
         inputs = prep['inputs']
 
-        # ========== 训练模式 (mask, 不做物理删除) ==========
-        # 注意：用 eval 模式消除 dropout 影响，只测试 mask 决策逻辑
+        # ========== 训练路径 (model, attention mask, 不做物理删除) ==========
         model.eval()
-        model.pruner_manager.set_use_gumbel_noise(False)  # 关闭 noise
-        model.pruner_manager.set_temperature(0.1)
+        model.pruner_manager.set_use_gumbel_noise(False)
+        model.pruner_manager.set_temperature(args.temperature)
 
         with torch.no_grad():
             output_train = model(
@@ -514,26 +513,35 @@ def main_retention(args, model=None, processor=None, train_dataset=None):
                 return_pruning_info=True,
             )
 
-        # 收集训练模式的 mask
-        train_masks = {}
+        # 收集训练路径的保留率和 debug 信息
         train_ratios = {}
+        train_debug = {}
         for layer_idx in model.pruning_layers:
             if layer_idx in output_train.pruning_infos:
-                hard_mask = output_train.pruning_infos[layer_idx]['hard_mask']
-                train_masks[layer_idx] = hard_mask.clone()
+                info = output_train.pruning_infos[layer_idx]
+                hard_mask = info['hard_mask']
                 ratio = hard_mask.float().mean().item()
                 train_ratios[layer_idx] = ratio
                 all_train_ratios[layer_idx].append(ratio)
 
-        # 训练模式的 logits（最后一个位置，用于预测下一个 token）
-        train_logits = output_train.logits[0, -1, :].clone()
+                # Debug: keep_logits 统计
+                keep_logits = info.get('keep_logits')
+                if keep_logits is not None:
+                    train_debug[layer_idx] = {
+                        'logits_shape': keep_logits.shape,
+                        'logits_mean': keep_logits.float().mean().item(),
+                        'logits_std': keep_logits.float().std().item(),
+                        'logits_min': keep_logits.float().min().item(),
+                        'logits_max': keep_logits.float().max().item(),
+                        'mask_sum': hard_mask.sum().item(),
+                        'mask_shape': hard_mask.shape,
+                    }
 
-        # ========== 第二次运行 (验证确定性) ==========
-        # 两边都用 eval 模式，验证 mask 决策是否确定性
+        # ========== 推理路径 (generate_with_hard_pruning, 物理删除) ==========
         model.eval()
 
         with torch.no_grad():
-            output_infer = model(
+            output_ids, kept_stats = model.generate_with_hard_pruning(
                 input_ids=inputs['input_ids'],
                 pixel_values=inputs['pixel_values'],
                 attention_mask=inputs.get('attention_mask'),
@@ -541,113 +549,65 @@ def main_retention(args, model=None, processor=None, train_dataset=None):
                 vision_end=prep['vision_end'],
                 question_starts=prep['question_starts'],
                 question_ends=prep['question_ends'],
-                answer_starts=prep['answer_starts'] if 'answer_starts' in prep else [prep['question_ends'][0]],
-                answer_ends=prep['answer_ends'] if 'answer_ends' in prep else [prep['question_ends'][0] + 1],
-                return_pruning_info=True,
+                max_new_tokens=1,
             )
 
-        # 收集推理模式的 mask
-        infer_masks = {}
+        # 收集推理路径的保留率
         infer_ratios = {}
         for layer_idx in model.pruning_layers:
-            if layer_idx in output_infer.pruning_infos:
-                hard_mask = output_infer.pruning_infos[layer_idx]['hard_mask']
-                infer_masks[layer_idx] = hard_mask.clone()
-                ratio = hard_mask.float().mean().item()
+            key = f'L{layer_idx}_kept'
+            if key in kept_stats:
+                ratio = kept_stats[key]
                 infer_ratios[layer_idx] = ratio
                 all_infer_ratios[layer_idx].append(ratio)
 
-        # 推理模式的 logits
-        infer_logits = output_infer.logits[0, -1, :].clone()
-
         # ========== 对比 ==========
-        print(f"\n  [保留率对比]")
+        print(f"\n  [保留率对比] (训练路径 vs 推理路径)")
         print(f"  {'Layer':<8} {'Train':>12} {'Infer':>12} {'Diff':>12}")
         print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12}")
         for layer_idx in model.pruning_layers:
             t_ratio = train_ratios.get(layer_idx, 0)
             i_ratio = infer_ratios.get(layer_idx, 0)
             diff = abs(t_ratio - i_ratio)
-            match = "OK" if diff < 0.001 else "!!"
-            print(f"  L{layer_idx:<6} {t_ratio:>11.2%} {i_ratio:>11.2%} {diff:>11.6f} {match}")
+            all_ratio_diffs[layer_idx].append(diff)
+            match = "OK" if diff < 0.01 else "!!"
+            print(f"  L{layer_idx:<6} {t_ratio:>11.2%} {i_ratio:>11.2%} {diff:>11.4f} {match}")
 
-        # 对比具体保留的 token
-        print(f"\n  [保留 token 对比]")
-        sample_mask_match = True
-        for layer_idx in model.pruning_layers:
-            t_mask = train_masks.get(layer_idx)
-            i_mask = infer_masks.get(layer_idx)
-            if t_mask is not None and i_mask is not None:
-                # 对比 mask 是否完全一致
-                mask_equal = torch.equal(t_mask, i_mask)
-                if mask_equal:
-                    print(f"  L{layer_idx}: mask 完全一致 ✓")
-                else:
-                    sample_mask_match = False
-                    diff_count = (t_mask != i_mask).sum().item()
-                    print(f"  L{layer_idx}: mask 不一致! 差异数量: {diff_count}")
-                    # 打印前几个不一致的位置
-                    diff_indices = (t_mask[0] != i_mask[0]).nonzero(as_tuple=True)[0][:5]
-                    for idx in diff_indices:
-                        print(f"    位置 {idx.item()}: train={t_mask[0, idx].item()}, infer={i_mask[0, idx].item()}")
-        all_mask_match.append(sample_mask_match)
-
-        # 对比 logits
-        print(f"\n  [Logits 对比]")
-        logits_diff = (train_logits.float() - infer_logits.float()).abs()
-        max_diff = logits_diff.max().item()
-        mean_diff = logits_diff.mean().item()
-        all_logits_diff.append(max_diff)
-
-        print(f"  max_diff: {max_diff:.6f}, mean_diff: {mean_diff:.6f}")
-
-        # 对比 top-5 预测
-        train_top5 = train_logits.topk(5)
-        infer_top5 = infer_logits.topk(5)
-
-        print(f"  Train top-5: {[processor.tokenizer.decode([idx.item()]) for idx in train_top5.indices]}")
-        print(f"  Infer top-5: {[processor.tokenizer.decode([idx.item()]) for idx in infer_top5.indices]}")
-
-        if train_top5.indices[0] == infer_top5.indices[0]:
-            print(f"  Top-1 预测一致 ✓")
-        else:
-            print(f"  Top-1 预测不一致!")
-
-        if max_diff < 1e-3:
-            print(f"  Logits 数值一致 (max_diff < 1e-3) ✓")
-        elif max_diff < 1e-1:
-            print(f"  Logits 数值接近 (max_diff < 0.1)")
-        else:
-            print(f"  Logits 数值差异较大!")
+        # Debug: 打印 keep_logits 统计
+        if args.debug and train_debug:
+            print(f"\n  [Debug: keep_logits 统计]")
+            for layer_idx in model.pruning_layers:
+                if layer_idx in train_debug:
+                    d = train_debug[layer_idx]
+                    print(f"  L{layer_idx}: shape={d['logits_shape']}, "
+                          f"mean={d['logits_mean']:.3f}, std={d['logits_std']:.3f}, "
+                          f"min={d['logits_min']:.3f}, max={d['logits_max']:.3f}")
+                    print(f"         mask_shape={d['mask_shape']}, mask_sum={d['mask_sum']:.0f}")
 
     # ========== 汇总统计 ==========
     print("\n" + "=" * 70)
     print("汇总统计")
     print("=" * 70)
 
-    print(f"\n[保留率]")
-    print(f"{'Layer':<8} {'Train Mean':>12} {'Infer Mean':>12} {'Diff':>12}")
+    print(f"\n[保留率] (训练路径 vs 推理路径)")
+    print(f"{'Layer':<8} {'Train Mean':>12} {'Infer Mean':>12} {'Mean Diff':>12}")
     print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12}")
 
     for layer_idx in model.pruning_layers:
         t_mean = sum(all_train_ratios[layer_idx]) / len(all_train_ratios[layer_idx]) if all_train_ratios[layer_idx] else 0
         i_mean = sum(all_infer_ratios[layer_idx]) / len(all_infer_ratios[layer_idx]) if all_infer_ratios[layer_idx] else 0
-        diff = abs(t_mean - i_mean)
-        match = "OK" if diff < 0.001 else "!!"
-        print(f"L{layer_idx:<6} {t_mean:>11.2%} {i_mean:>11.2%} {diff:>11.6f} {match}")
+        diff_mean = sum(all_ratio_diffs[layer_idx]) / len(all_ratio_diffs[layer_idx]) if all_ratio_diffs[layer_idx] else 0
+        match = "OK" if diff_mean < 0.01 else "!!"
+        print(f"L{layer_idx:<6} {t_mean:>11.2%} {i_mean:>11.2%} {diff_mean:>11.4f} {match}")
 
-    print(f"\n[Mask 一致性]")
-    match_count = sum(all_mask_match)
-    print(f"  {match_count}/{len(all_mask_match)} 样本的 mask 完全一致")
-
-    print(f"\n[Logits 差异]")
-    print(f"  max_diff 平均: {sum(all_logits_diff)/len(all_logits_diff):.6f}")
-    print(f"  max_diff 最大: {max(all_logits_diff):.6f}")
-
-    if all(all_mask_match) and max(all_logits_diff) < 1e-3:
-        print(f"\n✓ 两次运行的 mask 决策和 logits 完全一致!")
+    # 判断是否存在训练-推理不一致
+    max_diff = max(max(diffs) for diffs in all_ratio_diffs.values() if diffs)
+    if max_diff < 0.01:
+        print(f"\n✓ 训练路径和推理路径的保留率一致 (max_diff < 1%)")
     else:
-        print(f"\n✗ 两次运行存在差异，可能有非确定性因素!")
+        print(f"\n✗ 训练路径和推理路径存在差异! max_diff = {max_diff:.2%}")
+        print(f"  原因: 训练用 attention mask (576 tokens), 推理用物理删除 (fewer tokens)")
+        print(f"  这导致 pruner 的 vision_hidden 输入不同，产生不同的 keep_logits")
 
 
 if __name__ == "__main__":
@@ -659,8 +619,12 @@ if __name__ == "__main__":
                         help="Checkpoint 路径")
     parser.add_argument("--pruning_threshold", type=float, default=0.5,
                         help="Sigmoid 阈值 (默认 0.5)")
+    parser.add_argument("--temperature", type=float, default=0.3,
+                        help="Temperature (默认 0.3，与 hybrid_phase3_temp 一致)")
     parser.add_argument("--num_samples", type=int, default=5,
                         help="测试样本数量")
+    parser.add_argument("--debug", action="store_true",
+                        help="打印详细 debug 信息")
     args = parser.parse_args()
 
     # 共享数据加载
@@ -682,6 +646,6 @@ if __name__ == "__main__":
 
     if args.mode in ["retention", "both"]:
         print("\n" + "=" * 70)
-        print("模式 2: 验证 eval 模式下 mask 决策的确定性")
+        print("模式 2: 对比训练路径 vs 推理路径的保留率")
         print("=" * 70)
         main_retention(args, train_dataset=train_dataset)

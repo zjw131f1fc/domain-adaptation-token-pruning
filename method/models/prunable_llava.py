@@ -923,8 +923,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # Step 5: 应用 Adapter（使用 scatter 后的 mask，与训练一致）
             if self.use_separated_adapters:
-                # 分离式 Adapter：对 vision/text/generator 分别处理
-                vision_adapter, text_adapter, generator_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
+                # 分离式 Adapter：对 vision/text 分别处理（text 包含 question 和 generator）
+                vision_adapter, text_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
                 adapted_output = attn_output.clone()
 
                 # Vision tokens: [current_vision_start, current_vision_end)
@@ -940,10 +940,10 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     adapted_text = text_adapter(text_slice, mask=scattered_mask, query=text_query)
                     adapted_output[:, current_vision_end:current_seq_len-1, :] = adapted_text
 
-                # Generator token (最后一个，用于生成第一个 answer token)
+                # Generator token (最后一个，用于生成第一个 answer token): 使用 text_adapter
                 gen_slice = attn_output[:, current_seq_len-1:current_seq_len, :]
                 gen_query = query_states_flat[:, current_seq_len-1:current_seq_len, :]
-                adapted_gen = generator_adapter(gen_slice, mask=scattered_mask, query=gen_query)
+                adapted_gen = text_adapter(gen_slice, mask=scattered_mask, query=gen_query)
                 adapted_output[:, current_seq_len-1:current_seq_len, :] = adapted_gen
 
                 attn_output = adapted_output
@@ -1193,9 +1193,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     # 从 masks 中获取 scattered_mask（与训练时一致的 scatter 格式）
                     _, _, scattered_mask = masks[layer_idx]
                     if self.use_separated_adapters:
-                        # 分离式 Adapter：Generate 阶段使用 generator_adapter
-                        _, _, generator_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
-                        attn_output_gen = generator_adapter(
+                        # 分离式 Adapter：Generate 阶段使用 text_adapter
+                        _, text_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
+                        attn_output_gen = text_adapter(
                             attn_output_gen,
                             mask=scattered_mask,
                             query=query_states_flat_gen

@@ -305,8 +305,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         # === Step 4.5: Adapter 修正 ===
         if self.separated_adapters is not None:
-            # 分离式 Adapter：对 vision/text/generator 分别处理
-            vision_adapter, text_adapter, generator_adapter = self.separated_adapters
+            # 分离式 Adapter：对 vision/text 分别处理（text 包含 question 和 answer）
+            vision_adapter, text_adapter = self.separated_adapters
             attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
             adapted_output = attn_output_fake_flat.clone()
 
@@ -324,13 +324,13 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 adapted_text = text_adapter(text_slice, mask=hard_mask_full[i:i+1], query=text_query)
                 adapted_output[i, q_start:q_end, :] = adapted_text.squeeze(0)
 
-            # Generator tokens: 生成 answer 的 token [ans_start-1, ans_end-1)
+            # Generator tokens (answer): 使用 text_adapter
             for i in range(batch_size):
                 gen_start = answer_starts[i] - 1
                 gen_end = answer_ends[i] - 1
                 gen_slice = attn_output_fake_flat[i:i+1, gen_start:gen_end, :]
                 gen_query = query_states_flat[i:i+1, gen_start:gen_end, :]
-                adapted_gen = generator_adapter(gen_slice, mask=hard_mask_full[i:i+1], query=gen_query)
+                adapted_gen = text_adapter(gen_slice, mask=hard_mask_full[i:i+1], query=gen_query)
                 adapted_output[i, gen_start:gen_end, :] = adapted_gen.squeeze(0)
 
             attn_output_fake = adapted_output.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
