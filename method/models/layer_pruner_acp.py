@@ -49,6 +49,9 @@ class CrossAttentionPruner(nn.Module):
         self.n_queries = 4
         self.pruning_queries = nn.Parameter(torch.randn(1, self.n_queries, d_internal) * 0.02)
 
+        # Question embedding projection (用于条件化 pruning queries)
+        self.question_proj = nn.Linear(d_model, d_internal)
+
         # Vision token projection
         self.vision_proj = nn.Linear(d_model, d_internal)
 
@@ -85,6 +88,10 @@ class CrossAttentionPruner(nn.Module):
         nn.init.xavier_uniform_(self.vision_proj.weight, gain=0.1)
         nn.init.zeros_(self.vision_proj.bias)
 
+        # Question projection: 小权重初始化
+        nn.init.xavier_uniform_(self.question_proj.weight, gain=0.1)
+        nn.init.zeros_(self.question_proj.bias)
+
         # Token scorer 最后一层零初始化，让初始输出接近 0
         nn.init.zeros_(self.token_scorer[-1].weight)
         nn.init.zeros_(self.token_scorer[-1].bias)
@@ -99,6 +106,7 @@ class CrossAttentionPruner(nn.Module):
         q2v_attn: Optional[torch.Tensor] = None,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
         n_pruned_tokens: int = 0,
+        question_hidden: Optional[torch.Tensor] = None,
         return_components: bool = False
     ) -> torch.Tensor:
         """计算 keep logits
@@ -111,6 +119,7 @@ class CrossAttentionPruner(nn.Module):
             q2v_attn: (batch, n_vision) - LLM 的 question→vision attention 权重（作为 baseline）
             cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
             n_pruned_tokens: 已被剪掉的 tokens 数量（推理时物理删除后使用，用于修正 baseline_mean）
+            question_hidden: (batch, q_len, d_model) - question tokens 的 hidden states
             return_components: 是否返回中间结果
 
         返回:
@@ -148,8 +157,14 @@ class CrossAttentionPruner(nn.Module):
         # 1. Project vision tokens
         v = self.vision_proj(vision_hidden)  # (batch, n_vision, d_internal)
 
-        # 2. Expand pruning queries
+        # 2. Expand pruning queries 并融入 question embedding
         queries = self.pruning_queries.expand(batch_size, -1, -1)  # (batch, n_queries, d_internal)
+        if question_hidden is not None:
+            # 均值池化 question tokens
+            question_emb = question_hidden.mean(dim=1)  # (batch, d_model)
+            question_proj = self.question_proj(question_emb)  # (batch, d_internal)
+            # 加到 pruning queries 上作为 condition
+            queries = queries + question_proj.unsqueeze(1)  # (batch, n_queries, d_internal)
 
         # 3. Cross-attention: queries attend to vision tokens
         # attn_weights: (batch, n_queries, n_vision)
@@ -271,6 +286,7 @@ class CrossAttentionPruner(nn.Module):
         q2v_attn: Optional[torch.Tensor] = None,
         cumulative_vision_mask: Optional[torch.Tensor] = None,
         n_pruned_tokens: int = 0,
+        question_hidden: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         return_debug: bool = False
     ) -> Tuple[torch.Tensor, Dict]:
@@ -281,6 +297,7 @@ class CrossAttentionPruner(nn.Module):
             q2v_attn: (batch, n_vision) - 可选的 LLM attention 权重
             cumulative_vision_mask: (batch, n_vision) - 累积 mask，1=保留，0=已被剪掉
             n_pruned_tokens: 已被剪掉的 tokens 数量（推理时物理删除后使用）
+            question_hidden: (batch, q_len, d_model) - question tokens 的 hidden states
             temperature: 可选的温度覆盖
             return_debug: 是否返回 debug 信息
 
@@ -292,6 +309,7 @@ class CrossAttentionPruner(nn.Module):
             vision_hidden, q2v_attn,
             cumulative_vision_mask=cumulative_vision_mask,
             n_pruned_tokens=n_pruned_tokens,
+            question_hidden=question_hidden,
             return_components=True
         )
 

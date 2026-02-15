@@ -891,12 +891,35 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         vision_hidden_padded[i, pos] = vision_hidden_current[i, j]
                         q2v_attn_padded[i, pos] = q2v_attn_avg[i, j]
 
+            # 提取 question tokens 的 hidden states（用于条件化 pruner）
+            question_hidden_list = []
+            for i in range(batch_size):
+                orig_q_start, orig_q_end = question_starts[i], question_ends[i]
+                current_q_start = None
+                current_q_end = None
+                for new_idx, orig_idx in enumerate(kept_indices[i]):
+                    if orig_idx == orig_q_start and current_q_start is None:
+                        current_q_start = new_idx
+                    if orig_idx == orig_q_end - 1:
+                        current_q_end = new_idx + 1
+                if current_q_start is None:
+                    current_q_start = current_vision_end
+                if current_q_end is None:
+                    current_q_end = current_seq_len
+                question_hidden_list.append(hidden_normed_for_pruning[i, current_q_start:current_q_end, :])
+            # Pad to same length for batching
+            max_q_len = max(qh.shape[0] for qh in question_hidden_list)
+            question_hidden = torch.zeros(batch_size, max_q_len, hidden_size, device=device, dtype=dtype)
+            for i, qh in enumerate(question_hidden_list):
+                question_hidden[i, :qh.shape[0], :] = qh
+
             pruner = self.pruner_manager.get_pruner(layer_idx)
             with torch.no_grad():
                 # 传入 cumulative_vision_mask，与训练路径一致
                 hard_mask_padded, _ = pruner.forward_full(
                     vision_hidden_padded, q2v_attn_padded,
                     cumulative_vision_mask=cumulative_vision_mask,
+                    question_hidden=question_hidden,
                     n_pruned_tokens=0  # 不需要修正 baseline，因为已经用 mask 处理
                 )
 
