@@ -110,6 +110,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         vision_adapter_bottleneck: int = 256,  # vision adapter 瓶颈维度
         text_adapter_bottleneck: int = 256,    # text adapter 瓶颈维度
         generator_adapter_bottleneck: int = 512,  # generator adapter 瓶颈维度
+        mask_encoder_type: str = 'attention',  # mask encoder 类型: 'attention' 或 'linear'
         temperature: float = 1.0,
         dropout: float = 0.1,
         disc_use_spectral_norm: bool = False,
@@ -165,6 +166,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 answer_bottleneck_dim=generator_adapter_bottleneck,
                 n_vision=576,
                 dropout=dropout,
+                mask_encoder_type=mask_encoder_type,
             )
             self.adapter_manager = None
         else:
@@ -174,6 +176,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 bottleneck_dim=adapter_bottleneck,
                 adapter_type=adapter_type,
                 n_vision=576,  # LLaVA 1.5 的 vision token 数量
+                mask_encoder_type=mask_encoder_type,
             )
             self.separated_adapter_manager = None
 

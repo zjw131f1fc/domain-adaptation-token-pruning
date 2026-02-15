@@ -1,8 +1,66 @@
 """Adapter 模块 - 补偿剪枝后的信息损失"""
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
+
+
+class MaskAttentionEncoder(nn.Module):
+    """Attention 池化的 Mask Encoder
+
+    用位置编码 + Attention 池化来编码 mask，保留空间信息。
+    比直接 Linear(576, bottleneck) 更轻量且更有效。
+    """
+
+    def __init__(self, n_vision: int = 576, d_pos: int = 64, bottleneck_dim: int = 512):
+        super().__init__()
+        self.n_vision = n_vision
+        self.d_pos = d_pos
+
+        # 位置编码（可学习）
+        self.pos_embedding = nn.Parameter(torch.randn(n_vision, d_pos) * 0.02)
+
+        # Attention query（可学习）
+        self.attn_query = nn.Parameter(torch.randn(1, d_pos) * 0.02)
+
+        # 输出投影
+        self.out_proj = nn.Linear(d_pos, bottleneck_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mask: (batch, n_vision) - pruning mask, 1=keep, 0=prune
+
+        Returns:
+            mask_emb: (batch, bottleneck_dim)
+        """
+        batch_size = mask.shape[0]
+
+        # mask * pos_emb: (batch, n_vision, d_pos)
+        # 被剪掉的位置 (mask=0) 对应的 embedding 为 0
+        mask_with_pos = mask.unsqueeze(-1) * self.pos_embedding  # (batch, 576, 64)
+
+        # Attention: query @ keys
+        # (1, d_pos) @ (batch, d_pos, n_vision) -> (batch, 1, n_vision)
+        scale = 1.0 / math.sqrt(self.d_pos)
+        attn_scores = torch.matmul(self.attn_query, mask_with_pos.transpose(-1, -2)) * scale
+
+        # Softmax（被剪掉的位置 embedding 为 0，attention 会自然降低）
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (batch, 1, n_vision)
+
+        # Weighted sum: (batch, 1, n_vision) @ (batch, n_vision, d_pos) -> (batch, 1, d_pos)
+        pooled = torch.matmul(attn_weights, mask_with_pos).squeeze(1)  # (batch, d_pos)
+
+        # 投影到 bottleneck
+        return self.out_proj(pooled)  # (batch, bottleneck_dim)
 
 
 class LightweightAdapter(nn.Module):
@@ -17,6 +75,7 @@ class LightweightAdapter(nn.Module):
         bottleneck_dim: int = 512,
         n_vision: int = 576,
         dropout: float = 0.15,
+        mask_encoder_type: str = 'attention',  # 'attention' or 'linear'
         **kwargs
     ):
         super().__init__()
@@ -27,12 +86,20 @@ class LightweightAdapter(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Mask encoder: 编码哪些 token 被剪掉
-        self.mask_encoder = nn.Sequential(
-            nn.Linear(n_vision, bottleneck_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(bottleneck_dim, bottleneck_dim)
-        )
+        if mask_encoder_type == 'attention':
+            self.mask_encoder = MaskAttentionEncoder(
+                n_vision=n_vision,
+                d_pos=64,
+                bottleneck_dim=bottleneck_dim
+            )
+        else:
+            # 原始的 Linear encoder（向后兼容）
+            self.mask_encoder = nn.Sequential(
+                nn.Linear(n_vision, bottleneck_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(bottleneck_dim, bottleneck_dim)
+            )
 
         # Query encoder: 投影 attention query 到 bottleneck
         self.query_proj = nn.Linear(hidden_size, bottleneck_dim)
@@ -112,6 +179,7 @@ class AdapterManager(nn.Module):
         adapter_type: str = 'lightweight',
         n_vision: int = 576,
         dropout: float = 0.15,
+        mask_encoder_type: str = 'attention',
         **kwargs
     ):
         super().__init__()
@@ -127,7 +195,8 @@ class AdapterManager(nn.Module):
                 hidden_size=hidden_size,
                 bottleneck_dim=bottleneck_dim,
                 n_vision=n_vision,
-                dropout=dropout
+                dropout=dropout,
+                mask_encoder_type=mask_encoder_type
             )
             for idx in layer_indices
         })
@@ -151,6 +220,7 @@ class SeparatedAdapterManager(nn.Module):
         answer_bottleneck_dim: int = 512,  # 保留参数但不使用，向后兼容
         n_vision: int = 576,
         dropout: float = 0.15,
+        mask_encoder_type: str = 'attention',
         **kwargs
     ):
         super().__init__()
@@ -165,13 +235,15 @@ class SeparatedAdapterManager(nn.Module):
                 hidden_size=hidden_size,
                 bottleneck_dim=vision_bottleneck_dim,
                 n_vision=n_vision,
-                dropout=dropout
+                dropout=dropout,
+                mask_encoder_type=mask_encoder_type
             )
             self.text_adapters[str(idx)] = LightweightAdapter(
                 hidden_size=hidden_size,
                 bottleneck_dim=text_bottleneck_dim,
                 n_vision=n_vision,
-                dropout=dropout
+                dropout=dropout,
+                mask_encoder_type=mask_encoder_type
             )
 
     def get_adapters(self, layer_idx: int):
