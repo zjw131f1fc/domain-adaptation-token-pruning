@@ -1475,6 +1475,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             losses = result['losses']
             stats = result['stats']
 
+            # DEBUG: 打印 backward 前状态
+            if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                      f"compute_losses_and_stats done, starting backward...")
+
             # === 先 backward 所有 loss，再同步梯度，再 step ===
             pruner_optimizer.zero_grad()
             pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
@@ -1486,12 +1491,24 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     for k, v in losses.items():
                         if k != 'disc_loss':
                             print(f"  {k}: {v.item()}, requires_grad={v.requires_grad}")
+                if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                          f"pruner_total.backward starting...")
                 pruner_total.backward(retain_graph=True)
+                if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                          f"pruner_total.backward done")
 
             disc_optimizer.zero_grad()
             disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
             if disc_has_grad:
+                if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                          f"disc_loss.backward starting...")
                 losses['disc_loss'].backward()
+                if os.environ.get('DEBUG_PRUNING', '0') == '1':
+                    print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] "
+                          f"disc_loss.backward done")
 
             # DEBUG: 打印梯度状态
             if os.environ.get('DEBUG_PRUNING', '0') == '1':

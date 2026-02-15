@@ -62,7 +62,7 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  pruning_layers: [2,13,25]
+  pruning_layers: [1,13,25]
   # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
