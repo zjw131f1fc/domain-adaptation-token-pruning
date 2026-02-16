@@ -210,10 +210,10 @@ class CrossAttentionPruner(nn.Module):
         )
 
         # Query-wise dropout: 随机屏蔽某些 queries 的贡献
-        # 注意：不做 scale up，让训练和推理行为一致
+        # 使用标准 dropout 实现：mask + scale up，保持期望值一致
         if self.training and self.query_dropout > 0:
             query_mask = (torch.rand(batch_size, self.n_queries, 1, device=attn_weights.device) > self.query_dropout).to(attn_weights.dtype)
-            attn_weights = attn_weights * query_mask
+            attn_weights = attn_weights * query_mask / (1 - self.query_dropout)
 
         # 4. Aggregate attention weights from multiple queries
         # (batch, n_queries, n_vision) -> (batch, n_vision, n_queries) -> (batch, n_vision, 1)
