@@ -16,6 +16,7 @@
 import os
 import sys
 import math
+from contextlib import nullcontext
 
 # 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
 os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
@@ -419,16 +420,18 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     eval_max_samples = trainer_cfg.get('eval_max_samples', 500)
     save_every = trainer_cfg.get('save_every_batches', 3000)
     grad_clip = trainer_cfg.get('grad_clip_max_norm', None)
+    grad_accum_steps = trainer_cfg.get('gradient_accumulation_steps', 1)  # 梯度累积步数
 
-    # 计算总步数
+    # 计算总步数（按优化器更新次数计算，不是 batch 数）
     total_batches_per_epoch = len(train_loader)
-    total_steps = epochs * total_batches_per_epoch
+    total_steps = epochs * (total_batches_per_epoch // grad_accum_steps)
 
     if is_main_process():
         logger.info(f"Training config: epochs={epochs}, batch_size={batch_size}, "
                    f"batches_per_epoch={total_batches_per_epoch}")
-        logger.info(f"Total steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
-        logger.info(f"World size: {world_size}, Effective batch size: {batch_size * world_size}")
+        logger.info(f"Gradient accumulation: {grad_accum_steps} steps, "
+                   f"Effective batch size: {batch_size * world_size * grad_accum_steps}")
+        logger.info(f"Total optimizer steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
         # 显示 skip_phase1 状态
         skip_phase1 = method_cfg.get('skip_phase1', False)
         if skip_phase1:
@@ -458,11 +461,19 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         epoch_losses = defaultdict(float)
         epoch_stats = defaultdict(float)
         n_batches = 0
+        accum_step = 0  # 累积计数器
 
         # 使用 tqdm 包装 DataLoader（只在主进程显示进度条）
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
 
+        # 在 epoch 开始时清零梯度
+        pruner_optimizer.zero_grad()
+        disc_optimizer.zero_grad()
+
         for batch in pbar:
+            accum_step += 1
+            is_accum_step = (accum_step % grad_accum_steps != 0)  # 是否是累积中间步
+
             # 训练步骤
             result = train_step(
                 batch=batch,
@@ -477,87 +488,102 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             losses = result['losses']
             stats = result['stats']
 
-            # === 先 backward 所有 loss，再同步梯度，再 step ===
-            pruner_optimizer.zero_grad()
-            pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss')
+            # === 梯度累积：loss 除以累积步数 ===
+            pruner_total = sum(v for k, v in losses.items() if k != 'disc_loss') / grad_accum_steps
             pruner_has_grad = pruner_total.requires_grad
-            if pruner_has_grad:
-                pruner_total.backward(retain_graph=True)
+            disc_loss = losses.get('disc_loss', None)
+            if disc_loss is not None:
+                disc_loss = disc_loss / grad_accum_steps
+            disc_has_grad = disc_loss is not None and disc_loss.requires_grad
 
-            disc_optimizer.zero_grad()
-            disc_has_grad = 'disc_loss' in losses and losses['disc_loss'].requires_grad
-            if disc_has_grad:
-                losses['disc_loss'].backward()
+            # === Backward（累积期间禁用 DDP 梯度同步）===
+            # 使用 no_sync 上下文管理器在累积期间禁用自动同步
+            sync_context = model.no_sync() if (is_accum_step and hasattr(model, 'no_sync')) else nullcontext()
+            with sync_context:
+                if pruner_has_grad:
+                    pruner_total.backward(retain_graph=disc_has_grad)
+                if disc_has_grad:
+                    disc_loss.backward()
 
-            # === 同步梯度（关键步骤！）===
-            sync_gradients(model)
+            # === 累积结束时：同步梯度并更新参数 ===
+            if not is_accum_step:
+                # 同步梯度（关键步骤！）
+                sync_gradients(model)
 
-            if disc_has_grad:
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model.get_discriminator_parameters(), grad_clip)
-                disc_optimizer.step()
+                if disc_has_grad:
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(model.get_discriminator_parameters(), grad_clip)
+                    disc_optimizer.step()
 
-            if pruner_has_grad:
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
-                pruner_optimizer.step()
+                if pruner_has_grad:
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
+                    pruner_optimizer.step()
 
-            # 学习率调度器步进
-            if pruner_scheduler is not None:
-                pruner_scheduler.step()
-            if disc_scheduler is not None:
-                disc_scheduler.step()
+                # 清零梯度，准备下一轮累积
+                pruner_optimizer.zero_grad()
+                disc_optimizer.zero_grad()
 
-            # 判别器重新初始化
+                # 学习率调度器步进（按优化器更新次数）
+                if pruner_scheduler is not None:
+                    pruner_scheduler.step()
+                if disc_scheduler is not None:
+                    disc_scheduler.step()
+
+                # 更新 global_step（按优化器更新次数）
+                global_step += 1
+
+            # 判别器重新初始化（只在累积结束时）
             # 注意：需要在所有进程间同步决策，避免死锁
-            disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
-            disc_reinit_mode = method_cfg.get('disc_reinit_mode', 'threshold')  # 'threshold' 或 'random'
-            disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
-            disc_reinit_prob = method_cfg.get('disc_reinit_prob', 0.01)  # 随机模式下的概率
+            if not is_accum_step:
+                disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
+                disc_reinit_mode = method_cfg.get('disc_reinit_mode', 'threshold')  # 'threshold' 或 'random'
+                disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
+                disc_reinit_prob = method_cfg.get('disc_reinit_prob', 0.01)  # 随机模式下的概率
 
-            # random 模式：在循环外部生成随机数，确保所有 rank 都参与 broadcast
-            # 为每层生成一个随机数
-            if disc_reinit_enable and disc_reinit_mode == 'random':
-                rand_tensors = {}
-                for layer_idx in pruning_layers:
-                    rand_tensor = torch.tensor(0.0, device=device)
-                    if is_main_process():
-                        rand_tensor = torch.rand(1, device=device)[0]
-                    if dist.is_initialized():
-                        dist.broadcast(rand_tensor, src=0)
-                    rand_tensors[layer_idx] = rand_tensor.item()
-
-            if disc_reinit_enable and 'disc_per_layer' in stats:
-                for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
-                    should_reinit = False
-                    reinit_reason = ""
-
-                    if disc_reinit_mode == 'threshold':
-                        # 阈值模式：准确率过高时重初始化
-                        layer_acc = (real_acc + fake_acc) / 2
-                        # 汇总所有 rank 的 accuracy（取平均），确保所有进程做出相同决策
-                        layer_acc_tensor = torch.tensor(layer_acc, device=device)
-                        if dist.is_initialized():
-                            dist.all_reduce(layer_acc_tensor, op=dist.ReduceOp.SUM)
-                            layer_acc_tensor /= dist.get_world_size()
-                        layer_acc_global = layer_acc_tensor.item()
-
-                        if layer_acc_global > disc_reinit_threshold:
-                            should_reinit = True
-                            reinit_reason = f"acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%}"
-
-                    elif disc_reinit_mode == 'random':
-                        # 随机模式：使用预先生成的随机数
-                        if rand_tensors.get(layer_idx, 1.0) < disc_reinit_prob:
-                            should_reinit = True
-                            reinit_reason = f"random (prob={disc_reinit_prob})"
-
-                    if should_reinit:
-                        model.disc_manager.reinit_layer(layer_idx)
-                        # 重新初始化后，从 rank 0 广播新参数
-                        broadcast_model_params(model, src=0)
+                # random 模式：在循环外部生成随机数，确保所有 rank 都参与 broadcast
+                # 为每层生成一个随机数
+                if disc_reinit_enable and disc_reinit_mode == 'random':
+                    rand_tensors = {}
+                    for layer_idx in pruning_layers:
+                        rand_tensor = torch.tensor(0.0, device=device)
                         if is_main_process():
-                            logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited ({reinit_reason})")
+                            rand_tensor = torch.rand(1, device=device)[0]
+                        if dist.is_initialized():
+                            dist.broadcast(rand_tensor, src=0)
+                        rand_tensors[layer_idx] = rand_tensor.item()
+
+                if disc_reinit_enable and 'disc_per_layer' in stats:
+                    for layer_idx, (real_acc, fake_acc) in stats['disc_per_layer'].items():
+                        should_reinit = False
+                        reinit_reason = ""
+
+                        if disc_reinit_mode == 'threshold':
+                            # 阈值模式：准确率过高时重初始化
+                            layer_acc = (real_acc + fake_acc) / 2
+                            # 汇总所有 rank 的 accuracy（取平均），确保所有进程做出相同决策
+                            layer_acc_tensor = torch.tensor(layer_acc, device=device)
+                            if dist.is_initialized():
+                                dist.all_reduce(layer_acc_tensor, op=dist.ReduceOp.SUM)
+                                layer_acc_tensor /= dist.get_world_size()
+                            layer_acc_global = layer_acc_tensor.item()
+
+                            if layer_acc_global > disc_reinit_threshold:
+                                should_reinit = True
+                                reinit_reason = f"acc={layer_acc_global:.2%} > {disc_reinit_threshold:.0%}"
+
+                        elif disc_reinit_mode == 'random':
+                            # 随机模式：使用预先生成的随机数
+                            if rand_tensors.get(layer_idx, 1.0) < disc_reinit_prob:
+                                should_reinit = True
+                                reinit_reason = f"random (prob={disc_reinit_prob})"
+
+                        if should_reinit:
+                            model.disc_manager.reinit_layer(layer_idx)
+                            # 重新初始化后，从 rank 0 广播新参数
+                            broadcast_model_params(model, src=0)
+                            if is_main_process():
+                                logger.info(f"  [REINIT] Discriminator L{layer_idx} reinited ({reinit_reason})")
 
             # 统计每层保留的 token 数量（用于训练结束后推荐 topk_ks）
             if result['pruning_infos']:
@@ -583,10 +609,9 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 else:
                     epoch_stats[k] += v
             n_batches += 1
-            global_step += 1
 
-            # 打印（只在主进程）
-            if global_step % print_every == 0 and is_main_process():
+            # 打印（只在主进程，且在累积结束时）
+            if not is_accum_step and global_step % print_every == 0 and is_main_process():
                 loss_str = ", ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 # 显示阶段信息
                 phase_str = ""
@@ -620,8 +645,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
                     logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
 
-            # 计算 eval loss（用于检测过拟合）
-            if eval_loss_loader is not None and global_step % eval_loss_every == 0:
+            # 计算 eval loss（用于检测过拟合，只在累积结束时）
+            if not is_accum_step and eval_loss_loader is not None and global_step % eval_loss_every == 0:
                 # 获取一个 eval batch
                 if eval_loss_iter is None:
                     eval_loss_iter = iter(eval_loss_loader)
@@ -659,8 +684,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     diff_str = f"+{diff:.4f}" if diff > 0 else f"{diff:.4f}"
                     logger.info(f"  [Loss] train={train_task_loss:.4f}, eval={eval_task_loss_avg:.4f} ({diff_str})")
 
-            # 分布式评估：所有 rank 都参与
-            if test_dataset and global_step % eval_every == 0:
+            # 分布式评估：所有 rank 都参与（只在累积结束时）
+            if not is_accum_step and test_dataset and global_step % eval_every == 0:
                 if is_main_process():
                     logger.info(f"Evaluating at step {global_step}...")
 
@@ -709,8 +734,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 model.train()
 
-            # 保存（只在主进程）
-            if global_step % save_every == 0 and is_main_process():
+            # 保存（只在主进程，且在累积结束时）
+            if not is_accum_step and global_step % save_every == 0 and is_main_process():
                 ckpt_path = save_dir / f"checkpoint_step{global_step}.pt"
                 ckpt_data = {
                     'step': global_step,
