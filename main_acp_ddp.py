@@ -443,7 +443,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         save_dir.mkdir(parents=True, exist_ok=True)
 
     # 训练循环
-    global_step = start_step
+    global_step = start_step  # 优化器更新次数
+    global_batch = start_step * grad_accum_steps  # 全局 batch 计数（用于 print/eval/save 判断）
     cached_origin_result = None
 
     # 统计每层的保留数量（用于推荐 topk_ks）
@@ -609,9 +610,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 else:
                     epoch_stats[k] += v
             n_batches += 1
+            global_batch += 1  # 每个 batch 都增加
 
-            # 打印（只在主进程，且在累积结束时）
-            if not is_accum_step and global_step % print_every == 0 and is_main_process():
+            # 打印（只在主进程，按 batch 数判断）
+            if global_batch % print_every == 0 and is_main_process():
                 loss_str = ", ".join(f"{k}={v.item():.4f}" for k, v in losses.items())
                 # 显示阶段信息
                 phase_str = ""
@@ -645,8 +647,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
                     logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
 
-            # 计算 eval loss（用于检测过拟合，只在累积结束时）
-            if not is_accum_step and eval_loss_loader is not None and global_step % eval_loss_every == 0:
+            # 计算 eval loss（用于检测过拟合，按 batch 数判断）
+            if eval_loss_loader is not None and global_batch % eval_loss_every == 0:
                 # 获取一个 eval batch
                 if eval_loss_iter is None:
                     eval_loss_iter = iter(eval_loss_loader)
@@ -684,10 +686,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     diff_str = f"+{diff:.4f}" if diff > 0 else f"{diff:.4f}"
                     logger.info(f"  [Loss] train={train_task_loss:.4f}, eval={eval_task_loss_avg:.4f} ({diff_str})")
 
-            # 分布式评估：所有 rank 都参与（只在累积结束时）
-            if not is_accum_step and test_dataset and global_step % eval_every == 0:
+            # 分布式评估：所有 rank 都参与（按 batch 数判断）
+            if test_dataset and global_batch % eval_every == 0:
                 if is_main_process():
-                    logger.info(f"Evaluating at step {global_step}...")
+                    logger.info(f"Evaluating at batch {global_batch} (step {global_step})...")
 
                 eval_modes = config.evaluation_settings.get('eval_mode', ['origin', 'hard'])
                 for eval_mode in eval_modes:
@@ -734,11 +736,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 model.train()
 
-            # 保存（只在主进程，且在累积结束时）
-            if not is_accum_step and global_step % save_every == 0 and is_main_process():
-                ckpt_path = save_dir / f"checkpoint_step{global_step}.pt"
+            # 保存（只在主进程，按 batch 数判断）
+            if global_batch % save_every == 0 and is_main_process():
+                ckpt_path = save_dir / f"checkpoint_batch{global_batch}.pt"
                 ckpt_data = {
                     'step': global_step,
+                    'batch': global_batch,
                     'pruner_state_dict': model.pruner_manager.state_dict(),
                     'disc_state_dict': model.disc_manager.state_dict(),
                     'pruner_optimizer': pruner_optimizer.state_dict(),
