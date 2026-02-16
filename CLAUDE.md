@@ -12,29 +12,31 @@
 
 ## 核心特性
 
-- **Gumbel-Sigmoid 两阶段混合训练**：探索期温度退火 + 稳定期低温训练
+- **Gumbel-Sigmoid 三阶段混合训练**：探索期温度退火 + 稳定期低温 + 对齐期关闭noise
 - **基于 GAN 的对抗训练**：Discriminator 确保剪枝后的表示保持质量
 - **Cross-Attention Pruner**：使用可学习 queries 评估 vision tokens 重要性
 - **Layer-wise Pruning**：在 LLM 内部多层进行渐进式剪枝
 - **Lightweight Adapter**：Mask-Aware FiLM adapter 补偿剪枝信息损失
 
-## Gumbel-Sigmoid 两阶段混合训练策略
+## Gumbel-Sigmoid 三阶段混合训练策略
 
 ### 配置
 
 ```yaml
 gumbel_mode: "hybrid"  # "always" | "never" | "hybrid"
 
-# 两阶段配置
+# 三阶段配置
 hybrid_phase1_end: 0.6      # 探索期结束点
+hybrid_phase2_end: 0.9      # 稳定期结束点
 hybrid_phase1_temp_start: 1.5
 hybrid_phase1_temp_end: 0.3
 ```
 
-### 两阶段说明
+### 三阶段说明
 
 1. **阶段1 探索期** (0% - 60%): 温度从 1.5 退火到 0.3，使用 Gumbel noise，探索哪些 token 重要
-2. **阶段2 稳定期** (60% - 100%): 温度保持 0.3，继续使用 Gumbel noise，精细化决策边界
+2. **阶段2 稳定期** (60% - 90%): 温度保持 0.3，继续使用 Gumbel noise，精细化决策边界
+3. **阶段3 对齐期** (90% - 100%): 温度保持 0.3，关闭 Gumbel noise，让训练和推理行为一致
 
 ### 推理逻辑
 
@@ -133,7 +135,7 @@ Step 400 [Phase 2]: task_loss=1.23, adv_loss=0.45, sparsity_loss=0.02 (temp=0.30
   Disc acc: 73.81% [L4=86%, L10=93%, L16=43%]
 ```
 
-- `[Phase N]`: 当前训练阶段（hybrid 模式，1=探索期，2=稳定期）
+- `[Phase N]`: 当前训练阶段（hybrid 模式，1=探索期，2=稳定期，3=对齐期）
 - `noise=ON/OFF`: 是否使用 Gumbel noise
 - `Kept ratio`: 训练时累积保留率
 - `Infer ratio`: 推理时累积保留率

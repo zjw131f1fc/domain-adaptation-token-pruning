@@ -19,9 +19,9 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 4  # 64: 3 128 192 :4
+    batch_size: 3  # 64: 3 128 192 :4
     # gradient_accumulation_steps: 4  # 梯度累积步数，有效 batch_size = batch_size * world_size * accumulation_steps   # 3 * 4 * 2   2 * 3 * 4
-    gradient_accumulation_steps: 2
+    gradient_accumulation_steps: 4
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -63,8 +63,8 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  # pruning_layers: [1,13,25]
-  pruning_layers: [4,14,24]
+  pruning_layers: [1,13,25]
+  # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -135,7 +135,7 @@ method_settings:
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 192  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火

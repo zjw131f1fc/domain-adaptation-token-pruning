@@ -89,8 +89,9 @@ def train_step(
     progress = current_step / total_steps if total_steps > 0 else 0
 
     if gumbel_mode == 'hybrid':
-        # 混合两阶段策略
+        # 混合三阶段策略
         phase1_end = method_cfg.get('hybrid_phase1_end', 0.5)
+        phase2_end = method_cfg.get('hybrid_phase2_end', 1.0)  # 第三阶段起始点
         phase1_temp_start = method_cfg.get('hybrid_phase1_temp_start', 1.5)
         phase1_temp_end = method_cfg.get('hybrid_phase1_temp_end', 0.1)
 
@@ -100,18 +101,23 @@ def train_step(
             use_gumbel_noise = True
             current_phase = 2
         else:
-            # 正常两阶段
+            # 正常三阶段
             if progress < phase1_end:
                 # 阶段1：探索期 - 温度退火 + Gumbel noise
                 phase_progress = progress / phase1_end
                 current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
                 use_gumbel_noise = True
                 current_phase = 1
-            else:
+            elif progress < phase2_end:
                 # 阶段2：稳定期 - 低温 + Gumbel noise
                 current_temp = phase1_temp_end
                 use_gumbel_noise = True
                 current_phase = 2
+            else:
+                # 阶段3：对齐期 - 低温 + 关闭 noise（训练推理一致）
+                current_temp = phase1_temp_end
+                use_gumbel_noise = False
+                current_phase = 3
 
         model.set_use_gumbel_noise(use_gumbel_noise)
     elif gumbel_mode == 'always':
@@ -240,7 +246,7 @@ def train_step(
 
         # 收集各层的累积保留率
         cumulative_ratios = []
-        for layer_idx in pruning_layers:
+        for i, layer_idx in enumerate(pruning_layers):
             cumulative_mask = output.pruning_infos[layer_idx]['cumulative_mask']
             cumulative_ratio = cumulative_mask.float().mean()
             cumulative_ratios.append(cumulative_ratio)
@@ -278,12 +284,20 @@ def train_step(
             # avg = (n0*1 + n1*p1 + n2*p1*p2 + n3*p1*p2*p3) / total_layers
             avg_kept = torch.tensor(0.0, device=device)
             avg_kept = avg_kept + n_segments[0] * 1.0  # 剪枝前的层，保留率=1
-            cumulative_product = torch.tensor(1.0, device=device)
+            cumulative_product = torch.tensor(1.0, device=device, requires_grad=True)
             for i in range(n_pruning_layers):
                 cumulative_product = cumulative_product * independent_ratios[i]
                 avg_kept = avg_kept + n_segments[i + 1] * cumulative_product
             avg_kept = avg_kept / total_layers
             sparsity_loss = torch.abs(avg_kept - target_ratio)
+
+            # 调试：检查梯度是否能传导
+            # 只在训练模式下检查梯度（eval 时在 torch.no_grad() 上下文中，没有梯度是正常的）
+            if torch.is_grad_enabled() and not sparsity_loss.requires_grad:
+                print(f"[WARNING] sparsity_loss has no grad! step={current_step}")
+                print(f"  avg_kept.requires_grad: {avg_kept.requires_grad}")
+                for i, p in enumerate(independent_ratios):
+                    print(f"  independent_ratios[{i}].requires_grad: {p.requires_grad}, grad_fn: {p.grad_fn}")
 
         else:  # harmonic
             # === 调和平均近似方案 ===
