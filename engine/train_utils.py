@@ -1,0 +1,418 @@
+"""训练相关工具函数"""
+
+import math
+import torch
+import torch.nn.functional as F
+from typing import Dict, Any, List
+
+from engine.data_utils import preprocess_batch
+
+
+def compute_task_loss(
+    logits: torch.Tensor,
+    answer_starts: List[int],
+    answers: List[str],
+    tokenizer,
+    device: torch.device,
+) -> torch.Tensor:
+    """计算 task loss (cross entropy)
+
+    Args:
+        logits: 模型输出的 logits (batch, seq_len, vocab_size)
+        answer_starts: 每个样本的答案起始位置
+        answers: 答案文本列表
+        tokenizer: tokenizer
+        device: 设备
+
+    Returns:
+        平均 cross entropy loss
+    """
+    batch_size = logits.shape[0]
+    total_loss = torch.tensor(0.0, device=device)
+
+    for i in range(batch_size):
+        # 不加空格前缀，因为 answer_starts 指向的是答案的第一个 token（空格在前面）
+        answer = answers[i].capitalize()
+        answer_ids = tokenizer(answer, add_special_tokens=False)['input_ids']
+        if len(answer_ids) == 0:
+            continue
+
+        # 添加 EOS token，确保模型学会何时停止生成
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is not None:
+            answer_ids = answer_ids + [eos_token_id]
+
+        pred_start = answer_starts[i] - 1
+        pred_end = min(pred_start + len(answer_ids), logits.shape[1])
+
+        if pred_start < 0 or pred_end <= pred_start:
+            continue
+
+        pred_logits = logits[i, pred_start:pred_end]
+        target_len = min(len(answer_ids), pred_end - pred_start)
+        targets = torch.tensor(answer_ids[:target_len], device=device)
+
+        loss = F.cross_entropy(pred_logits, targets)
+        total_loss = total_loss + loss
+
+    return total_loss / batch_size if batch_size > 0 else total_loss
+
+
+def train_step(
+    batch: List[Dict[str, Any]],
+    model,
+    processor,
+    config,
+    current_step: int,
+    total_steps: int,
+    device: torch.device
+) -> Dict[str, Any]:
+    """执行一个训练步骤
+
+    Args:
+        batch: 样本列表
+        model: 可剪枝模型
+        processor: LLaVA processor
+        config: 配置对象
+        current_step: 当前步数
+        total_steps: 总步数
+        device: 设备
+
+    Returns:
+        包含 losses, stats, pruning_infos 的字典
+    """
+    method_cfg = config.method_settings
+
+    # === Gumbel Mode 两阶段调度 ===
+    gumbel_mode = method_cfg.get('gumbel_mode', 'never')
+    skip_phase1 = method_cfg.get('skip_phase1', False)
+    progress = current_step / total_steps if total_steps > 0 else 0
+
+    if gumbel_mode == 'hybrid':
+        # 混合两阶段策略
+        phase1_end = method_cfg.get('hybrid_phase1_end', 0.5)
+        phase1_temp_start = method_cfg.get('hybrid_phase1_temp_start', 1.5)
+        phase1_temp_end = method_cfg.get('hybrid_phase1_temp_end', 0.1)
+
+        if skip_phase1:
+            # 跳过阶段1，直接从阶段2开始
+            current_temp = phase1_temp_end
+            use_gumbel_noise = True
+            current_phase = 2
+        else:
+            # 正常两阶段
+            if progress < phase1_end:
+                # 阶段1：探索期 - 温度退火 + Gumbel noise
+                phase_progress = progress / phase1_end
+                current_temp = phase1_temp_start - phase_progress * (phase1_temp_start - phase1_temp_end)
+                use_gumbel_noise = True
+                current_phase = 1
+            else:
+                # 阶段2：稳定期 - 低温 + Gumbel noise
+                current_temp = phase1_temp_end
+                use_gumbel_noise = True
+                current_phase = 2
+
+        model.set_use_gumbel_noise(use_gumbel_noise)
+    elif gumbel_mode == 'always':
+        # 始终使用 Gumbel noise（旧的温度退火逻辑）
+        temperature = method_cfg.get('temperature', 1.0)
+        temperature_min = method_cfg.get('temperature_min', 0.5)
+        anneal_rate = method_cfg.get('temperature_anneal_rate', 0.4)
+
+        if progress < anneal_rate:
+            current_temp = temperature - (progress / anneal_rate) * (temperature - temperature_min)
+        else:
+            current_temp = temperature_min
+        use_gumbel_noise = True
+        current_phase = 0
+        model.set_use_gumbel_noise(True)
+    else:
+        # never: 纯 STE，不使用 Gumbel noise
+        current_temp = method_cfg.get('temperature_min', 0.1)
+        use_gumbel_noise = False
+        current_phase = 0
+        model.set_use_gumbel_noise(False)
+
+    model.set_temperature(current_temp)
+
+    # === 预处理 ===
+    max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
+    prep = preprocess_batch(batch, processor, device, max_length=max_length)
+    inputs = prep['inputs']
+
+    # === Forward ===
+    model.train()
+
+    # 是否阻止 adv_loss 梯度流向 pruner
+    detach_adv_from_pruner = method_cfg.get('detach_adv_from_pruner', False)
+
+    output = model(
+        input_ids=inputs['input_ids'],
+        pixel_values=inputs['pixel_values'],
+        attention_mask=inputs['attention_mask'],
+        vision_start=prep['vision_start'],
+        vision_end=prep['vision_end'],
+        question_starts=prep['question_starts'],
+        question_ends=prep['question_ends'],
+        answer_starts=prep['answer_starts'],
+        answer_ends=prep['answer_ends'],
+        return_pruning_info=True,
+        detach_h_fake_for_adv=detach_adv_from_pruner,
+    )
+
+    # === 计算 Losses ===
+    losses = {}
+    stats = {
+        'temperature': current_temp,
+        'use_gumbel_noise': use_gumbel_noise,
+    }
+    if gumbel_mode == 'hybrid':
+        stats['hybrid_phase'] = current_phase
+
+    # 1. Task Loss（不做物理删除，位置不变，直接使用原始 answer_starts）
+    task_loss = compute_task_loss(
+        output.logits,
+        prep['answer_starts'],
+        prep['answers'],
+        processor.tokenizer,
+        device,
+    )
+    losses['task_loss'] = task_loss
+    stats['raw_task_loss'] = task_loss.item()
+
+    # 2. 如果有剪枝信息，计算 GAN 相关 losses
+    if output.pruning_infos and len(output.pruning_infos) > 0:
+        h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
+        h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
+
+        loss_type = method_cfg.get('disc_loss_type', 'bce')
+        gp_weight = method_cfg.get('disc_gp_weight', 10.0)
+
+        warmup_ratio = method_cfg.get('pruner_warmup_ratio', 0.0)
+        in_warmup = current_step < total_steps * warmup_ratio
+        gan_weight = 0.0 if in_warmup else 1.0
+        stats['in_warmup'] = in_warmup
+
+        # 获取 disc_manager（可能被 DDP 包装）
+        disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
+
+        adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
+        losses['adv_loss'] = adv_loss * gan_weight
+        stats['raw_adv_loss'] = adv_loss.item()
+
+        disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
+        losses['disc_loss'] = disc_loss * gan_weight
+        stats['raw_disc_loss'] = disc_loss.item()
+
+        acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
+        stats['disc_accuracy'] = acc_info['overall']
+        stats['disc_real_acc'] = acc_info['real_acc']
+        stats['disc_fake_acc'] = acc_info['fake_acc']
+        stats['disc_per_layer'] = acc_info['per_layer']
+
+        # Sparsity Loss
+        target_token_num = method_cfg.get('target_token_num', 144)
+        n_vision = prep['n_vision']
+        final_target_ratio = target_token_num / n_vision
+
+        # 剪枝目标退火：从 100% 保留逐渐退火到目标值
+        # 如果 skip_phase1=True，跳过退火，直接使用目标值
+        sparsity_anneal_ratio = method_cfg.get('sparsity_anneal_ratio', 0.0)
+        if skip_phase1:
+            # 跳过阶段1，直接使用目标稀疏度
+            target_ratio = final_target_ratio
+        elif sparsity_anneal_ratio > 0 and progress < sparsity_anneal_ratio:
+            # 使用余弦退火：从 1.0 平滑过渡到 final_target_ratio
+            anneal_progress = progress / sparsity_anneal_ratio
+            # 余弦退火：(1 + cos(π * t)) / 2 从 1 到 0
+            cosine_factor = (1 + math.cos(math.pi * anneal_progress)) / 2
+            target_ratio = final_target_ratio + (1.0 - final_target_ratio) * cosine_factor
+        else:
+            target_ratio = final_target_ratio
+
+        total_layers = len(model.base_model.language_model.layers)
+        pruning_layers = sorted(output.pruning_infos.keys())
+        n_pruning_layers = len(pruning_layers)
+
+        # 获取 sparsity loss 模式
+        sparsity_loss_mode = method_cfg.get('sparsity_loss_mode', 'exact')  # 'exact' 或 'harmonic'
+
+        # 收集各层的累积保留率
+        cumulative_ratios = []
+        for layer_idx in pruning_layers:
+            cumulative_mask = output.pruning_infos[layer_idx]['cumulative_mask']
+            cumulative_ratio = cumulative_mask.float().mean()
+            cumulative_ratios.append(cumulative_ratio)
+            stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
+
+        # 计算独立保留率 p_i = 当前层的 current_mask 的平均值
+        # 不再使用除法 cumulative_r_i / cumulative_r_{i-1}，避免梯度计算问题
+        independent_ratios = []
+        for i, layer_idx in enumerate(pruning_layers):
+            current_mask = output.pruning_infos[layer_idx].get('current_mask')
+            if current_mask is None:
+                # 向后兼容：如果没有 current_mask，使用除法计算
+                if i == 0:
+                    p_i = cumulative_ratios[i]
+                else:
+                    prev_cum = cumulative_ratios[i - 1].clamp(min=1e-6)
+                    p_i = cumulative_ratios[i] / prev_cum
+            else:
+                p_i = current_mask.float().mean()
+            p_i = p_i.clamp(min=1e-6, max=1.0)
+            independent_ratios.append(p_i)
+
+        # 计算各段的层数 [n0, n1, n2, n3]
+        n_segments = []
+        for i, layer_idx in enumerate(pruning_layers):
+            if i == 0:
+                n_segments.append(layer_idx)  # n0: 剪枝前的层数
+            if i < n_pruning_layers - 1:
+                n_segments.append(pruning_layers[i + 1] - layer_idx)
+            else:
+                n_segments.append(total_layers - layer_idx)
+
+        if sparsity_loss_mode == 'exact':
+            # === 精确加权平均方案 ===
+            # avg = (n0*1 + n1*p1 + n2*p1*p2 + n3*p1*p2*p3) / total_layers
+            avg_kept = torch.tensor(0.0, device=device)
+            avg_kept = avg_kept + n_segments[0] * 1.0  # 剪枝前的层，保留率=1
+            cumulative_product = torch.tensor(1.0, device=device)
+            for i in range(n_pruning_layers):
+                cumulative_product = cumulative_product * independent_ratios[i]
+                avg_kept = avg_kept + n_segments[i + 1] * cumulative_product
+            avg_kept = avg_kept / total_layers
+            sparsity_loss = torch.abs(avg_kept - target_ratio)
+
+        else:  # harmonic
+            # === 调和平均近似方案 ===
+            # hm = n / Σ(1/p_i)
+            inv_sum = sum(1.0 / p for p in independent_ratios)
+            hm = n_pruning_layers / inv_sum
+
+            # avg_approx = (n0*1 + n1*hm + n2*hm^2 + n3*hm^3) / total_layers
+            avg_approx = torch.tensor(0.0, device=device)
+            avg_approx = avg_approx + n_segments[0] * 1.0
+            hm_power = hm
+            for i in range(1, len(n_segments)):
+                avg_approx = avg_approx + n_segments[i] * hm_power
+                hm_power = hm_power * hm
+            avg_approx = avg_approx / total_layers
+            sparsity_loss = torch.abs(avg_approx - target_ratio)
+
+            stats['harmonic_mean'] = hm.item()
+
+        losses['sparsity_loss'] = sparsity_loss
+        stats['raw_sparsity_loss'] = sparsity_loss.item()
+        # 显示平均每层保留率（与 sparsity loss 约束的目标一致）
+        if sparsity_loss_mode == 'exact':
+            stats['avg_kept_ratio'] = avg_kept.item()
+        else:
+            stats['avg_kept_ratio'] = avg_approx.item()
+        stats['final_kept_ratio'] = cumulative_ratios[-1].item()  # 最后一层的累积保留率
+        stats['target_kept_ratio'] = target_ratio
+        stats['total_layers'] = total_layers
+
+    # === Per-Pruner Tightening Loss: 惩罚每个 pruner 的保留率 ===
+    # 使每个 pruner 独立地倾向于剪掉更多 tokens
+    # tightening_weights 可以是单个值或 list（对应每个剪枝层）
+    tightening_weights_cfg = method_cfg.get('tightening_weights', [])
+    if tightening_weights_cfg and output.pruning_infos:
+        pruning_layers_sorted = sorted(output.pruning_infos.keys())
+
+        # 如果是单个值，扩展为 list
+        if isinstance(tightening_weights_cfg, (int, float)):
+            tightening_weights_cfg = [tightening_weights_cfg] * len(pruning_layers_sorted)
+
+        tightening_loss_total = torch.tensor(0.0, device=device)
+        for i, layer_idx in enumerate(pruning_layers_sorted):
+            # 获取该层的权重
+            if i < len(tightening_weights_cfg):
+                layer_weight = tightening_weights_cfg[i]
+            else:
+                layer_weight = 0.0
+
+            if layer_weight <= 0:
+                continue
+
+            # 使用当前层的 mask（不是累积 mask）
+            current_mask = output.pruning_infos[layer_idx].get('current_mask')
+            if current_mask is None:
+                current_mask = output.pruning_infos[layer_idx].get('cumulative_mask')
+            if current_mask is not None:
+                layer_kept_ratio = current_mask.float().mean()
+                tightening_loss_total = tightening_loss_total + layer_weight * layer_kept_ratio
+                stats[f'L{layer_idx}_tightening'] = layer_kept_ratio.item()
+
+        if tightening_loss_total > 0:
+            losses['tightening_loss'] = tightening_loss_total
+            stats['tightening_loss'] = tightening_loss_total.item()
+
+    # === Entropy 正则损失：鼓励 logits 生成极端值 ===
+    # 最小化 entropy 会让 sigmoid(logits) 接近 0 或 1，使训练和推理行为一致
+    entropy_weight = method_cfg.get('entropy_weight', 0.0)
+    if entropy_weight > 0 and output.pruning_infos:
+        entropy_losses = []
+        for layer_idx in output.pruning_infos:
+            keep_logits = output.pruning_infos[layer_idx].get('keep_logits')
+            if keep_logits is not None:
+                # p = sigmoid(keep_logits)
+                p = torch.sigmoid(keep_logits.float())
+                # entropy = -p * log(p) - (1-p) * log(1-p)
+                # 使用 clamp 避免 log(0)
+                p_clamped = p.clamp(min=1e-7, max=1-1e-7)
+                entropy = -p_clamped * torch.log(p_clamped) - (1 - p_clamped) * torch.log(1 - p_clamped)
+                entropy_losses.append(entropy.mean())
+        if entropy_losses:
+            entropy_loss = torch.stack(entropy_losses).mean()
+            losses['entropy_loss'] = entropy_loss
+            stats['entropy_loss'] = entropy_loss.item()
+
+    # === 应用权重 ===
+    task_weight = method_cfg.get('task_loss_weight', 1.0)
+    adv_weight = method_cfg.get('adv_loss_weight', 0.5)
+    sparsity_weight = method_cfg.get('sparsity_weight', 0.2)
+
+    warmup_ratio = method_cfg.get('loss_weight_warmup_ratio', 0.0)
+    if warmup_ratio > 0 and progress < warmup_ratio:
+        warmup_progress = progress / warmup_ratio
+        cosine_factor = (1 - torch.cos(torch.tensor(warmup_progress * 3.14159))) / 2
+
+        task_weight_start = method_cfg.get('task_loss_weight_start', task_weight)
+        adv_weight_start = method_cfg.get('adv_loss_weight_start', adv_weight)
+
+        task_weight = task_weight_start + (task_weight - task_weight_start) * cosine_factor.item()
+        adv_weight = adv_weight_start + (adv_weight - adv_weight_start) * cosine_factor.item()
+
+    if method_cfg.get('sparsity_warmup_enable', False):
+        sparsity_warmup_ratio = method_cfg.get('sparsity_warmup_ratio', 0.2)
+        sparsity_weight_max = method_cfg.get('sparsity_weight_max', sparsity_weight)
+        if progress < sparsity_warmup_ratio:
+            sparsity_weight = sparsity_weight + (sparsity_weight_max - sparsity_weight) * (progress / sparsity_warmup_ratio)
+        else:
+            sparsity_weight = sparsity_weight_max
+
+    stats['task_weight'] = task_weight
+    stats['adv_weight'] = adv_weight
+    stats['sparsity_weight'] = sparsity_weight
+
+    weighted_losses = {
+        'task_loss': losses['task_loss'] * task_weight,
+    }
+    if 'adv_loss' in losses:
+        weighted_losses['adv_loss'] = losses['adv_loss'] * adv_weight
+    if 'sparsity_loss' in losses:
+        weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
+    if 'entropy_loss' in losses:
+        weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
+    if 'tightening_loss' in losses:
+        weighted_losses['tightening_loss'] = losses['tightening_loss']  # 权重已在计算时应用
+    if 'disc_loss' in losses:
+        weighted_losses['disc_loss'] = losses['disc_loss']
+
+    return {
+        'losses': weighted_losses,
+        'stats': stats,
+        'pruning_infos': {idx: info for idx, info in output.pruning_infos.items()} if output.pruning_infos else None,
+    }

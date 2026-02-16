@@ -35,6 +35,7 @@ class CrossAttentionPruner(nn.Module):
         n_queries: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
+        query_dropout: float = 0.0,  # Query-wise dropout
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的阈值，用于训练第三阶段和推理
         use_question_condition: bool = False,  # 是否使用 question embedding 条件化
@@ -48,13 +49,17 @@ class CrossAttentionPruner(nn.Module):
         self.use_gumbel_noise = use_gumbel_noise
         self.pruning_threshold = pruning_threshold
         self.use_question_condition = use_question_condition
+        self.query_dropout = query_dropout
 
         # 可学习的 pruning queries (多个 query 学习不同的重要性模式)
         self.pruning_queries = nn.Parameter(torch.randn(1, n_queries, d_internal) * 0.02)
 
         # Question embedding projection (用于条件化 pruning queries)
         if use_question_condition:
-            self.question_proj = nn.Linear(d_model, d_internal)
+            self.question_proj = nn.Sequential(
+                nn.Linear(d_model, d_internal),
+                nn.LayerNorm(d_internal)
+            )
         else:
             self.question_proj = None
 
@@ -96,8 +101,8 @@ class CrossAttentionPruner(nn.Module):
 
         # Question projection: 小权重初始化
         if self.question_proj is not None:
-            nn.init.xavier_uniform_(self.question_proj.weight, gain=0.1)
-            nn.init.zeros_(self.question_proj.bias)
+            nn.init.xavier_uniform_(self.question_proj[0].weight, gain=0.1)
+            nn.init.zeros_(self.question_proj[0].bias)
 
         # Token scorer 最后一层零初始化，让初始输出接近 0
         nn.init.zeros_(self.token_scorer[-1].weight)
@@ -203,6 +208,11 @@ class CrossAttentionPruner(nn.Module):
             need_weights=True,
             average_attn_weights=True  # 对 heads 取平均
         )
+
+        # Query-wise dropout: 随机屏蔽某些 queries 的贡献
+        if self.training and self.query_dropout > 0:
+            query_mask = (torch.rand(batch_size, self.n_queries, 1, device=attn_weights.device) > self.query_dropout).to(attn_weights.dtype)
+            attn_weights = attn_weights * query_mask / (1 - self.query_dropout)
 
         # 4. Aggregate attention weights from multiple queries
         # (batch, n_queries, n_vision) -> (batch, n_vision, n_queries) -> (batch, n_vision, 1)
@@ -376,6 +386,7 @@ class LayerPrunerManager(nn.Module):
         n_queries: Pruning queries 数量
         temperature: 初始温度
         dropout: Dropout 比例
+        query_dropout: Query-wise dropout 比例
         use_gumbel_noise: 是否使用 Gumbel noise（False 则使用纯 STE）
         use_question_condition: 是否使用 question embedding 条件化
     """
@@ -389,6 +400,7 @@ class LayerPrunerManager(nn.Module):
         n_queries: int = 4,
         temperature: float = 1.0,
         dropout: float = 0.1,
+        query_dropout: float = 0.0,
         use_gumbel_noise: bool = True,
         pruning_threshold: float = 0.5,
         use_question_condition: bool = False,
@@ -407,6 +419,7 @@ class LayerPrunerManager(nn.Module):
                 n_queries=n_queries,
                 temperature=temperature,
                 dropout=dropout,
+                query_dropout=query_dropout,
                 use_gumbel_noise=use_gumbel_noise,
                 pruning_threshold=pruning_threshold,
                 use_question_condition=use_question_condition,

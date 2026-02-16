@@ -12,34 +12,29 @@
 
 ## 核心特性
 
-- **Gumbel-Sigmoid 三阶段混合训练**：解决训练/推理不一致问题
+- **Gumbel-Sigmoid 两阶段混合训练**：探索期温度退火 + 稳定期低温训练
 - **基于 GAN 的对抗训练**：Discriminator 确保剪枝后的表示保持质量
 - **Cross-Attention Pruner**：使用可学习 queries 评估 vision tokens 重要性
 - **Layer-wise Pruning**：在 LLM 内部多层进行渐进式剪枝
 - **Lightweight Adapter**：Mask-Aware FiLM adapter 补偿剪枝信息损失
 
-## Gumbel-Sigmoid 三阶段混合训练策略
-
-解决 Gumbel-Softmax 训练与推理不一致的问题。
+## Gumbel-Sigmoid 两阶段混合训练策略
 
 ### 配置
 
 ```yaml
 gumbel_mode: "hybrid"  # "always" | "never" | "hybrid"
 
-# 三阶段配置
-hybrid_phase1_end: 0.5      # 探索期结束点
-hybrid_phase2_end: 0.8      # 稳定期结束点
+# 两阶段配置
+hybrid_phase1_end: 0.6      # 探索期结束点
 hybrid_phase1_temp_start: 1.5
-hybrid_phase1_temp_end: 0.1
-hybrid_phase3_temp: 0.1
+hybrid_phase1_temp_end: 0.3
 ```
 
-### 三阶段说明
+### 两阶段说明
 
-1. **阶段1 探索期** (0% - 50%): 温度从 1.5 退火到 0.1，使用 Gumbel noise，探索哪些 token 重要
-2. **阶段2 稳定期** (50% - 80%): 温度保持 0.1，继续使用 Gumbel noise，精细化决策边界
-3. **阶段3 确定性微调期** (80% - 100%): 关闭 noise，训练逻辑 = 推理逻辑 (`logits > 0`)
+1. **阶段1 探索期** (0% - 60%): 温度从 1.5 退火到 0.3，使用 Gumbel noise，探索哪些 token 重要
+2. **阶段2 稳定期** (60% - 100%): 温度保持 0.3，继续使用 Gumbel noise，精细化决策边界
 
 ### 推理逻辑
 
@@ -132,13 +127,13 @@ torchrun --nproc_per_node=4 eval_acp_ddp.py --config configs/vision_token_prunin
 
 日志输出示例：
 ```
-Step 400 [Phase 3]: task_loss=1.23, adv_loss=0.45, sparsity_loss=0.02 (temp=0.10, noise=OFF)
+Step 400 [Phase 2]: task_loss=1.23, adv_loss=0.45, sparsity_loss=0.02 (temp=0.30, noise=ON)
   Kept ratio: 22.15% (target: 22.22%) [L4=18.30%, L10=19.62%, L16=8.88%]
   Infer ratio (x>0): [L4=18.30%, L10=19.62%, L16=8.88%]
   Disc acc: 73.81% [L4=86%, L10=93%, L16=43%]
 ```
 
-- `[Phase N]`: 当前训练阶段（hybrid 模式）
+- `[Phase N]`: 当前训练阶段（hybrid 模式，1=探索期，2=稳定期）
 - `noise=ON/OFF`: 是否使用 Gumbel noise
 - `Kept ratio`: 训练时累积保留率
-- `Infer ratio`: 推理时累积保留率（Phase 3 时应与 Kept ratio 一致）
+- `Infer ratio`: 推理时累积保留率

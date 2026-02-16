@@ -104,6 +104,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruner_d_internal: int = 128,
         pruner_n_heads: int = 4,
         pruner_n_queries: int = 4,
+        pruner_query_dropout: float = 0.0,  # Query-wise dropout
         disc_d_hidden: int = 256,
         adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
         adapter_type: str = 'lightweight',    # adapter 类型: 'simple' 或 'lightweight'
@@ -114,6 +115,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         mask_encoder_type: str = 'attention',  # mask encoder 类型: 'attention' 或 'linear'
         temperature: float = 1.0,
         dropout: float = 0.1,
+        adapter_dropout: float = 0.15,  # Adapter 专用 dropout
         disc_use_spectral_norm: bool = False,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的剪枝阈值
@@ -142,6 +144,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             n_queries=pruner_n_queries,
             temperature=temperature,
             dropout=dropout,
+            query_dropout=pruner_query_dropout,
             use_gumbel_noise=use_gumbel_noise,
             pruning_threshold=pruning_threshold,
             use_question_condition=use_question_condition,
@@ -167,7 +170,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 text_bottleneck_dim=text_adapter_bottleneck,
                 answer_bottleneck_dim=generator_adapter_bottleneck,
                 n_vision=576,
-                dropout=dropout,
+                dropout=adapter_dropout,
                 mask_encoder_type=mask_encoder_type,
             )
             self.adapter_manager = None
@@ -179,6 +182,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 adapter_type=adapter_type,
                 n_vision=576,  # LLaVA 1.5 的 vision token 数量
                 mask_encoder_type=mask_encoder_type,
+                dropout=adapter_dropout,
             )
             self.separated_adapter_manager = None
 
