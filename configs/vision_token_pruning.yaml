@@ -151,6 +151,9 @@ method_settings:
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
   eval_temperature: 0.3
+  # 评估时的剪枝阈值（sigmoid 后的阈值，默认 0.5）
+  # 降低阈值会保留更多 token，提高阈值会剪掉更多 token
+  eval_pruning_threshold: 0.5
 
   # ==================== 损失权重 ====================
   # task_loss: Cross entropy on answer tokens

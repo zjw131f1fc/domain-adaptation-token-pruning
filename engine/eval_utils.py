@@ -43,10 +43,12 @@ def evaluate(
     """
     model.eval()
 
-    # 设置评估时的温度
+    # 设置评估时的温度和阈值
     method_cfg = config.method_settings
     eval_temp = method_cfg.get('eval_temperature', method_cfg.get('temperature_min', 0.1))
+    eval_threshold = method_cfg.get('eval_pruning_threshold', 0.5)  # 评估时的剪枝阈值
     model.set_temperature(eval_temp)
+    model.set_pruning_threshold(eval_threshold)
     model.set_use_gumbel_noise(False)  # 评估时不使用 Gumbel noise
 
     # 获取 max_length 配置
