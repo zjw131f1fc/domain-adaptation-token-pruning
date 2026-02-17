@@ -92,7 +92,7 @@ method_settings:
   hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
   hybrid_phase2_end: 0.9    # 稳定期结束点，之后进入对齐期（关闭 noise）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
-  hybrid_phase1_temp_end: 0.3     # 探索期结束温度（也是稳定期和对齐期温度）
+  hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期和对齐期温度）
 
   # ==================== Discriminator 配置 ====================
   disc_d_d: 512
@@ -152,7 +152,7 @@ method_settings:
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
-  eval_temperature: 0.3
+  eval_temperature: 0.1
   # 评估时的剪枝阈值（sigmoid 后的阈值，默认 0.5）
   # 降低阈值会保留更多 token，提高阈值会剪掉更多 token
   eval_pruning_threshold: 0.5

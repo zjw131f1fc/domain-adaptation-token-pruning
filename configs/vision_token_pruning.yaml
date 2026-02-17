@@ -92,7 +92,7 @@ method_settings:
   hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
   hybrid_phase2_end: 0.9    # 稳定期结束点，之后进入对齐期（关闭 noise）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
-  hybrid_phase1_temp_end: 0.3     # 探索期结束温度（也是稳定期和对齐期温度）
+  hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期和对齐期温度）
 
   # ==================== Discriminator 配置 ====================
   disc_d_d: 512
@@ -135,7 +135,7 @@ method_settings:
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 192  # 目标保留的 vision token 数量
+  target_token_num: 128  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
@@ -152,7 +152,7 @@ method_settings:
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
-  eval_temperature: 0.3
+  eval_temperature: 0.1
   # 评估时的剪枝阈值（sigmoid 后的阈值，默认 0.5）
   # 降低阈值会保留更多 token，提高阈值会剪掉更多 token
   eval_pruning_threshold: 0.5
