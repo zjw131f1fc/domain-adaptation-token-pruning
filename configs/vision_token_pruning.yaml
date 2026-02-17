@@ -49,7 +49,7 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: 100000
-    test: 400
+    test: 5000
   fast_load_no_random: false
   category_priority:
     enable: false
