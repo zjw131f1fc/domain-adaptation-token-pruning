@@ -73,9 +73,9 @@ class MMBenchPreparer(BasePreparer):
         # 保存 HuggingFace dataset 引用用于延迟加载
         self._hf_datasets: Dict[Tuple[str, str], Any] = {}
 
-    # --- 预拆分加载：dev -> train, test -> test ---
-    def _load_dev(self) -> List[Dict[str, Any]]:
-        # 原实现中使用 test split，这里改为 dev split 作为训练集合
+    # --- 从 dev split 加载所有数据，然后随机拆分 ---
+    def _load_all(self) -> List[Dict[str, Any]]:
+        """加载 dev split 的所有数据（cn + en）"""
         subsets = ['cn', 'en']
         merged: List[Dict[str, Any]] = []
         for sub in subsets:
@@ -108,63 +108,95 @@ class MMBenchPreparer(BasePreparer):
                 })
         return merged
 
-    def _load_test(self) -> List[Dict[str, Any]]:
-        # test split: 不保证有答案? 数据集中 answer 字段仍存在 (保持评估一致)
-        subsets = ['cn', 'en']
-        merged: List[Dict[str, Any]] = []
-        for sub in subsets:
-            ds = load_dataset("lmms-lab/MMBench", sub, split="test")
-            self._hf_datasets[(sub, 'test')] = ds  # 保存引用
-            for i in range(len(ds)):
-                item = ds[i]
-                base_cat = item['category']
-                new_cat = f"{base_cat}-{sub}" if base_cat is not None else sub
-                q_raw = item['question']
-                opt_lines = [
-                    f"A. {item['A']}",
-                    f"B. {item['B']}",
-                    f"C. {item['C']}",
-                    f"D. {item['D']}",
-                ]
-                instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
-                full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
-                merged.append({
-                    'image': (sub, 'test', i),  # 存储 (subset, split, index) 而非图像
-                    'question': full_q,
-                    'A': item['A'],
-                    'B': item['B'],
-                    'C': item['C'],
-                    'D': item['D'],
-                    'answer': item['answer'],
-                    'category': new_cat,
-                    'raw_question': q_raw,
-                    'subset': sub,
-                })
-        return merged
-
-    def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
-        data: Dict[str, List[Dict[str, Any]]] = {}
-        # dev -> train 永远加载
-        data['train'] = self._load_dev()
-        # test 若在 split 配置中出现则加载
-        if 'test' in self.split_cfg:
-            data['test'] = self._load_test()
-        return data
+    # # --- 原预拆分加载代码（已弃用）---
+    # def _load_dev(self) -> List[Dict[str, Any]]:
+    #     # 原实现中使用 test split，这里改为 dev split 作为训练集合
+    #     subsets = ['cn', 'en']
+    #     merged: List[Dict[str, Any]] = []
+    #     for sub in subsets:
+    #         ds = load_dataset("lmms-lab/MMBench", sub, split="dev")
+    #         self._hf_datasets[(sub, 'dev')] = ds  # 保存引用
+    #         for i in range(len(ds)):
+    #             item = ds[i]
+    #             base_cat = item['category']
+    #             new_cat = f"{base_cat}-{sub}" if base_cat is not None else sub
+    #             q_raw = item['question']
+    #             opt_lines = [
+    #                 f"A. {item['A']}",
+    #                 f"B. {item['B']}",
+    #                 f"C. {item['C']}",
+    #                 f"D. {item['D']}",
+    #             ]
+    #             instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
+    #             full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
+    #             merged.append({
+    #                 'image': (sub, 'dev', i),  # 存储 (subset, split, index) 而非图像
+    #                 'question': full_q,
+    #                 'A': item['A'],
+    #                 'B': item['B'],
+    #                 'C': item['C'],
+    #                 'D': item['D'],
+    #                 'answer': item['answer'],
+    #                 'category': new_cat,
+    #                 'raw_question': q_raw,
+    #                 'subset': sub,
+    #             })
+    #     return merged
+    #
+    # def _load_test(self) -> List[Dict[str, Any]]:
+    #     # test split: 不保证有答案? 数据集中 answer 字段仍存在 (保持评估一致)
+    #     subsets = ['cn', 'en']
+    #     merged: List[Dict[str, Any]] = []
+    #     for sub in subsets:
+    #         ds = load_dataset("lmms-lab/MMBench", sub, split="test")
+    #         self._hf_datasets[(sub, 'test')] = ds  # 保存引用
+    #         for i in range(len(ds)):
+    #             item = ds[i]
+    #             base_cat = item['category']
+    #             new_cat = f"{base_cat}-{sub}" if base_cat is not None else sub
+    #             q_raw = item['question']
+    #             opt_lines = [
+    #                 f"A. {item['A']}",
+    #                 f"B. {item['B']}",
+    #                 f"C. {item['C']}",
+    #                 f"D. {item['D']}",
+    #             ]
+    #             instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
+    #             full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
+    #             merged.append({
+    #                 'image': (sub, 'test', i),  # 存储 (subset, split, index) 而非图像
+    #                 'question': full_q,
+    #                 'A': item['A'],
+    #                 'B': item['B'],
+    #                 'C': item['C'],
+    #                 'D': item['D'],
+    #                 'answer': item['answer'],
+    #                 'category': new_cat,
+    #                 'raw_question': q_raw,
+    #                 'subset': sub,
+    #             })
+    #     return merged
+    #
+    # def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
+    #     data: Dict[str, List[Dict[str, Any]]] = {}
+    #     # dev -> train 永远加载
+    #     data['train'] = self._load_dev()
+    #     # test 若在 split 配置中出现则加载
+    #     if 'test' in self.split_cfg:
+    #         data['test'] = self._load_test()
+    #     return data
 
     def get(self) -> Dict[str, Any]:
-        presplits = self._load_presplits()
-        # 汇总所有样本用于统计
-        all_samples: List[Dict[str, Any]] = []
-        for lst in presplits.values():
-            all_samples.extend(lst)
-        self.detect_category(all_samples)
-        applied_map = self.apply_field_map(all_samples)
-        base_splits, placeholder = self.split_from_presplits(presplits)
+        samples = self._load_all()
+        self.detect_category(samples)
+        applied_map = self.apply_field_map(samples)
+        # 使用 split_from_single 从单一列表随机拆分（仿照 POPE/MME）
+        base_splits, placeholder = self.split_from_single(samples)
         # 转换为 MMBDataset（支持延迟加载）
         splits: Dict[str, MMBDataset] = {}
         for name, ds in base_splits.items():
             splits[name] = MMBDataset(ds.samples, self._hf_datasets)
-        meta = self.build_meta(all_samples, splits, applied_map, placeholder)
+        meta = self.build_meta(samples, splits, applied_map, placeholder)
         judge = self._build_judge(meta, splits) if meta['total'] > 0 else self._build_judge_placeholder(meta)
         bundle = {'splits': splits, 'meta': meta, 'judge': judge}
         if True:
@@ -178,7 +210,7 @@ class MMBenchPreparer(BasePreparer):
         if logger is None:
             return
         self.base_report(meta)
-        logger.info('[MMB] Presplit: True (dev/test 原始多子集)')
+        logger.info('[MMB] Presplit: False (单列表随机拆分，仅使用 dev split)')
         if meta['has_category']:
             total_cat: Dict[Any, int] = {}
             for ds in splits.values():
