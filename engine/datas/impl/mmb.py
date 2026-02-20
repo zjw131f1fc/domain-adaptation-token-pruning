@@ -86,6 +86,14 @@ class MMBenchPreparer(BasePreparer):
                 base_cat = item['category']
                 new_cat = f"{base_cat}-{sub}" if base_cat is not None else sub
                 q_raw = item['question']
+                answer = item['answer']
+
+                # 过滤问题或答案为空的样本
+                if not q_raw or not str(q_raw).strip():
+                    continue
+                if not answer or not str(answer).strip():
+                    continue
+
                 opt_lines = [
                     f"A. {item['A']}",
                     f"B. {item['B']}",
@@ -101,7 +109,7 @@ class MMBenchPreparer(BasePreparer):
                     'B': item['B'],
                     'C': item['C'],
                     'D': item['D'],
-                    'answer': item['answer'],
+                    'answer': answer,
                     'category': new_cat,
                     'raw_question': q_raw,
                     'subset': sub,
@@ -256,13 +264,13 @@ class MMBenchPreparer(BasePreparer):
 
         # 创建MMBench提交文件
         backbone_name = self._sanitize_name(self.config.backbone_settings['name'])
-        dataset_name = self._sanitize_name(self.config.dataset_settings['dataset_name'])
+        dataset_name = self._sanitize_name(self.config.dataset_settings['name'])
         timestamp = getattr(self.config, 'timestamp', 'unknown')
         # 获取当前evaluate mode (此时已经是单个mode字符串，不是列表)
         eval_mode = self.config.evaluation_settings['eval_mode']
         eval_mode_name = self._sanitize_name(str(eval_mode))
         # 提交文件放置到按数据集分层的日志目录下: logs/<dataset_name>/
-        log_root = self.config.file_settings['log_dir']
+        log_root = self.config.global_settings['log_dir']
         dataset_log_dir = os.path.join(log_root, dataset_name)
         if not os.path.exists(dataset_log_dir):
             os.makedirs(dataset_log_dir, exist_ok=True)

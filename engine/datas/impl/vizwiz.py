@@ -1,15 +1,14 @@
 """VizWiz 数据集准备器
 
 目标:
-  - 从 HuggingFace Multimodal-Fatima/VizWiz 加载
-  - train 用于训练，validation 用于评估
+  - 从 HuggingFace lmms-lab/VizWiz-VQA 加载
+  - 使用 val split，按单数据集方式划分 train/test
   - 评估方式与 VQA v2 一致
 
 数据结构:
   - image: PIL.Image
   - question: str
   - answers: List[str]
-  - answer_type: str (可作为 category)
 
 性能优化:
   - 延迟图像加载: 加载阶段只存储索引，访问时才加载图像
@@ -18,15 +17,16 @@
 from typing import List, Dict, Any, Union
 from collections import Counter
 from ..base import BasePreparer, BsesDataset
-from datasets import load_dataset  # type: ignore
+from datasets import load_dataset as hf_load_dataset  # type: ignore
+from tqdm import tqdm
 
 
 class VizWizDataset(BsesDataset):
     """VizWiz 数据集，支持延迟图像加载"""
 
-    def __init__(self, samples: List[Dict[str, Any]], hf_datasets: Dict[str, Any] = None):
+    def __init__(self, samples: List[Dict[str, Any]], hf_dataset=None):
         super().__init__(samples)
-        self._hf_datasets = hf_datasets or {}
+        self._hf_dataset = hf_dataset
 
     def __getitem__(self, idx: Union[int, slice]) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         """延迟加载：返回样本时才加载图像"""
@@ -36,11 +36,10 @@ class VizWizDataset(BsesDataset):
 
         sample = self.samples[idx].copy()
 
-        # 如果 image 字段是 (split, index) 元组，则延迟加载
-        if isinstance(sample.get('image'), tuple) and self._hf_datasets:
-            split_name, hf_idx = sample['image']
-            if split_name in self._hf_datasets:
-                sample['image'] = self._hf_datasets[split_name][hf_idx]['image']
+        # 如果 image 字段是 int 索引，则延迟加载
+        if isinstance(sample.get('image'), int) and self._hf_dataset is not None:
+            hf_idx = sample['image']
+            sample['image'] = self._hf_dataset[hf_idx]['image']
 
         return sample
 
@@ -49,10 +48,9 @@ class VizWizPreparer(BasePreparer):
     def __init__(self, config):
         super().__init__(config)
         ds_cfg = self.config.dataset_settings
-        # 使用 answer_type 作为类别
-        self.use_category = ds_cfg.get('use_category', True)
+        self.use_category = ds_cfg.get('use_category', False)
         self.has_category = self.use_category
-        self._hf_datasets: Dict[str, Any] = {}
+        self._hf_dataset = None
 
     def _get_most_common_answer(self, answers: List[str]) -> str:
         """从答案列表中选择最常见的答案"""
@@ -61,16 +59,15 @@ class VizWizPreparer(BasePreparer):
         counter = Counter(answers)
         return counter.most_common(1)[0][0]
 
-    def _load_train(self) -> List[Dict[str, Any]]:
-        """加载 train 数据"""
-        ds = load_dataset("Multimodal-Fatima/VizWiz", split="train")
-        self._hf_datasets['train'] = ds
+    def _load_all(self) -> List[Dict[str, Any]]:
+        """从 val split 加载所有数据"""
+        ds = hf_load_dataset("lmms-lab/VizWiz-VQA", split="val")
+        self._hf_dataset = ds
         samples: List[Dict[str, Any]] = []
 
-        for i in range(len(ds)):
+        for i in tqdm(range(len(ds)), desc="VizWiz val", dynamic_ncols=True):
             item = ds[i]
             answers = item['answers']
-            answer_type = item.get('answer_type', 'unknown')
 
             # 选择最常见答案作为训练答案
             train_answer = self._get_most_common_answer(answers)
@@ -83,73 +80,32 @@ class VizWizPreparer(BasePreparer):
             question_with_prompt = f"{question} Answer the question using a single word or phrase."
 
             sample = {
-                'image': ('train', i),
+                'image': i,  # 存储索引，延迟加载
                 'question': question_with_prompt,
                 'answers': answers,
                 'answer': train_answer,
             }
-            if self.use_category:
-                sample['category'] = answer_type
             samples.append(sample)
 
         return samples
-
-    def _load_val_as_test(self) -> List[Dict[str, Any]]:
-        """加载 validation 数据作为测试集"""
-        ds = load_dataset("Multimodal-Fatima/VizWiz", split="validation")
-        self._hf_datasets['test'] = ds
-        samples: List[Dict[str, Any]] = []
-
-        for i in range(len(ds)):
-            item = ds[i]
-            answers = item['answers']
-            answer_type = item.get('answer_type', 'unknown')
-
-            train_answer = self._get_most_common_answer(answers)
-
-            question = item['question']
-            question_with_prompt = f"{question} Answer the question using a single word or phrase."
-
-            sample = {
-                'image': ('test', i),
-                'question': question_with_prompt,
-                'answers': answers,
-                'answer': train_answer if train_answer else 'unanswerable',
-            }
-            if self.use_category:
-                sample['category'] = answer_type
-            samples.append(sample)
-
-        return samples
-
-    def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
-        """加载预拆分的数据"""
-        data: Dict[str, List[Dict[str, Any]]] = {}
-        data['train'] = self._load_train()
-        if 'test' in self.split_cfg:
-            data['test'] = self._load_val_as_test()
-        return data
 
     def get(self) -> Dict[str, Any]:
-        presplits = self._load_presplits()
-
-        all_samples: List[Dict[str, Any]] = []
-        for lst in presplits.values():
-            all_samples.extend(lst)
+        all_samples = self._load_all()
 
         self.detect_category(all_samples)
         applied_map = self.apply_field_map(all_samples)
-        base_splits, placeholder = self.split_from_presplits(presplits)
+        splits, placeholder = self.split_from_single(all_samples)
 
-        splits: Dict[str, VizWizDataset] = {}
-        for name, ds in base_splits.items():
-            splits[name] = VizWizDataset(ds.samples, self._hf_datasets)
+        # 转换为 VizWizDataset（支持延迟加载）
+        viz_splits: Dict[str, VizWizDataset] = {}
+        for name, ds in splits.items():
+            viz_splits[name] = VizWizDataset(ds.samples, self._hf_dataset)
 
         meta = self.build_meta(all_samples, splits, applied_map, placeholder)
         judge = self._build_judge()
 
         bundle = {
-            'splits': splits,
+            'splits': viz_splits,
             'meta': meta,
             'judge': judge,
         }
@@ -158,24 +114,13 @@ class VizWizPreparer(BasePreparer):
 
     def print_report(self, prepared: Dict[str, Any]):
         meta = prepared['meta']
-        splits = prepared['splits']
         logger = getattr(self.config, 'logger', None)
         if logger is None:
             return
 
         self.base_report(meta)
-        logger.info('[VizWiz] Presplit: True (train训练，validation评估)')
+        logger.info('[VizWiz] Source: lmms-lab/VizWiz-VQA (val split)')
         logger.info(f"[VizWiz] Loaded Samples: {meta['total']}")
-
-        if self.use_category and meta['has_category']:
-            cat_stat: Dict[Any, int] = {}
-            for ds in splits.values():
-                for i in range(len(ds)):
-                    c = ds.samples[i].get('category', 'unknown')
-                    cat_stat[c] = cat_stat.get(c, 0) + 1
-            logger.info("[VizWiz] Category Distribution: " + ", ".join(
-                f"{c}:{n}" for c, n in sorted(cat_stat.items(), key=lambda x: (-x[1], str(x[0])))
-            ))
 
     def _build_judge(self):
         """构建 judge 函数 - 与 VQA v2 评估方式一致"""
