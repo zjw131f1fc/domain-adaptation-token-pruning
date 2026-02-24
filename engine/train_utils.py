@@ -187,35 +187,64 @@ def train_step(
     losses['task_loss'] = task_loss
     stats['raw_task_loss'] = task_loss.item()
 
-    # 2. 如果有剪枝信息，计算 GAN 相关 losses
+    # 2. 如果有剪枝信息，计算对抗损失（Discriminator 或 MSE）
     if output.pruning_infos and len(output.pruning_infos) > 0:
         h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
         h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
-
-        loss_type = method_cfg.get('disc_loss_type', 'bce')
-        gp_weight = method_cfg.get('disc_gp_weight', 10.0)
 
         warmup_ratio = method_cfg.get('pruner_warmup_ratio', 0.0)
         in_warmup = current_step < total_steps * warmup_ratio
         gan_weight = 0.0 if in_warmup else 1.0
         stats['in_warmup'] = in_warmup
 
-        # 获取 disc_manager（可能被 DDP 包装）
-        disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
+        # 获取对抗模式
+        adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
 
-        adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
-        losses['adv_loss'] = adv_loss * gan_weight
-        stats['raw_adv_loss'] = adv_loss.item()
+        if adversarial_mode == 'mse':
+            # === MSE 模式：直接约束 h_real 和 h_fake 的一致性 ===
+            mse_loss_total = torch.tensor(0.0, device=device)
+            n_samples = 0
+            for layer_idx in h_real_dict:
+                h_real_list = h_real_dict[layer_idx]
+                h_fake_list = h_fake_dict[layer_idx]
+                # 逐样本计算 MSE
+                for h_real, h_fake in zip(h_real_list, h_fake_list):
+                    # h_real, h_fake: (heads, n_ans, head_dim)
+                    mse_loss_total = mse_loss_total + F.mse_loss(h_fake, h_real)
+                n_samples = len(h_real_list)
 
-        disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
-        losses['disc_loss'] = disc_loss * gan_weight
-        stats['raw_disc_loss'] = disc_loss.item()
+            # 除以样本数和层数
+            n_layers = len(h_real_dict)
+            mse_loss = mse_loss_total / (n_samples * n_layers)
+            losses['adv_loss'] = mse_loss * gan_weight
+            stats['raw_adv_loss'] = mse_loss.item()
+            stats['adversarial_mode'] = 'mse'
 
-        acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
-        stats['disc_accuracy'] = acc_info['overall']
-        stats['disc_real_acc'] = acc_info['real_acc']
-        stats['disc_fake_acc'] = acc_info['fake_acc']
-        stats['disc_per_layer'] = acc_info['per_layer']
+            # MSE 模式下没有判别器损失
+            losses['disc_loss'] = torch.tensor(0.0, device=device)
+            stats['raw_disc_loss'] = 0.0
+        else:
+            # === Discriminator 模式：使用判别器进行对抗训练 ===
+            loss_type = method_cfg.get('disc_loss_type', 'bce')
+            gp_weight = method_cfg.get('disc_gp_weight', 10.0)
+
+            # 获取 disc_manager（可能被 DDP 包装）
+            disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
+
+            adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
+            losses['adv_loss'] = adv_loss * gan_weight
+            stats['raw_adv_loss'] = adv_loss.item()
+
+            disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
+            losses['disc_loss'] = disc_loss * gan_weight
+            stats['raw_disc_loss'] = disc_loss.item()
+
+            acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
+            stats['disc_accuracy'] = acc_info['overall']
+            stats['disc_real_acc'] = acc_info['real_acc']
+            stats['disc_fake_acc'] = acc_info['fake_acc']
+            stats['disc_per_layer'] = acc_info['per_layer']
+            stats['adversarial_mode'] = 'discriminator'
 
         # Sparsity Loss
         target_token_num = method_cfg.get('target_token_num', 144)

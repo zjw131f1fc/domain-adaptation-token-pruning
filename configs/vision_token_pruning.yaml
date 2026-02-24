@@ -19,9 +19,9 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 1  # 64: 3 128 192 :4
+    batch_size: 4  # 64: 3 128 192 :4
     # gradient_accumulation_steps: 4  # 梯度累积步数，有效 batch_size = batch_size * world_size * accumulation_steps   # 3 * 4 * 2   2 * 3 * 4
-    gradient_accumulation_steps: 6
+    gradient_accumulation_steps: 2
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -58,13 +58,13 @@ dataset_settings:
       - {test: 'mean'}   # 测试集保持原始比例
 
 backbone_settings:
-  name: "llava-1.5-13b"
+  name: "llava-1.5-7b"
 
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
   # pruning_layers: [1,13,25]
-  pruning_layers: [10,22,35]
+  pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -95,6 +95,11 @@ method_settings:
   hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期和对齐期温度）
 
   # ==================== Discriminator 配置 ====================
+  # 对抗损失模式：
+  # - "discriminator": 使用判别器进行对抗训练（默认）
+  # - "mse": 使用 MSE 损失直接约束 h_real 和 h_fake 的一致性
+  adversarial_mode: "mse"  # "discriminator" | "mse"
+
   disc_d_d: 512
   disc_dropout: 0.2
   disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）

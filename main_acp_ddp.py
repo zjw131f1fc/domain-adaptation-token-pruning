@@ -329,7 +329,13 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     from itertools import chain
     pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
     pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
-    disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
+
+    # 判别器优化器（仅在 discriminator 模式下创建）
+    adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
+    if adversarial_mode == 'discriminator':
+        disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
+    else:
+        disc_optimizer = None
 
     # 创建学习率调度器（余弦退火）
     # 计算总步数用于调度器
@@ -359,13 +365,14 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         else:
             pruner_scheduler = CosineAnnealingLR(pruner_optimizer, T_max=total_steps_for_scheduler, eta_min=pruner_lr * min_lr_ratio)
 
-        # Disc scheduler: warmup + cosine
-        if warmup_steps > 0:
-            disc_warmup = LinearLR(disc_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-            disc_cosine = CosineAnnealingLR(disc_optimizer, T_max=cosine_steps, eta_min=disc_lr * min_lr_ratio)
-            disc_scheduler = SequentialLR(disc_optimizer, schedulers=[disc_warmup, disc_cosine], milestones=[warmup_steps])
-        else:
-            disc_scheduler = CosineAnnealingLR(disc_optimizer, T_max=total_steps_for_scheduler, eta_min=disc_lr * min_lr_ratio)
+        # Disc scheduler: warmup + cosine (仅在 discriminator 模式下创建)
+        if disc_optimizer is not None:
+            if warmup_steps > 0:
+                disc_warmup = LinearLR(disc_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+                disc_cosine = CosineAnnealingLR(disc_optimizer, T_max=cosine_steps, eta_min=disc_lr * min_lr_ratio)
+                disc_scheduler = SequentialLR(disc_optimizer, schedulers=[disc_warmup, disc_cosine], milestones=[warmup_steps])
+            else:
+                disc_scheduler = CosineAnnealingLR(disc_optimizer, T_max=total_steps_for_scheduler, eta_min=disc_lr * min_lr_ratio)
 
         if is_main_process():
             logger.info(f"LR Scheduler: Cosine Annealing with warmup")
@@ -376,7 +383,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         from torch.optim.lr_scheduler import LinearLR
 
         pruner_scheduler = LinearLR(pruner_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
-        disc_scheduler = LinearLR(disc_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
+        if disc_optimizer is not None:
+            disc_scheduler = LinearLR(disc_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
 
         if is_main_process():
             logger.info(f"LR Scheduler: Linear Decay")
@@ -421,7 +429,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info("  Loaded pruner_optimizer state")
 
-            if 'disc_optimizer' in checkpoint:
+            if 'disc_optimizer' in checkpoint and disc_optimizer is not None:
                 disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
                 if is_main_process():
                     logger.info("  Loaded disc_optimizer state")
@@ -508,7 +516,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
         # 在 epoch 开始时清零梯度
         pruner_optimizer.zero_grad()
-        disc_optimizer.zero_grad()
+        if disc_optimizer is not None:
+            disc_optimizer.zero_grad()
 
         for batch in pbar:
             accum_step += 1
@@ -550,7 +559,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 # 同步梯度（关键步骤！）
                 sync_gradients(model)
 
-                if disc_has_grad:
+                if disc_has_grad and disc_optimizer is not None:
                     if grad_clip:
                         torch.nn.utils.clip_grad_norm_(model.get_discriminator_parameters(), grad_clip)
                     disc_optimizer.step()
@@ -562,7 +571,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 # 清零梯度，准备下一轮累积
                 pruner_optimizer.zero_grad()
-                disc_optimizer.zero_grad()
+                if disc_optimizer is not None:
+                    disc_optimizer.zero_grad()
 
                 # 学习率调度器步进（按优化器更新次数）
                 if pruner_scheduler is not None:
@@ -573,9 +583,9 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 # 更新 global_step（按优化器更新次数）
                 global_step += 1
 
-            # 判别器重新初始化（只在累积结束时）
+            # 判别器重新初始化（只在累积结束时，且仅在 discriminator 模式下）
             # 注意：需要在所有进程间同步决策，避免死锁
-            if not is_accum_step:
+            if not is_accum_step and adversarial_mode == 'discriminator':
                 disc_reinit_enable = method_cfg.get('disc_reinit_enable', True)
                 disc_reinit_mode = method_cfg.get('disc_reinit_mode', 'threshold')  # 'threshold' 或 'random'
                 disc_reinit_threshold = method_cfg.get('disc_reinit_threshold', 0.85)
@@ -646,7 +656,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             epoch_stats[k][layer_idx] = [0, 0]
                         epoch_stats[k][layer_idx][0] += real_acc
                         epoch_stats[k][layer_idx][1] += fake_acc
-                else:
+                elif isinstance(v, (int, float)):
+                    # 只累积数值类型的统计信息
                     epoch_stats[k] += v
             n_batches += 1
             global_batch += 1  # 每个 batch 都增加
@@ -784,8 +795,9 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     'pruner_state_dict': model.pruner_manager.state_dict(),
                     'disc_state_dict': model.disc_manager.state_dict(),
                     'pruner_optimizer': pruner_optimizer.state_dict(),
-                    'disc_optimizer': disc_optimizer.state_dict(),
                 }
+                if disc_optimizer is not None:
+                    ckpt_data['disc_optimizer'] = disc_optimizer.state_dict()
                 # 根据 adapter 类型保存
                 if model.use_separated_adapters:
                     ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()

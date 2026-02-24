@@ -119,6 +119,22 @@ hybrid_phase1_temp_end: 0.3
 
 ## 配置说明
 
+### 对抗训练模式
+
+支持两种对抗训练模式：
+
+1. **Discriminator 模式**（默认）：
+   - 使用判别器进行对抗训练
+   - 判别器学习区分 h_real 和 h_fake
+   - Pruner 和 Adapter 学习欺骗判别器
+   - 配置：`adversarial_mode: "discriminator"`
+
+2. **MSE 模式**：
+   - 直接使用 MSE 损失约束 h_real 和 h_fake 的一致性
+   - 不需要判别器，训练更简单
+   - 适合快速实验和消融研究
+   - 配置：`adversarial_mode: "mse"`
+
 ### 关键超参数
 
 ```yaml
