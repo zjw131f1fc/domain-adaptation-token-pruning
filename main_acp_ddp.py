@@ -56,13 +56,18 @@ from engine.eval_utils import evaluate
 # ============================================================
 
 def load_model(config, device: torch.device, local_rank: int):
-    """加载可剪枝的 LLaVA 模型（DDP 兼容版本）
+    """加载可剪枝的 MLLM 模型（DDP 兼容版本）
+
+    支持的模型类型：
+    - llava: LLaVA 1.5 7B/13B
+    - qwen2_vl: Qwen2-VL 2B/7B
 
     关键改动：
     1. 不使用 device_map='auto'，手动放置到指定 device
     2. 返回可训练模块列表用于 DDP 包装
+    3. 根据 backbone_settings.model_type 自动路由到对应模型
     """
-    from transformers import LlavaForConditionalGeneration, AutoProcessor
+    from transformers import AutoProcessor
 
     logger = config.logger if is_main_process() else None
     method_cfg = config.method_settings
@@ -118,26 +123,38 @@ def load_model(config, device: torch.device, local_rank: int):
     # 剪枝阈值（sigmoid 后的阈值，用于训练第三阶段和推理）
     pruning_threshold = method_cfg.get('pruning_threshold', 0.5)
 
-    # 模型路径
+    # 模型路径和类型
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
+    model_type = backbone_cfg.get('model_type', 'llava')  # 从配置加载器自动设置
+
     model_mapping = {
         'llava-1.5-7b': 'llava-hf/llava-1.5-7b-hf',
         'llava-1.5-13b': 'llava-hf/llava-1.5-13b-hf',
+        'qwen2-vl-2b': 'Qwen/Qwen2-VL-2B-Instruct',
+        'qwen2-vl-7b': 'Qwen/Qwen2-VL-7B-Instruct',
     }
     model_path = model_mapping.get(model_name, model_name)
 
     if logger:
-        logger.info(f"Loading base model from {model_path}...")
+        logger.info(f"Loading base model from {model_path} (type: {model_type})...")
 
-    # 加载基础模型 - 不使用 device_map='auto'
-    # 先加载到 CPU，然后手动移动到指定 device
-    base_model = LlavaForConditionalGeneration.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        # 不使用 device_map，让模型先加载到 CPU
-        device_map=None,
-        low_cpu_mem_usage=True,
-    )
+    # 根据模型类型加载不同的基础模型
+    if model_type == 'qwen2_vl':
+        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        base_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            device_map=None,
+            low_cpu_mem_usage=True,
+        )
+    else:  # llava
+        from transformers import LlavaForConditionalGeneration, AutoProcessor
+        base_model = LlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            device_map=None,
+            low_cpu_mem_usage=True,
+        )
 
     # 手动移动到指定设备
     base_model = base_model.to(device)
@@ -150,29 +167,51 @@ def load_model(config, device: torch.device, local_rank: int):
     # 将 processor 附加到模型
     base_model.processor = processor
 
-    # 创建可剪枝模型
-    from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
-
-    model = PrunableLlavaForConditionalGeneration(
-        base_model=base_model,
-        pruning_layers=pruning_layers,
-        pruner_d_internal=pruner_d_internal,
-        pruner_n_heads=pruner_n_heads,
-        pruner_query_dropout=pruner_query_dropout,
-        disc_d_hidden=disc_d_hidden,
-        adapter_bottleneck=adapter_bottleneck,
-        adapter_type=adapter_type,
-        use_separated_adapters=use_separated_adapters,
-        vision_adapter_bottleneck=vision_adapter_bottleneck,
-        text_adapter_bottleneck=text_adapter_bottleneck,
-        generator_adapter_bottleneck=generator_adapter_bottleneck,
-        temperature=temperature,
-        dropout=dropout,
-        adapter_dropout=adapter_dropout,
-        disc_use_spectral_norm=disc_spectral_norm,
-        use_gumbel_noise=use_gumbel_noise,
-        pruning_threshold=pruning_threshold,
-    )
+    # 创建可剪枝模型（根据模型类型选择）
+    if model_type == 'qwen2_vl':
+        from method.models.prunable_qwen2vl import PrunableQwen2VLForConditionalGeneration
+        model = PrunableQwen2VLForConditionalGeneration(
+            base_model=base_model,
+            pruning_layers=pruning_layers,
+            pruner_d_internal=pruner_d_internal,
+            pruner_n_heads=pruner_n_heads,
+            pruner_query_dropout=pruner_query_dropout,
+            disc_d_hidden=disc_d_hidden,
+            adapter_bottleneck=adapter_bottleneck,
+            adapter_type=adapter_type,
+            use_separated_adapters=use_separated_adapters,
+            vision_adapter_bottleneck=vision_adapter_bottleneck,
+            text_adapter_bottleneck=text_adapter_bottleneck,
+            generator_adapter_bottleneck=generator_adapter_bottleneck,
+            temperature=temperature,
+            dropout=dropout,
+            adapter_dropout=adapter_dropout,
+            disc_use_spectral_norm=disc_spectral_norm,
+            use_gumbel_noise=use_gumbel_noise,
+            pruning_threshold=pruning_threshold,
+        )
+    else:  # llava
+        from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
+        model = PrunableLlavaForConditionalGeneration(
+            base_model=base_model,
+            pruning_layers=pruning_layers,
+            pruner_d_internal=pruner_d_internal,
+            pruner_n_heads=pruner_n_heads,
+            pruner_query_dropout=pruner_query_dropout,
+            disc_d_hidden=disc_d_hidden,
+            adapter_bottleneck=adapter_bottleneck,
+            adapter_type=adapter_type,
+            use_separated_adapters=use_separated_adapters,
+            vision_adapter_bottleneck=vision_adapter_bottleneck,
+            text_adapter_bottleneck=text_adapter_bottleneck,
+            generator_adapter_bottleneck=generator_adapter_bottleneck,
+            temperature=temperature,
+            dropout=dropout,
+            adapter_dropout=adapter_dropout,
+            disc_use_spectral_norm=disc_spectral_norm,
+            use_gumbel_noise=use_gumbel_noise,
+            pruning_threshold=pruning_threshold,
+        )
 
     # 冻结基础模型
     model.freeze_base_model()

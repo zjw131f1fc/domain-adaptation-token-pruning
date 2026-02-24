@@ -40,32 +40,82 @@ hybrid_phase1_temp_end: 0.3
 
 ### 推理逻辑
 
-推理时始终使用 `mask = (logits > 0).float()`，这是 Gumbel-Sigmoid 的自然阈值（`sigmoid(0) = 0.5`）。
+推理时使用确定性阈值：`mask = (sigmoid(logits / temp) > 0.5).float()`，其中 temp 默认为 0.3（与阶段 3 一致）。这确保了训练和推理的完全对齐。
 
 ## 架构
 
+### 训练流程
+
+每个剪枝层的处理流程：
+
+1. **计算 Attention**：LayerNorm + Q/K/V 投影 + RoPE + Attention Weights（causal mask）
+2. **提取 Baseline**：question→vision attention 作为重要性的初始估计
+3. **Pruner 生成 Mask**：
+   - 输入：vision hidden states + q2v attention + 累积 mask
+   - 输出：当前层的剪枝决策（0/1 mask）
+4. **计算 h_real 和 h_fake**：
+   - `h_real`：完整 attention 聚合（无剪枝）
+   - `h_fake`：应用 current_mask 的 post-softmax masking + renormalize
+5. **Adapter 修正**：对 h_fake 应用轻量级 adapter 补偿信息损失
+6. **Discriminator 判别**：判断 h_real vs h_fake（answer 位置）
+7. **更新累积 Mask**：`new_cumulative_mask = old_cumulative_mask * current_mask`
+
 ### 核心组件
 
-```
-图像 → 视觉编码器 → 带剪枝层的 LLM → 输出（Fake）
-                         ↓
-          不带剪枝的 LLM → 输出（Real）
-                         ↓
-          Discriminator 判断 Real vs Fake
-```
-
 #### CrossAttentionPruner
-- 可学习的 pruning queries 通过 cross-attention 评估 vision tokens
-- 残差设计：`keep_logits = baseline + delta + bias`
-- `keep_bias` 初始化为 2.0，初始保留更多 token
+- **残差设计**：`keep_logits = baseline + delta + bias`
+  - `baseline`：question→vision attention（log 变换 + 中心化）
+  - `delta`：Pruner 学习的修正量
+    - Cross-attention：可学习 queries 评估 vision tokens
+    - Per-token score：MLP 评估单个 token 重要性
+  - `bias`：可学习偏置（初始化为 2.0，鼓励保留更多 token）
+- **Key Padding Mask**：使用累积 mask 屏蔽已被剪掉的 tokens
 
 #### LayerDiscriminator
-- 每个 answer token 独立判别
-- 支持谱归一化和随机重初始化
+- 每个 answer token 独立判别（per-token discrimination）
+- 支持谱归一化和随机重初始化（防止判别器过强）
+- 输入：(batch, num_heads, seq_len, head_dim) 的 attention output
 
 #### Lightweight Adapter
-- Mask-Aware FiLM adapter
-- 根据剪枝 pattern 动态调整
+- **Mask-Aware 设计**：根据累积 mask 动态调整
+- **分离式 Adapter**（可选）：
+  - Vision Adapter：处理 vision tokens
+  - Text Adapter：处理 question 和 answer tokens
+- 使用 FiLM (Feature-wise Linear Modulation) 机制
+
+### 训练 vs 推理
+
+**训练时**：
+- 使用 **post-softmax masking**（不做物理删除）
+- 序列长度保持不变（576 个 vision tokens）
+- 阶段 3 关闭 Gumbel noise，与推理对齐
+- 计算 h_real 和 h_fake 用于对抗训练
+
+**推理时**：
+- **Prefill 阶段**：
+  - 遍历所有层，在剪枝层计算 mask
+  - **物理删除**被剪掉的 vision tokens
+  - 更新 position_ids（保持原位置，不重新编号）
+  - 更新 KV cache（删除对应位置）
+- **Decode 阶段**：
+  - 使用 Prefill 阶段保存的 mask
+  - 在剪枝层应用 Adapter
+  - 逐 token 生成
+
+### 累积剪枝机制
+
+剪枝是**累积的**，后续层只能在前面层保留的 tokens 上继续剪枝：
+
+- **第一个剪枝层**（如 L4）：在所有 576 个 vision tokens 上决策
+- **后续剪枝层**（如 L14, L24）：只能在前面层保留的 tokens 上继续剪枝
+- **累积公式**：`new_cumulative_mask = old_cumulative_mask * current_mask`
+- **非剪枝层**：应用累积 mask 的 post-softmax masking，不做新的剪枝决策
+
+**示例**：
+- L4 保留 30% → 173 tokens
+- L14 在 173 tokens 上保留 70% → 121 tokens
+- L24 在 121 tokens 上保留 80% → 97 tokens
+- 最终保留率：97/576 ≈ 16.8%
 
 ## 配置说明
 

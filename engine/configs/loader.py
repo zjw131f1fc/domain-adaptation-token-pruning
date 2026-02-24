@@ -138,8 +138,10 @@ AUTO_NAME_FIELDS = [
 # ==================== 模型维度映射 ====================
 # 根据 backbone 名称自动设置 hidden_dim 和 vision_dim
 BACKBONE_DIM_MAP = {
-    "qwen-2.5-3b": {"hidden_dim": 2048, "vision_dim": 2048},
-    "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 1024},
+    "qwen2-vl-2b": {"hidden_dim": 1536, "vision_dim": 1536, "model_type": "qwen2_vl"},
+    "qwen2-vl-7b": {"hidden_dim": 3584, "vision_dim": 3584, "model_type": "qwen2_vl"},
+    "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 1024, "model_type": "llava"},
+    "llava-1.5-13b": {"hidden_dim": 5120, "vision_dim": 1024, "model_type": "llava"},
 }
 
 
@@ -428,9 +430,10 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     if backbone_name not in BACKBONE_DIM_MAP:
         raise ValueError(f"未知的 backbone 名称: {backbone_name}，支持的模型: {list(BACKBONE_DIM_MAP.keys())}")
     dim_config = BACKBONE_DIM_MAP[backbone_name]
-    # 将维度信息直接存到 backbone_settings
+    # 将维度信息和模型类型直接存到 backbone_settings
     config["backbone_settings"]["hidden_dim"] = dim_config["hidden_dim"]
     config["backbone_settings"]["vision_dim"] = dim_config["vision_dim"]
+    config["backbone_settings"]["model_type"] = dim_config.get("model_type", "llava")
     
     # 6. 生成 experiment_tag 和路径（如果不跳过）
     if not skip_auto_paths:
