@@ -109,6 +109,7 @@ def load_model(config, device: torch.device, local_rank: int):
         use_gumbel_noise = False
 
     # Adapter 配置
+    use_adapter = method_cfg.get('use_adapter', True)
     adapter_type = method_cfg.get('adapter_type', 'lightweight')
     adapter_bottleneck = method_cfg.get('adapter_bottleneck', None)
     adapter_dropout = method_cfg.get('adapter_dropout', 0.15)  # Adapter dropout
@@ -199,6 +200,7 @@ def load_model(config, device: torch.device, local_rank: int):
             pruner_n_heads=pruner_n_heads,
             pruner_query_dropout=pruner_query_dropout,
             disc_d_hidden=disc_d_hidden,
+            use_adapter=use_adapter,
             adapter_bottleneck=adapter_bottleneck,
             adapter_type=adapter_type,
             use_separated_adapters=use_separated_adapters,
@@ -408,12 +410,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info("  Loaded pruner_manager state")
 
-            if 'adapter_state_dict' in checkpoint and not model.use_separated_adapters:
+            if 'adapter_state_dict' in checkpoint and model.use_adapter and not model.use_separated_adapters:
                 model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
                 if is_main_process():
                     logger.info("  Loaded adapter_manager state")
 
-            if 'separated_adapter_state_dict' in checkpoint and model.use_separated_adapters:
+            if 'separated_adapter_state_dict' in checkpoint and model.use_adapter and model.use_separated_adapters:
                 model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
                 if is_main_process():
                     logger.info("  Loaded separated_adapter_manager state")
@@ -799,10 +801,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if disc_optimizer is not None:
                     ckpt_data['disc_optimizer'] = disc_optimizer.state_dict()
                 # 根据 adapter 类型保存
-                if model.use_separated_adapters:
-                    ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
-                else:
-                    ckpt_data['adapter_state_dict'] = model.adapter_manager.state_dict()
+                if model.use_adapter:
+                    if model.use_separated_adapters:
+                        ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
+                    else:
+                        ckpt_data['adapter_state_dict'] = model.adapter_manager.state_dict()
                 if pruner_scheduler is not None:
                     ckpt_data['pruner_scheduler'] = pruner_scheduler.state_dict()
                 if disc_scheduler is not None:
@@ -825,10 +828,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             'pruner_state_dict': model.pruner_manager.state_dict(),
             'disc_state_dict': model.disc_manager.state_dict(),
         }
-        if model.use_separated_adapters:
-            final_ckpt['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
-        else:
-            final_ckpt['adapter_state_dict'] = model.adapter_manager.state_dict()
+        if model.use_adapter:
+            if model.use_separated_adapters:
+                final_ckpt['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
+            else:
+                final_ckpt['adapter_state_dict'] = model.adapter_manager.state_dict()
         torch.save(final_ckpt, final_path)
         logger.info(f"Training completed. Final checkpoint saved to {final_path}")
 

@@ -76,12 +76,13 @@ hybrid_phase1_temp_end: 0.3
 - 支持谱归一化和随机重初始化（防止判别器过强）
 - 输入：(batch, num_heads, seq_len, head_dim) 的 attention output
 
-#### Lightweight Adapter
+#### Lightweight Adapter（可选）
 - **Mask-Aware 设计**：根据累积 mask 动态调整
 - **分离式 Adapter**（可选）：
   - Vision Adapter：处理 vision tokens
   - Text Adapter：处理 question 和 answer tokens
 - 使用 FiLM (Feature-wise Linear Modulation) 机制
+- **可完全关闭**：设置 `use_adapter: false` 可关闭 Adapter，只使用 Pruner
 
 ### 训练 vs 推理
 
