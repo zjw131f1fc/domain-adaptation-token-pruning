@@ -289,12 +289,14 @@ def main():
         if logger:
             logger.info(f"Pruning layers: {pruning_layers}")
 
-        # 加载数据集
+        # 加载数据集（评估时不过滤超长样本）
         if logger:
             logger.info("Loading dataset...")
         original_logger = config.logger
         if not is_main_process():
             config.logger = None
+        # 评估时保留所有样本，不过滤超长样本
+        config.dataset_settings['filter_long_samples'] = False
         from engine.datas.loader import load_dataset
         data_bundle = load_dataset(config)
         config.logger = original_logger

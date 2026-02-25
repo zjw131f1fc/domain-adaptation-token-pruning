@@ -437,21 +437,25 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     logger.info("  Loaded disc_optimizer state")
 
             # 加载学习率调度器状态
-            if 'pruner_scheduler' in checkpoint and pruner_scheduler is not None:
-                pruner_scheduler.load_state_dict(checkpoint['pruner_scheduler'])
-                if is_main_process():
-                    logger.info("  Loaded pruner_scheduler state")
+            reset_step = config.global_settings.get('reset_step_on_load', False)
+            if not reset_step:
+                if 'pruner_scheduler' in checkpoint and pruner_scheduler is not None:
+                    pruner_scheduler.load_state_dict(checkpoint['pruner_scheduler'])
+                    if is_main_process():
+                        logger.info("  Loaded pruner_scheduler state")
 
-            if 'disc_scheduler' in checkpoint and disc_scheduler is not None:
-                disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
-                if is_main_process():
-                    logger.info("  Loaded disc_scheduler state")
+                if 'disc_scheduler' in checkpoint and disc_scheduler is not None:
+                    disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
+                    if is_main_process():
+                        logger.info("  Loaded disc_scheduler state")
 
-            # 恢复训练步数
-            if 'step' in checkpoint:
+            # 恢复训练步数（如果 reset_step_on_load=True 则跳过）
+            if 'step' in checkpoint and not reset_step:
                 start_step = checkpoint['step']
                 if is_main_process():
                     logger.info(f"  Resuming from step {start_step}")
+            elif reset_step and is_main_process():
+                logger.info("  Step counter reset to 0 (reset_step_on_load=True)")
 
             # 重新广播模型参数确保一致性
             broadcast_model_params(model, src=0)

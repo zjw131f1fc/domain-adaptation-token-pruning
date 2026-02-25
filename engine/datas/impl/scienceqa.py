@@ -73,17 +73,50 @@ class ScienceQADataset(BsesDataset):
             if split_name in self._hf_datasets:
                 raw_img = self._hf_datasets[split_name][hf_idx]['image']
                 # 确保转换为 PIL Image（处理 dict 格式）
-                sample['image'] = _ensure_pil_image(raw_img)
+                pil_img = _ensure_pil_image(raw_img)
+                # 预先 resize 到 384x384，避免大图导致处理缓慢
+                if pil_img is not None:
+                    max_size = 384
+                    if max(pil_img.size) > max_size:
+                        pil_img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                sample['image'] = pil_img
 
         return sample
 
 
 class ScienceQAPreparer(BasePreparer):
+    # 序列长度阈值（超过此值的样本会被过滤）
+    # 576 vision tokens + 文本 tokens，总长度不超过此值
+    MAX_SEQ_LENGTH = 1000
+
     def __init__(self, config):
         super().__init__(config)
         self.has_category = True  # 使用 task 作为 category
         # 保存 HuggingFace dataset 引用用于延迟加载
         self._hf_datasets: Dict[str, Any] = {}
+        # 加载 tokenizer 用于长度过滤
+        self._tokenizer = None
+        # 是否过滤超长样本（仅训练时过滤，评估时保留）
+        self._filter_long_samples = config.dataset_settings.get('filter_long_samples', True)
+
+    def _get_tokenizer(self):
+        """延迟加载 tokenizer"""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            hf_cache = self.config.global_settings.get('hf_cache_dir', None)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "llava-hf/llava-1.5-7b-hf",
+                cache_dir=hf_cache
+            )
+        return self._tokenizer
+
+    def _estimate_seq_length(self, question: str, answer: str) -> int:
+        """估算序列长度（576 vision tokens + 文本 tokens）"""
+        tokenizer = self._get_tokenizer()
+        eos = tokenizer.eos_token or "</s>"
+        prompt = f"USER: <image>\n{question}\nASSISTANT: {answer}{eos}"
+        tokens = tokenizer(prompt, return_tensors="pt")
+        return tokens['input_ids'].shape[1] + 576  # 加上 vision tokens
 
     def _load_split(self, split: str) -> tuple:
         """加载指定 split 的数据
@@ -95,6 +128,7 @@ class ScienceQAPreparer(BasePreparer):
         self._hf_datasets[split] = ds  # 保存引用
         out: List[Dict[str, Any]] = []
         no_image_samples: List[Dict[str, Any]] = []
+        filtered_count = 0
 
         # 调试：统计图像类型
         image_type_stats: Dict[str, int] = {}
@@ -148,6 +182,14 @@ class ScienceQAPreparer(BasePreparer):
             prompt_parts.append(instr)
 
             full_q = "\n".join(prompt_parts)
+
+            # 过滤超长样本（仅对有图样本过滤，且仅当 filter_long_samples=True 时）
+            if has_image and self._filter_long_samples:
+                seq_len = self._estimate_seq_length(full_q, letter)
+                if seq_len > self.MAX_SEQ_LENGTH:
+                    filtered_count += 1
+                    continue
+
             sample = {
                 'image': (split, i) if has_image else None,  # 无图样本存 None
                 'question': full_q,
@@ -171,6 +213,8 @@ class ScienceQAPreparer(BasePreparer):
         logger = getattr(self.config, 'logger', None)
         if logger is not None:
             logger.info(f"[ScienceQA] Split '{split}': {len(no_image_samples)} samples with no/invalid image; {len(out)} with image.")
+            if filtered_count > 0:
+                logger.info(f"[ScienceQA] Split '{split}': 过滤了 {filtered_count} 个超长样本 (>{self.MAX_SEQ_LENGTH} tokens)")
             # 输出图像类型统计，帮助诊断 HuggingFace datasets 解码问题
             if image_type_stats:
                 type_info = ", ".join(f"{k}: {v}" for k, v in sorted(image_type_stats.items()))

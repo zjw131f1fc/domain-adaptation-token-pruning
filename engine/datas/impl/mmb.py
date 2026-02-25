@@ -65,6 +65,10 @@ class MMBDataset(BsesDataset):
 
 
 class MMBenchPreparer(BasePreparer):
+    # 序列长度阈值（超过此值的样本会被过滤）
+    # 576 vision tokens + 文本 tokens，总长度不超过此值
+    MAX_SEQ_LENGTH = 1000
+
     def __init__(self, config):
         super().__init__(config)
         # 明确存在 category 字段
@@ -72,12 +76,38 @@ class MMBenchPreparer(BasePreparer):
         # 可通过 dataset_settings['field_map'] 自定义映射，这里不强制
         # 保存 HuggingFace dataset 引用用于延迟加载
         self._hf_datasets: Dict[Tuple[str, str], Any] = {}
+        # 加载 tokenizer 用于长度过滤
+        self._tokenizer = None
+        # 是否过滤超长样本（仅训练时过滤，评估时保留）
+        self._filter_long_samples = config.dataset_settings.get('filter_long_samples', True)
+
+    def _get_tokenizer(self):
+        """延迟加载 tokenizer"""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+            hf_cache = self.config.global_settings.get('hf_cache_dir', None)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "llava-hf/llava-1.5-7b-hf",
+                cache_dir=hf_cache
+            )
+        return self._tokenizer
+
+    def _estimate_seq_length(self, question: str, answer: str) -> int:
+        """估算序列长度（576 vision tokens + 文本 tokens）"""
+        tokenizer = self._get_tokenizer()
+        eos = tokenizer.eos_token or "</s>"
+        prompt = f"USER: <image>\n{question}\nASSISTANT: {answer}{eos}"
+        tokens = tokenizer(prompt, return_tensors="pt")
+        return tokens['input_ids'].shape[1] + 576  # 加上 vision tokens
 
     # --- 从 dev split 加载所有数据，然后随机拆分 ---
     def _load_all(self) -> List[Dict[str, Any]]:
         """加载 dev split 的所有数据（cn + en）"""
         subsets = ['cn', 'en']
         merged: List[Dict[str, Any]] = []
+        filtered_count = 0
+        logger = getattr(self.config, 'logger', None)
+
         for sub in subsets:
             ds = load_dataset("lmms-lab/MMBench", sub, split="dev")
             self._hf_datasets[(sub, 'dev')] = ds  # 保存引用
@@ -102,6 +132,14 @@ class MMBenchPreparer(BasePreparer):
                 ]
                 instr = "Choose the correct answer from A/B/C/D and output only one letter (A, B, C, or D)."
                 full_q = f"{q_raw}\n" + "\n".join(opt_lines) + f"\n{instr}"
+
+                # 过滤超长样本（仅当 filter_long_samples=True 时）
+                if self._filter_long_samples:
+                    seq_len = self._estimate_seq_length(full_q, answer)
+                    if seq_len > self.MAX_SEQ_LENGTH:
+                        filtered_count += 1
+                        continue
+
                 merged.append({
                     'image': (sub, 'dev', i),  # 存储 (subset, split, index) 而非图像
                     'question': full_q,
@@ -114,6 +152,10 @@ class MMBenchPreparer(BasePreparer):
                     'raw_question': q_raw,
                     'subset': sub,
                 })
+
+        if logger and filtered_count > 0:
+            logger.info(f"[MMB] 过滤了 {filtered_count} 个超长样本 (>{self.MAX_SEQ_LENGTH} tokens)")
+
         return merged
 
     # # --- 原预拆分加载代码（已弃用）---
