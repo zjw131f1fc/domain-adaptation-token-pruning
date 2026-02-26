@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any, List
 
-from engine.data_utils import preprocess_batch
+from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
 
 
 def compute_task_loss(
@@ -144,7 +144,13 @@ def train_step(
 
     # === 预处理 ===
     max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
-    prep = preprocess_batch(batch, processor, device, max_length=max_length)
+
+    # 根据模型类型选择预处理函数
+    backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
+    if 'qwen2-vl' in backbone_name.lower():
+        prep = preprocess_batch_qwen2vl(batch, processor, device, max_length=max_length)
+    else:
+        prep = preprocess_batch(batch, processor, device, max_length=max_length)
     inputs = prep['inputs']
 
     # === Forward ===
@@ -153,19 +159,26 @@ def train_step(
     # 是否阻止 adv_loss 梯度流向 pruner
     detach_adv_from_pruner = method_cfg.get('detach_adv_from_pruner', False)
 
-    output = model(
-        input_ids=inputs['input_ids'],
-        pixel_values=inputs['pixel_values'],
-        attention_mask=inputs['attention_mask'],
-        vision_start=prep['vision_start'],
-        vision_end=prep['vision_end'],
-        question_starts=prep['question_starts'],
-        question_ends=prep['question_ends'],
-        answer_starts=prep['answer_starts'],
-        answer_ends=prep['answer_ends'],
-        return_pruning_info=True,
-        detach_h_fake_for_adv=detach_adv_from_pruner,
-    )
+    # 构建 forward 参数
+    forward_kwargs = {
+        'input_ids': inputs['input_ids'],
+        'pixel_values': inputs['pixel_values'],
+        'attention_mask': inputs['attention_mask'],
+        'vision_start': prep['vision_start'],
+        'vision_end': prep['vision_end'],
+        'question_starts': prep['question_starts'],
+        'question_ends': prep['question_ends'],
+        'answer_starts': prep['answer_starts'],
+        'answer_ends': prep['answer_ends'],
+        'return_pruning_info': True,
+        'detach_h_fake_for_adv': detach_adv_from_pruner,
+    }
+
+    # Qwen2-VL 需要 image_grid_thw
+    if 'image_grid_thw' in inputs:
+        forward_kwargs['image_grid_thw'] = inputs['image_grid_thw']
+
+    output = model(**forward_kwargs)
 
     # === 计算 Losses ===
     losses = {}

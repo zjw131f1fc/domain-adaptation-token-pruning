@@ -76,6 +76,7 @@ class PrunableQwen2VLForConditionalGeneration(nn.Module):
         pruner_n_queries: int = 4,
         pruner_query_dropout: float = 0.0,
         disc_d_hidden: int = 256,
+        use_adapter: bool = True,  # 是否使用 Adapter
         adapter_bottleneck: int = None,
         adapter_type: str = 'lightweight',
         use_separated_adapters: bool = False,
@@ -99,6 +100,7 @@ class PrunableQwen2VLForConditionalGeneration(nn.Module):
         self.config = base_model.config
         self.pruning_layers = pruning_layers
         self.use_question_condition = use_question_condition
+        self.use_adapter = use_adapter
         self.n_vision = n_vision
 
         # 获取 LLM 配置

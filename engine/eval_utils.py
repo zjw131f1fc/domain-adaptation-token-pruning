@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional, Callable
 from tqdm import tqdm
 
 from engine.distributed import is_main_process
-from engine.data_utils import preprocess_batch
+from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
 
 
 @torch.no_grad()
@@ -93,15 +93,44 @@ def evaluate(
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
 
+        # 根据模型类型选择预处理函数
+        backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
+        is_qwen2vl = 'qwen2-vl' in backbone_name.lower()
+
         if mode == "hard":
-            preprocessed = preprocess_batch(
-                batch=[sample],
-                processor=processor,
-                device=device,
-                max_length=max_length,
-                mode="inference"
-            )
+            if is_qwen2vl:
+                preprocessed = preprocess_batch_qwen2vl(
+                    batch=[sample],
+                    processor=processor,
+                    device=device,
+                    max_length=max_length,
+                    mode="inference"
+                )
+            else:
+                preprocessed = preprocess_batch(
+                    batch=[sample],
+                    processor=processor,
+                    device=device,
+                    max_length=max_length,
+                    mode="inference"
+                )
             inputs = preprocessed['inputs']
+
+            # 构建 forward 参数
+            forward_kwargs = {
+                'input_ids': inputs['input_ids'],
+                'pixel_values': inputs['pixel_values'],
+                'attention_mask': inputs['attention_mask'],
+                'vision_start': preprocessed['vision_start'],
+                'vision_end': preprocessed['vision_end'],
+                'question_starts': preprocessed['question_starts'],
+                'question_ends': preprocessed['question_ends'],
+                'answer_starts': [preprocessed['question_ends'][0]],
+                'answer_ends': [preprocessed['question_ends'][0] + 1],
+                'return_pruning_info': True,
+            }
+            if 'image_grid_thw' in inputs:
+                forward_kwargs['image_grid_thw'] = inputs['image_grid_thw']
 
             # Debug: 同时用训练路径计算保留率
             debug_train_ratios = {}
@@ -109,34 +138,28 @@ def evaluate(
                 # 用训练路径（model()）计算保留率
                 model.eval()
                 with torch.no_grad():
-                    output_train = model(
-                        input_ids=inputs['input_ids'],
-                        pixel_values=inputs['pixel_values'],
-                        attention_mask=inputs['attention_mask'],
-                        vision_start=preprocessed['vision_start'],
-                        vision_end=preprocessed['vision_end'],
-                        question_starts=preprocessed['question_starts'],
-                        question_ends=preprocessed['question_ends'],
-                        answer_starts=[preprocessed['question_ends'][0]],
-                        answer_ends=[preprocessed['question_ends'][0] + 1],
-                        return_pruning_info=True,
-                    )
+                    output_train = model(**forward_kwargs)
                 for layer_idx in pruning_layers:
                     if layer_idx in output_train.pruning_infos:
                         cumulative_mask = output_train.pruning_infos[layer_idx]['cumulative_mask']
                         debug_train_ratios[layer_idx] = cumulative_mask.float().mean().item()
 
-            output_ids, stats = model.generate_with_hard_pruning(
-                input_ids=inputs['input_ids'],
-                pixel_values=inputs['pixel_values'],
-                attention_mask=inputs.get('attention_mask'),
-                vision_start=preprocessed['vision_start'],
-                vision_end=preprocessed['vision_end'],
-                question_starts=preprocessed['question_starts'],
-                question_ends=preprocessed['question_ends'],
-                max_new_tokens=32,
-                debug_generate=(step_idx <= 3 and is_main_process()),  # 前 3 个样本打印 debug
-            )
+            # 构建 generate 参数
+            generate_kwargs = {
+                'input_ids': inputs['input_ids'],
+                'pixel_values': inputs['pixel_values'],
+                'attention_mask': inputs.get('attention_mask'),
+                'vision_start': preprocessed['vision_start'],
+                'vision_end': preprocessed['vision_end'],
+                'question_starts': preprocessed['question_starts'],
+                'question_ends': preprocessed['question_ends'],
+                'max_new_tokens': 32,
+                'debug_generate': (step_idx <= 3 and is_main_process()),
+            }
+            if 'image_grid_thw' in inputs:
+                generate_kwargs['image_grid_thw'] = inputs['image_grid_thw']
+
+            output_ids, stats = model.generate_with_hard_pruning(**generate_kwargs)
 
             # Debug: 对比训练路径和推理路径的保留率
             if step_idx <= 5 and is_main_process() and debug_train_ratios:
@@ -161,14 +184,36 @@ def evaluate(
                             layer_kept_ratios[layer_idx] = []
                         layer_kept_ratios[layer_idx].append(value)
         else:
-            prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
-            inputs = processor(
-                text=prompt,
-                images=sample['image'],
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-            ).to(device)
+            # origin 模式：使用原始模型生成
+            if is_qwen2vl:
+                # Qwen2-VL 格式
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": "placeholder"},
+                            {"type": "text", "text": sample['question']},
+                        ],
+                    },
+                ]
+                prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = processor(
+                    text=prompt,
+                    images=sample['image'],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                ).to(device)
+            else:
+                # LLaVA 格式
+                prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
+                inputs = processor(
+                    text=prompt,
+                    images=sample['image'],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                ).to(device)
 
             output_ids = model.generate(
                 **inputs,
@@ -178,10 +223,19 @@ def evaluate(
 
         generated = processor.decode(output_ids[0], skip_special_tokens=True)
 
-        if "ASSISTANT:" in generated:
-            pred = generated.split("ASSISTANT:")[-1].strip()
+        # 根据模型类型提取预测结果
+        if is_qwen2vl:
+            # Qwen2-VL: 提取 assistant 回复
+            if "assistant\n" in generated.lower():
+                pred = generated.lower().split("assistant\n")[-1].strip()
+            else:
+                pred = generated.strip()
         else:
-            pred = generated.strip()
+            # LLaVA
+            if "ASSISTANT:" in generated:
+                pred = generated.split("ASSISTANT:")[-1].strip()
+            else:
+                pred = generated.strip()
 
         predictions.append(pred)
 

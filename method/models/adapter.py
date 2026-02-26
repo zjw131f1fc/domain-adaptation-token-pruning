@@ -43,10 +43,20 @@ class MaskAttentionEncoder(nn.Module):
             mask_emb: (batch, bottleneck_dim)
         """
         batch_size = mask.shape[0]
+        actual_n_vision = mask.shape[1]
+
+        # 如果实际 vision tokens 数量与预设不同，插值 pos_embedding
+        if actual_n_vision != self.n_vision:
+            # (n_vision, d_pos) -> (1, d_pos, n_vision) -> interpolate -> (1, d_pos, actual) -> (actual, d_pos)
+            pos_emb = self.pos_embedding.T.unsqueeze(0)  # (1, d_pos, n_vision)
+            pos_emb = F.interpolate(pos_emb, size=actual_n_vision, mode='linear', align_corners=False)
+            pos_emb = pos_emb.squeeze(0).T  # (actual_n_vision, d_pos)
+        else:
+            pos_emb = self.pos_embedding
 
         # mask * pos_emb: (batch, n_vision, d_pos)
         # 被剪掉的位置 (mask=0) 对应的 embedding 为 0
-        mask_with_pos = mask.unsqueeze(-1) * self.pos_embedding  # (batch, 576, 64)
+        mask_with_pos = mask.unsqueeze(-1) * pos_emb  # (batch, actual_n_vision, d_pos)
 
         # Attention: query @ keys
         # (1, d_pos) @ (batch, d_pos, n_vision) -> (batch, 1, n_vision)
