@@ -41,7 +41,7 @@ trainer_settings:
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
     print_loss_every_batches: 20  # 隔多久打印一次损失
     eval_loss_every_batches: 100  # 隔多久计算一次 eval loss（用于检测过拟合）
-    eval_every_batches: 1000  # 隔多久评估一次（计算 accuracy）
+    eval_every_batches: 100  # 隔多久评估一次（计算 accuracy）
     eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null
@@ -50,7 +50,7 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: 30000
-    test: 5000
+    test: 500
   fast_load_no_random: false
   category_priority:
     enable: false
@@ -157,7 +157,10 @@ method_settings:
   # Adversarial Loss 梯度控制
   # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
   # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
-  detach_adv_from_pruner: true  # legacy（adversarial_mode=none 时无效）
+  # 注意：我们现在没有对抗训练；这个开关如果为 true，会把 vision mask 在 attention 里 detach，
+  # 导致 pruner 基本收不到 task_loss 的梯度（只剩 sparsity_loss）。
+  # delayed repair 的梯度已经通过 repair_detach_input 与 pruner 解耦，所以这里建议关掉。
+  detach_adv_from_pruner: false
 
   # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
   # 机制：
