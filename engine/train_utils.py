@@ -82,6 +82,7 @@ def train_step(
         包含 losses, stats, pruning_infos 的字典
     """
     method_cfg = config.method_settings
+    adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
 
     # === Gumbel Mode 两阶段调度 ===
     gumbel_mode = method_cfg.get('gumbel_mode', 'never')
@@ -210,13 +211,14 @@ def train_step(
         gan_weight = 0.0 if in_warmup else 1.0
         stats['in_warmup'] = in_warmup
 
-        # 获取对抗模式
-        adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
-
         if adversarial_mode == 'mse':
             # === MSE 模式：直接约束 h_real 和 h_fake 的一致性 ===
             mse_loss_type = method_cfg.get('mse_loss_type', 'mse')
             mse_normalize = method_cfg.get('mse_normalize', False)
+            has_h_corrected = all(info.get('h_corrected') is not None for info in output.pruning_infos.values())
+            h_corrected_dict = {idx: info['h_corrected'] for idx, info in output.pruning_infos.items()} if has_h_corrected else None
+            h_align_dict = h_corrected_dict if has_h_corrected else h_fake_dict
+            stats['align_source'] = 'h_corrected' if has_h_corrected else 'h_fake'
 
             alignment_loss_total = torch.tensor(0.0, device=device)
             n_samples = 0
@@ -228,7 +230,7 @@ def train_step(
 
             for layer_idx in h_real_dict:
                 h_real_list = h_real_dict[layer_idx]
-                h_fake_list = h_fake_dict[layer_idx]
+                h_fake_list = h_align_dict[layer_idx]
 
                 layer_mse = 0.0
                 layer_cosine = 0.0
@@ -495,6 +497,8 @@ def train_step(
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     adv_weight = method_cfg.get('adv_loss_weight', 0.5)
+    if adversarial_mode == 'mse':
+        adv_weight = method_cfg.get('mse_loss_weight', adv_weight)
     sparsity_weight = method_cfg.get('sparsity_weight', 0.2)
 
     warmup_ratio = method_cfg.get('loss_weight_warmup_ratio', 0.0)

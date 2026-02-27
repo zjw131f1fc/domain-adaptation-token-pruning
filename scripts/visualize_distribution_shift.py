@@ -26,8 +26,12 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
 from sklearn.manifold import TSNE
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 # 添加项目根目录
 project_root = Path(__file__).parent.parent
@@ -222,6 +226,104 @@ def compute_mmd(X, Y, gamma=1.0):
     return mmd
 
 
+def _subsample_pair(X, Y, max_samples=2000, seed=42):
+    rng = np.random.default_rng(seed)
+    n = min(len(X), len(Y), max_samples)
+    if n <= 0:
+        return None, None
+    idx_x = rng.choice(len(X), n, replace=False)
+    idx_y = rng.choice(len(Y), n, replace=False)
+    return X[idx_x], Y[idx_y]
+
+
+def compute_c2st(X, Y, test_size=0.3, seed=42):
+    """Classifier two-sample test (C2ST). Accuracy/AUC ~ 0.5 => distributions close."""
+    Xs, Ys = _subsample_pair(X, Y, max_samples=5000, seed=seed)
+    if Xs is None:
+        return None
+    X_all = np.vstack([Xs, Ys])
+    y_all = np.array([0] * len(Xs) + [1] * len(Ys))
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_all, y_all, test_size=test_size, random_state=seed, stratify=y_all
+    )
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    clf = LogisticRegression(max_iter=1000, solver='liblinear')
+    clf.fit(X_train, y_train)
+
+    y_prob = clf.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    acc = accuracy_score(y_test, y_pred)
+    try:
+        auc = roc_auc_score(y_test, y_prob)
+    except ValueError:
+        auc = None
+
+    return {'acc': acc, 'auc': auc}
+
+
+def compute_swd(X, Y, n_projections=100, seed=42):
+    """Sliced Wasserstein Distance with random 1D projections."""
+    Xs, Ys = _subsample_pair(X, Y, max_samples=2000, seed=seed)
+    if Xs is None:
+        return None
+    rng = np.random.default_rng(seed)
+    d = Xs.shape[1]
+    dirs = rng.normal(size=(n_projections, d))
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True) + 1e-8
+
+    dists = []
+    for v in dirs:
+        proj_x = Xs @ v
+        proj_y = Ys @ v
+        proj_x = np.sort(proj_x)
+        proj_y = np.sort(proj_y)
+        dists.append(np.mean(np.abs(proj_x - proj_y)))
+    return float(np.mean(dists))
+
+
+def _sqrtm_psd(mat):
+    """Matrix square root for symmetric PSD matrices."""
+    eigvals, eigvecs = np.linalg.eigh(mat)
+    eigvals = np.clip(eigvals, 0, None)
+    return (eigvecs * np.sqrt(eigvals)) @ eigvecs.T
+
+
+def compute_frechet_distance(X, Y, pca_dim=64, seed=42):
+    """Fréchet distance on PCA-reduced features."""
+    Xs, Ys = _subsample_pair(X, Y, max_samples=5000, seed=seed)
+    if Xs is None:
+        return None
+
+    d = Xs.shape[1]
+    pca_dim = min(pca_dim, d, len(Xs) - 1, len(Ys) - 1)
+    if pca_dim < 2:
+        return None
+
+    pca = PCA(n_components=pca_dim, random_state=seed)
+    Z = pca.fit_transform(np.vstack([Xs, Ys]))
+    Zx = Z[:len(Xs)]
+    Zy = Z[len(Xs):]
+
+    mu_x = Zx.mean(axis=0)
+    mu_y = Zy.mean(axis=0)
+    cov_x = np.cov(Zx, rowvar=False)
+    cov_y = np.cov(Zy, rowvar=False)
+
+    cov_x_sqrt = _sqrtm_psd(cov_x)
+    cov_prod = cov_x_sqrt @ cov_y @ cov_x_sqrt
+    cov_mean = _sqrtm_psd(cov_prod)
+
+    diff = mu_x - mu_y
+    frechet = diff @ diff + np.trace(cov_x + cov_y - 2 * cov_mean)
+    return float(frechet)
+
+
 def cohens_d(x, y):
     """计算 Cohen's d 效应量"""
     nx, ny = len(x), len(y)
@@ -261,8 +363,9 @@ def collect_h_vectors(model, processor, samples, device):
                 return_pruning_info=True,
             )
 
-        if hasattr(output, 'pruning_info') and output.pruning_info:
-            for layer_idx, info in output.pruning_info.items():
+        pruning_infos = getattr(output, 'pruning_infos', None) or getattr(output, 'pruning_info', None)
+        if pruning_infos:
+            for layer_idx, info in pruning_infos.items():
                 if 'h_real' in info and 'h_fake' in info:
                     for h_real, h_fake in zip(info['h_real'], info['h_fake']):
                         # h_real, h_fake: (heads, n_ans, head_dim)
@@ -375,6 +478,39 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     print(f"      MMD (h_fake vs h_real): {mmd_fake:.6f}")
     print(f"      MMD (h_corrected vs h_real): {mmd_corrected:.6f}")
     print(f"      MMD improvement: {mmd_improvement:.1f}%")
+
+    # ==================== [5] Two-Sample Tests / Distribution Distances ====================
+    print(f"\n    [5] Two-Sample Tests / Distribution Distances:")
+
+    # C2ST
+    c2st_fake = compute_c2st(h_real, h_fake)
+    c2st_corrected = compute_c2st(h_real, h_corrected) if h_corrected is not None else None
+    if c2st_fake is not None:
+        auc_str = f"{c2st_fake['auc']:.3f}" if c2st_fake['auc'] is not None else "N/A"
+        print(f"      C2ST acc (h_fake vs h_real): {c2st_fake['acc']:.3f}, auc={auc_str}")
+    if c2st_corrected is not None:
+        auc_str = f"{c2st_corrected['auc']:.3f}" if c2st_corrected['auc'] is not None else "N/A"
+        print(f"      C2ST acc (h_corrected vs h_real): {c2st_corrected['acc']:.3f}, auc={auc_str}")
+
+    # SWD
+    swd_fake = compute_swd(h_real, h_fake)
+    swd_corrected = compute_swd(h_real, h_corrected) if h_corrected is not None else None
+    if swd_fake is not None:
+        print(f"      SWD (h_fake vs h_real): {swd_fake:.6f}")
+    if swd_corrected is not None:
+        swd_improvement = (swd_fake - swd_corrected) / (swd_fake + 1e-8) * 100 if swd_fake is not None else 0
+        print(f"      SWD (h_corrected vs h_real): {swd_corrected:.6f}")
+        print(f"      SWD improvement: {swd_improvement:.1f}%")
+
+    # Frechet Distance (PCA-reduced)
+    frechet_fake = compute_frechet_distance(h_real, h_fake)
+    frechet_corrected = compute_frechet_distance(h_real, h_corrected) if h_corrected is not None else None
+    if frechet_fake is not None:
+        print(f"      Frechet (PCA) (h_fake vs h_real): {frechet_fake:.6f}")
+    if frechet_corrected is not None:
+        frechet_improvement = (frechet_fake - frechet_corrected) / (frechet_fake + 1e-8) * 100 if frechet_fake is not None else 0
+        print(f"      Frechet (PCA) (h_corrected vs h_real): {frechet_corrected:.6f}")
+        print(f"      Frechet improvement: {frechet_improvement:.1f}%")
 
     # ==================== 可视化 ====================
     os.makedirs(output_dir, exist_ok=True)

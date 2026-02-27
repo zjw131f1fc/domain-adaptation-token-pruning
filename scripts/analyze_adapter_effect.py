@@ -264,8 +264,9 @@ def analyze_single_sample(model, processor, sample, device, hook):
         }
 
     # 提取 h_real vs h_fake 差异
-    if hasattr(output, 'pruning_info') and output.pruning_info:
-        for layer_idx, info in output.pruning_info.items():
+    pruning_infos = getattr(output, 'pruning_infos', None) or getattr(output, 'pruning_info', None)
+    if pruning_infos:
+        for layer_idx, info in pruning_infos.items():
             if 'h_real' in info and 'h_fake' in info:
                 h_real_list = info['h_real']
                 h_fake_list = info['h_fake']
