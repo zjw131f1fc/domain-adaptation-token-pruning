@@ -101,6 +101,25 @@ def parse_args():
         default=10,
         help="In patch_test: select top-k worst samples by base delta_nll to run patching on.",
     )
+    parser.add_argument(
+        "--teacher_prune_layers",
+        type=str,
+        default="",
+        help=(
+            "In patch_test: comma-separated pruning layers to keep ACTIVE for teacher run. "
+            "Empty => keep-all teacher (no pruning). Example: '4' means teacher is 'only prune L4'."
+        ),
+    )
+    parser.add_argument(
+        "--student_prune_layers",
+        type=str,
+        default="",
+        help=(
+            "In patch_test: comma-separated pruning layers to keep ACTIVE for student run. "
+            "Empty => normal model behavior (all pruners active as in checkpoint/config). "
+            "Example: '4,14' means student is 'only prune L4 and L14' (L24 keep-all)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -358,10 +377,10 @@ def _get_llm_layers(model):
 
 
 @contextmanager
-def _force_pruners_keep_all(model, allow_layer_idx: int | None = None):
+def _force_pruners_keep_all(model, allow_layer_idx: int | list[int] | set[int] | None = None):
     """Monkeypatch pruners to always return all-ones mask.
 
-    If allow_layer_idx is not None, that layer's pruner is left untouched.
+    If allow_layer_idx is not None, those layer's pruners are left untouched (still perform pruning).
     """
     base_model = model.module if hasattr(model, "module") else model
     pruner_manager = getattr(base_model, "pruner_manager", None)
@@ -370,6 +389,14 @@ def _force_pruners_keep_all(model, allow_layer_idx: int | None = None):
         return
 
     saved = {}
+    allow = None
+    if allow_layer_idx is not None:
+        if isinstance(allow_layer_idx, int):
+            allow = {int(allow_layer_idx)}
+        elif isinstance(allow_layer_idx, set):
+            allow = {int(x) for x in allow_layer_idx}
+        else:
+            allow = {int(x) for x in allow_layer_idx}
 
     def _keep_all_forward_full(self, vision_hidden, q2v_attn_avg, cumulative_vision_mask=None, **kwargs):
         batch_size = vision_hidden.shape[0]
@@ -381,7 +408,7 @@ def _force_pruners_keep_all(model, allow_layer_idx: int | None = None):
         return current_mask, pruner_info
 
     for k, pruner in pruner_manager.pruners.items():
-        if allow_layer_idx is not None and int(k) == int(allow_layer_idx):
+        if allow is not None and int(k) in allow:
             continue
         saved[k] = pruner.forward_full
         pruner.forward_full = types.MethodType(_keep_all_forward_full, pruner)
@@ -568,7 +595,7 @@ def _run_forward_capture_scope_slices(
     layer_indices: list[int],
     scope: str,
     teacher_keep_all: bool,
-    single_prune_layer: int | None,
+    prune_active_layers: list[int] | None,
 ):
     """Run one forward, capture hidden slices for given layers+scope, and return logits + pruning_infos.
 
@@ -611,11 +638,11 @@ def _run_forward_capture_scope_slices(
             with _force_pruners_keep_all(model):
                 out = model(**forward_kwargs)
         else:
-            if single_prune_layer is not None:
-                with _force_pruners_keep_all(model, allow_layer_idx=single_prune_layer):
-                    out = model(**forward_kwargs)
-            else:
+            if prune_active_layers is None:
                 out = model(**forward_kwargs)
+            else:
+                with _force_pruners_keep_all(model, allow_layer_idx=prune_active_layers):
+                    out = model(**forward_kwargs)
 
     for h in handles:
         h.remove()
@@ -632,7 +659,7 @@ def _run_forward_with_patch(
     scope: str,
     alpha: float,
     teacher_slice: torch.Tensor,
-    single_prune_layer: int | None,
+    prune_active_layers: list[int] | None,
 ):
     """Run pruned forward but patch one layer's hidden states at given scope using teacher_slice."""
     layers = _get_llm_layers(model)
@@ -679,11 +706,11 @@ def _run_forward_with_patch(
     )
 
     with torch.no_grad():
-        if single_prune_layer is not None:
-            with _force_pruners_keep_all(model, allow_layer_idx=single_prune_layer):
-                out = model(**forward_kwargs)
-        else:
+        if prune_active_layers is None:
             out = model(**forward_kwargs)
+        else:
+            with _force_pruners_keep_all(model, allow_layer_idx=prune_active_layers):
+                out = model(**forward_kwargs)
 
     handle.remove()
     logits = getattr(out, "logits", None)
@@ -1081,6 +1108,8 @@ def run_patch_test(
     patch_alphas: list[float],
     patch_topk: int,
     single_prune_layer: int | None,
+    teacher_prune_layers: list[int] | None,
+    student_prune_layers: list[int] | None,
 ):
     """Activation patching/interpolation experiment.
 
@@ -1105,6 +1134,24 @@ def run_patch_test(
     per_sample = []
     teacher_slices = []  # list[dict[layer]->tensor]
 
+    # Determine pruning override behavior for patch_test
+    # teacher: empty -> keep-all; else only prune on teacher_prune_layers
+    teacher_keep_all = (not teacher_prune_layers)
+
+    # student: precedence: explicit student_prune_layers > single_prune_layer > default behavior
+    if student_prune_layers:
+        student_prune_active = student_prune_layers
+    elif single_prune_layer is not None:
+        student_prune_active = [int(single_prune_layer)]
+    else:
+        student_prune_active = None  # None => no override, use model default (all pruners active)
+
+    print("Patch test: settings")
+    print(f"  teacher_keep_all={teacher_keep_all}")
+    if not teacher_keep_all:
+        print(f"  teacher_prune_layers={teacher_prune_layers}")
+    print(f"  student_prune_active={student_prune_active if student_prune_active is not None else 'DEFAULT(full)'}")
+
     for i, sample in enumerate(samples):
         if (i + 1) % 10 == 0:
             print(f"  Processing {i+1}/{len(samples)}...")
@@ -1118,8 +1165,8 @@ def run_patch_test(
             prep=prep,
             layer_indices=patch_layers,
             scope=patch_scope,
-            teacher_keep_all=True,
-            single_prune_layer=None,
+            teacher_keep_all=teacher_keep_all,
+            prune_active_layers=(None if teacher_keep_all else teacher_prune_layers),
         )
         # student: pruned (or single layer pruned)
         s_logits, s_pruning_infos, _ = _run_forward_capture_scope_slices(
@@ -1128,7 +1175,7 @@ def run_patch_test(
             layer_indices=[],
             scope=patch_scope,
             teacher_keep_all=False,
-            single_prune_layer=single_prune_layer,
+            prune_active_layers=student_prune_active,
         )
 
         ans_s = prep["answer_starts"][0]
@@ -1210,7 +1257,7 @@ def run_patch_test(
                     scope=patch_scope,
                     alpha=float(a),
                     teacher_slice=ts,
-                    single_prune_layer=single_prune_layer,
+                    prune_active_layers=student_prune_active,
                 )
                 p_nll, _ = _answer_region_nll_and_entropy(p_logits, inputs["input_ids"], ans_s, ans_e)
                 patched[(l, a)].append(float(p_nll - base_nll_t))
@@ -1310,6 +1357,8 @@ def main():
     else:
         patch_layers = _parse_int_list(args.patch_layers)
         patch_alphas = _parse_float_list(args.patch_alphas)
+        teacher_prune_layers = _parse_int_list(args.teacher_prune_layers) if args.teacher_prune_layers.strip() else []
+        student_prune_layers = _parse_int_list(args.student_prune_layers) if args.student_prune_layers.strip() else []
         run_patch_test(
             model=model,
             processor=processor,
@@ -1323,6 +1372,8 @@ def main():
             patch_alphas=patch_alphas,
             patch_topk=args.patch_topk,
             single_prune_layer=(None if args.single_prune_layer < 0 else args.single_prune_layer),
+            teacher_prune_layers=teacher_prune_layers,
+            student_prune_layers=student_prune_layers,
         )
 
 
