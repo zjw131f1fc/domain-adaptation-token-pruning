@@ -42,11 +42,12 @@ def parse_args():
         "--mode",
         type=str,
         default="export_h",
-        choices=["export_h", "gap_curve", "gap_impact"],
+        choices=["export_h", "gap_curve", "gap_impact", "patch_test"],
         help=(
             "export_h: dump h vectors per pruning layer; "
             "gap_curve: compute layerwise pruned-vs-unpruned gap curves; "
-            "gap_impact: correlate per-layer gap with answer NLL / confidence (teacher-forcing)."
+            "gap_impact: correlate per-layer gap with answer NLL / confidence (teacher-forcing); "
+            "patch_test: activation patching/interpolation to test whether pulling pruned states toward teacher helps."
         ),
     )
     parser.add_argument("--proj_dim", type=int, default=64, help="Projection dim used for gap_curve (smaller=cheaper)")
@@ -74,6 +75,31 @@ def parse_args():
         type=str,
         default="",
         help="Optional: write a human-readable gap_impact report to this path.",
+    )
+    parser.add_argument(
+        "--patch_scope",
+        type=str,
+        default="gen_answer",
+        choices=["answer", "gen_answer"],
+        help="In patch_test: which token scope to patch at the chosen layer(s).",
+    )
+    parser.add_argument(
+        "--patch_layers",
+        type=str,
+        default="14,22,29,30",
+        help="In patch_test: comma-separated layer indices to patch (e.g., '22,29,30').",
+    )
+    parser.add_argument(
+        "--patch_alphas",
+        type=str,
+        default="0,0.25,0.5,0.75,1.0",
+        help="In patch_test: comma-separated interpolation alphas (0=no patch, 1=full teacher slice).",
+    )
+    parser.add_argument(
+        "--patch_topk",
+        type=int,
+        default=10,
+        help="In patch_test: select top-k worst samples by base delta_nll to run patching on.",
     )
     return parser.parse_args()
 
@@ -499,6 +525,21 @@ def _answer_region_nll_and_entropy(logits, input_ids, answer_start: int, answer_
     return nll_mean, entropy_mean
 
 
+def _parse_int_list(s: str) -> list[int]:
+    parts = [p.strip() for p in str(s).split(",") if p.strip()]
+    out = []
+    for p in parts:
+        if p.startswith("L"):
+            p = p[1:]
+        out.append(int(p))
+    return out
+
+
+def _parse_float_list(s: str) -> list[float]:
+    parts = [p.strip() for p in str(s).split(",") if p.strip()]
+    return [float(p) for p in parts]
+
+
 def _pearsonr(x: np.ndarray, y: np.ndarray) -> float:
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -511,6 +552,143 @@ def _pearsonr(x: np.ndarray, y: np.ndarray) -> float:
     y = y - y.mean()
     denom = (np.linalg.norm(x) * np.linalg.norm(y)) + 1e-12
     return float((x @ y) / denom)
+
+
+def _scope_positions_from_prep(prep, scope: str) -> tuple[int, int]:
+    scopes = _token_scopes(prep)
+    if scope not in scopes:
+        raise ValueError(f"Unknown scope: {scope}")
+    s, e = scopes[scope]
+    return int(s), int(e)
+
+
+def _run_forward_capture_scope_slices(
+    model,
+    prep,
+    layer_indices: list[int],
+    scope: str,
+    teacher_keep_all: bool,
+    single_prune_layer: int | None,
+):
+    """Run one forward, capture hidden slices for given layers+scope, and return logits + pruning_infos.
+
+    Captured slices are (1, n_tokens, hidden) tensors on device.
+    """
+    layers = _get_llm_layers(model)
+    s, e = _scope_positions_from_prep(prep, scope)
+    captured = {}
+
+    def _make_hook(layer_idx):
+        def hook(module, inputs, output):
+            hidden = output[0] if isinstance(output, (tuple, list)) else output
+            # hidden: (batch, seq, hidden)
+            captured[layer_idx] = hidden[:, s:e, :].detach()
+        return hook
+
+    handles = []
+    for li in layer_indices:
+        if li < 0 or li >= len(layers):
+            raise ValueError(f"Layer idx out of range: {li} (n_layers={len(layers)})")
+        handles.append(layers[li].register_forward_hook(_make_hook(li)))
+
+    inputs = prep["inputs"]
+    forward_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        attention_mask=inputs.get("attention_mask"),
+        vision_start=prep["vision_start"],
+        vision_end=prep["vision_end"],
+        question_starts=prep["question_starts"],
+        question_ends=prep["question_ends"],
+        answer_starts=prep["answer_starts"],
+        answer_ends=prep["answer_ends"],
+        return_pruning_info=True,
+    )
+
+    # run forward
+    with torch.no_grad():
+        if teacher_keep_all:
+            with _force_pruners_keep_all(model):
+                out = model(**forward_kwargs)
+        else:
+            if single_prune_layer is not None:
+                with _force_pruners_keep_all(model, allow_layer_idx=single_prune_layer):
+                    out = model(**forward_kwargs)
+            else:
+                out = model(**forward_kwargs)
+
+    for h in handles:
+        h.remove()
+
+    logits = getattr(out, "logits", None)
+    pruning_infos = getattr(out, "pruning_infos", None) or getattr(out, "pruning_info", None)
+    return logits, pruning_infos, captured
+
+
+def _run_forward_with_patch(
+    model,
+    prep,
+    patch_layer: int,
+    scope: str,
+    alpha: float,
+    teacher_slice: torch.Tensor,
+    single_prune_layer: int | None,
+):
+    """Run pruned forward but patch one layer's hidden states at given scope using teacher_slice."""
+    layers = _get_llm_layers(model)
+    if patch_layer < 0 or patch_layer >= len(layers):
+        raise ValueError(f"Layer idx out of range: {patch_layer} (n_layers={len(layers)})")
+    s, e = _scope_positions_from_prep(prep, scope)
+
+    def hook(module, inputs, output):
+        if alpha <= 0:
+            return output
+        hidden = output[0] if isinstance(output, (tuple, list)) else output
+        # hidden: (batch, seq, hidden)
+        # Patch only selected token span
+        patched = hidden
+        if s < e:
+            patched = hidden.clone()
+            ts = teacher_slice.to(device=hidden.device, dtype=hidden.dtype)
+            if ts.dim() == 2:
+                ts = ts.unsqueeze(0)
+            # Safety: match token count
+            n_tok = min(patched[:, s:e, :].shape[1], ts.shape[1])
+            patched[:, s:s+n_tok, :] = (1.0 - alpha) * patched[:, s:s+n_tok, :] + alpha * ts[:, :n_tok, :]
+
+        if isinstance(output, (tuple, list)):
+            out0 = list(output)
+            out0[0] = patched
+            return tuple(out0)
+        return patched
+
+    handle = layers[patch_layer].register_forward_hook(hook)
+
+    inputs = prep["inputs"]
+    forward_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        attention_mask=inputs.get("attention_mask"),
+        vision_start=prep["vision_start"],
+        vision_end=prep["vision_end"],
+        question_starts=prep["question_starts"],
+        question_ends=prep["question_ends"],
+        answer_starts=prep["answer_starts"],
+        answer_ends=prep["answer_ends"],
+        return_pruning_info=True,
+    )
+
+    with torch.no_grad():
+        if single_prune_layer is not None:
+            with _force_pruners_keep_all(model, allow_layer_idx=single_prune_layer):
+                out = model(**forward_kwargs)
+        else:
+            out = model(**forward_kwargs)
+
+    handle.remove()
+    logits = getattr(out, "logits", None)
+    pruning_infos = getattr(out, "pruning_infos", None) or getattr(out, "pruning_info", None)
+    return logits, pruning_infos
 
 
 def compute_and_export_gap_curves(
@@ -875,6 +1053,7 @@ def compute_and_export_gap_impact(
                     a = m["answer"].replace("\n", "\\n")
                     f.write(f"  Q: {q}\n")
                     f.write(f"  A: {a}\n")
+
                 f.write(f"\nTop-{k} best samples by delta_nll:\n")
                 for rank, idx in enumerate(best_idx, start=1):
                     m = meta_list[int(idx)]
@@ -889,6 +1068,190 @@ def compute_and_export_gap_impact(
                     f.write(f"  A: {a}\n")
 
 
+def run_patch_test(
+    model,
+    processor,
+    samples,
+    device,
+    output_dir,
+    seed: int,
+    max_length: int,
+    patch_scope: str,
+    patch_layers: list[int],
+    patch_alphas: list[float],
+    patch_topk: int,
+    single_prune_layer: int | None,
+):
+    """Activation patching/interpolation experiment.
+
+    Procedure:
+      - For each sample, compute:
+          keep-all teacher NLL (answer region)
+          pruned student NLL
+          delta_nll = student - teacher
+        and capture teacher hidden slices at patch_layers for patch_scope tokens.
+      - Select top-k worst samples by delta_nll
+      - For each (layer, alpha), run pruned forward with hidden patch:
+          H <- (1-alpha)*H_student + alpha*H_teacher  (only on patch_scope token span)
+        and record patched delta_nll.
+    """
+    rng = np.random.default_rng(seed)
+    _ = rng  # reserved (keep signature consistent; seed affects nothing here yet)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Pass 1: compute base deltas and capture teacher slices
+    print("Patch test: collecting teacher/student baselines...")
+    per_sample = []
+    teacher_slices = []  # list[dict[layer]->tensor]
+
+    for i, sample in enumerate(samples):
+        if (i + 1) % 10 == 0:
+            print(f"  Processing {i+1}/{len(samples)}...")
+
+        prep = _preprocess_single_train(sample, processor, device, max_length=max_length)
+        inputs = prep["inputs"]
+
+        # teacher: keep-all + capture slices
+        t_logits, _, t_slices = _run_forward_capture_scope_slices(
+            model=model,
+            prep=prep,
+            layer_indices=patch_layers,
+            scope=patch_scope,
+            teacher_keep_all=True,
+            single_prune_layer=None,
+        )
+        # student: pruned (or single layer pruned)
+        s_logits, s_pruning_infos, _ = _run_forward_capture_scope_slices(
+            model=model,
+            prep=prep,
+            layer_indices=[],
+            scope=patch_scope,
+            teacher_keep_all=False,
+            single_prune_layer=single_prune_layer,
+        )
+
+        ans_s = prep["answer_starts"][0]
+        ans_e = prep["answer_ends"][0]
+        t_nll, t_ent = _answer_region_nll_and_entropy(t_logits, inputs["input_ids"], ans_s, ans_e)
+        s_nll, s_ent = _answer_region_nll_and_entropy(s_logits, inputs["input_ids"], ans_s, ans_e)
+        delta_nll = float(s_nll - t_nll)
+        delta_ent = float(s_ent - t_ent)
+
+        qid = sample.get("question_id", -1)
+        if isinstance(qid, (int, np.integer)):
+            qid_int = int(qid)
+        else:
+            qid_s = str(qid)
+            qid_int = int(qid_s) if qid_s.isdigit() else -1
+
+        kept_stats = {}
+        if s_pruning_infos:
+            for layer_idx, info in s_pruning_infos.items():
+                cm = info.get("cumulative_mask")
+                if cm is not None:
+                    kept_stats[int(layer_idx)] = float(cm.float().mean().item())
+
+        per_sample.append(
+            {
+                "sample_idx": int(i),
+                "question_id": qid_int,
+                "delta_nll": delta_nll,
+                "delta_entropy": delta_ent,
+                "nll_teacher": float(t_nll),
+                "nll_student": float(s_nll),
+                "entropy_teacher": float(t_ent),
+                "entropy_student": float(s_ent),
+                "kept": kept_stats,
+                "question": str(sample.get("question", "")),
+                "answer": str(sample.get("answer", "")),
+                "prep": prep,  # keep for patch stage (contains inputs on device)
+            }
+        )
+        teacher_slices.append(t_slices)
+
+    deltas = np.array([x["delta_nll"] for x in per_sample], dtype=np.float32)
+    order = np.argsort(-deltas)  # descending
+    k = min(max(int(patch_topk), 1), len(per_sample))
+    worst_ids = order[:k].tolist()
+
+    print("Patch test: baseline distribution (delta_nll = student - teacher):")
+    print(f"  mean={float(np.mean(deltas)):.4f}  median={float(np.median(deltas)):.4f}  p90={float(np.percentile(deltas, 90)):.4f}  max={float(np.max(deltas)):.4f}")
+    print(f"  selecting worst-k={k} samples by delta_nll.")
+    for rank, idx in enumerate(worst_ids[:min(5, k)], start=1):
+        x = per_sample[idx]
+        print(f"  worst#{rank}: idx={x['sample_idx']} qid={x['question_id']} delta_nll={x['delta_nll']:.4f} nll_t={x['nll_teacher']:.4f} nll_s={x['nll_student']:.4f}")
+
+    # Pass 2: patching on worst samples
+    print("Patch test: running patching sweeps on worst samples...")
+    # results: (layer, alpha) -> list[delta_nll_patched]
+    patched = {(l, a): [] for l in patch_layers for a in patch_alphas}
+
+    for wi, idx in enumerate(worst_ids, start=1):
+        x = per_sample[idx]
+        prep = x["prep"]
+        inputs = prep["inputs"]
+        ans_s = prep["answer_starts"][0]
+        ans_e = prep["answer_ends"][0]
+        base_nll_t = x["nll_teacher"]
+
+        if wi % 5 == 0:
+            print(f"  Patched {wi}/{k}...")
+
+        for l in patch_layers:
+            ts = teacher_slices[idx].get(l)
+            if ts is None:
+                continue
+            for a in patch_alphas:
+                p_logits, _ = _run_forward_with_patch(
+                    model=model,
+                    prep=prep,
+                    patch_layer=l,
+                    scope=patch_scope,
+                    alpha=float(a),
+                    teacher_slice=ts,
+                    single_prune_layer=single_prune_layer,
+                )
+                p_nll, _ = _answer_region_nll_and_entropy(p_logits, inputs["input_ids"], ans_s, ans_e)
+                patched[(l, a)].append(float(p_nll - base_nll_t))
+
+    # Summaries
+    base_worst = np.array([per_sample[idx]["delta_nll"] for idx in worst_ids], dtype=np.float32)
+    print("Patch test: aggregate results on worst set (lower delta_nll is better):")
+    print(f"  baseline worst-set: mean={float(np.mean(base_worst)):.4f}  median={float(np.median(base_worst)):.4f}  p90={float(np.percentile(base_worst, 90)):.4f}  max={float(np.max(base_worst)):.4f}")
+
+    # pretty print by layer
+    for l in patch_layers:
+        print(f"  Layer {l}:")
+        for a in patch_alphas:
+            vals = np.array(patched.get((l, a), []), dtype=np.float32)
+            if vals.size == 0:
+                print(f"    alpha={a:>4}: (no data)")
+                continue
+            print(
+                f"    alpha={a:>4}: mean={float(np.mean(vals)):.4f}  median={float(np.median(vals)):.4f}  p90={float(np.percentile(vals, 90)):.4f}  max={float(np.max(vals)):.4f}"
+            )
+
+    # Save npz
+    out_name = "patch_test.npz" if single_prune_layer is None else f"patch_test_single_L{single_prune_layer}.npz"
+    out_path = os.path.join(output_dir, out_name)
+    payload = {
+        "patch_scope": np.array([patch_scope]),
+        "patch_layers": np.array(patch_layers, dtype=np.int32),
+        "patch_alphas": np.array(patch_alphas, dtype=np.float32),
+        "worst_sample_indices": np.array([per_sample[idx]["sample_idx"] for idx in worst_ids], dtype=np.int32),
+        "worst_question_ids": np.array([per_sample[idx]["question_id"] for idx in worst_ids], dtype=np.int64),
+        "baseline_delta_nll_worst": base_worst,
+    }
+    for l in patch_layers:
+        for a in patch_alphas:
+            key = f"delta_nll_layer{l}_alpha{str(a).replace('.', 'p')}"
+            payload[key] = np.array(patched.get((l, a), []), dtype=np.float32)
+
+    np.savez_compressed(out_path, **payload)
+    print(f"Saved patch test results -> {out_path}")
+
+
 def main():
     args = parse_args()
     device = torch.device(args.device)
@@ -899,6 +1262,11 @@ def main():
     print(f"Force no adapter: {args.force_no_adapter}")
     if args.mode in ("gap_curve", "gap_impact"):
         print(f"Single prune layer: {args.single_prune_layer}")
+    if args.mode == "patch_test":
+        print(f"Patch scope: {args.patch_scope}")
+        print(f"Patch layers: {args.patch_layers}")
+        print(f"Patch alphas: {args.patch_alphas}")
+        print(f"Patch topk: {args.patch_topk}")
 
     # 加载模型
     model, processor = load_model_and_processor(args.checkpoint, args.config, device, force_no_adapter=args.force_no_adapter)
@@ -925,7 +1293,7 @@ def main():
             seed=args.seed,
             single_prune_layer=(None if args.single_prune_layer < 0 else args.single_prune_layer),
         )
-    else:
+    elif args.mode == "gap_impact":
         compute_and_export_gap_impact(
             model=model,
             processor=processor,
@@ -938,6 +1306,23 @@ def main():
             single_prune_layer=(None if args.single_prune_layer < 0 else args.single_prune_layer),
             topk=args.topk,
             report_path=args.report_path,
+        )
+    else:
+        patch_layers = _parse_int_list(args.patch_layers)
+        patch_alphas = _parse_float_list(args.patch_alphas)
+        run_patch_test(
+            model=model,
+            processor=processor,
+            samples=samples,
+            device=device,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            max_length=args.max_length,
+            patch_scope=args.patch_scope,
+            patch_layers=patch_layers,
+            patch_alphas=patch_alphas,
+            patch_topk=args.patch_topk,
+            single_prune_layer=(None if args.single_prune_layer < 0 else args.single_prune_layer),
         )
 
 
