@@ -87,8 +87,6 @@ class LayerDiscriminator(nn.Module):
         if h.dim() == 3:
             # 单个 answer token: (batch, heads, head_dim)
             h_flat = h.view(h.shape[0], -1)  # (batch, heads * head_dim)
-            # 对输入做 L2 归一化，让判别器关注方向而非幅度
-            h_flat = F.normalize(h_flat, p=2, dim=-1)
             return self.net(h_flat).squeeze(-1)  # (batch,)
         elif h.dim() == 4:
             # 多个 answer tokens: (batch, heads, n_ans, head_dim)
@@ -97,8 +95,6 @@ class LayerDiscriminator(nn.Module):
             h = h.permute(0, 2, 1, 3)
             # Flatten: (batch, n_ans, heads * head_dim)
             h_flat = h.reshape(batch, n_ans, -1)
-            # 对输入做 L2 归一化
-            h_flat = F.normalize(h_flat, p=2, dim=-1)
             # 对每个 answer token 判别: (batch, n_ans, 1) -> (batch, n_ans)
             return self.net(h_flat).squeeze(-1)
         else:
@@ -222,8 +218,8 @@ class LayerDiscriminatorManager(nn.Module):
                 h_real = h_real.unsqueeze(0).detach()
                 h_fake = h_fake.unsqueeze(0).detach()
 
-                real_pred = disc.forward_batch_answers(h_real, reduce='mean')
-                fake_pred = disc.forward_batch_answers(h_fake, reduce='mean')
+                real_pred = disc.forward_batch_answers(h_real, reduce='none')
+                fake_pred = disc.forward_batch_answers(h_fake, reduce='none')
 
                 if loss_type == 'wgan':
                     # WGAN loss: max E[D(real)] - E[D(fake)]
@@ -313,13 +309,17 @@ class LayerDiscriminatorManager(nn.Module):
             h_fake_list = h_fake_dict[layer_idx]
 
             disc = self.discriminators[key]
+            # Freeze discriminator params so adv_loss doesn't update the disc itself.
+            prev_requires = [p.requires_grad for p in disc.parameters()]
+            for p in disc.parameters():
+                p.requires_grad_(False)
 
             # 逐样本计算
             for h_fake in h_fake_list:
                 # h_fake: (heads, n_ans, head_dim) -> (1, heads, n_ans, head_dim)
                 h_fake = h_fake.unsqueeze(0)
 
-                fake_pred = disc.forward_batch_answers(h_fake, reduce='mean')
+                fake_pred = disc.forward_batch_answers(h_fake, reduce='none')
                 if loss_type in ('wgan', 'hinge'):
                     # WGAN/Hinge: Pruner 的目标是最大化 D(fake)，即最小化 -D(fake)
                     adv_loss = -fake_pred.mean()
@@ -332,6 +332,9 @@ class LayerDiscriminatorManager(nn.Module):
                 total_loss = total_loss + adv_loss
 
             n_samples = len(h_fake_list)
+            # Restore discriminator params
+            for p, req in zip(disc.parameters(), prev_requires):
+                p.requires_grad_(req)
 
         # 除以样本数和层数
         n_layers = len(self.layer_indices)
@@ -381,8 +384,8 @@ class LayerDiscriminatorManager(nn.Module):
                     h_real = h_real.unsqueeze(0)
                     h_fake = h_fake.unsqueeze(0)
 
-                    real_pred = disc.forward_batch_answers(h_real, reduce='mean')
-                    fake_pred = disc.forward_batch_answers(h_fake, reduce='mean')
+                    real_pred = disc.forward_batch_answers(h_real, reduce='none')
+                    fake_pred = disc.forward_batch_answers(h_fake, reduce='none')
 
                     layer_real_correct += (real_pred > 0).sum().item()
                     layer_fake_correct += (fake_pred < 0).sum().item()
