@@ -117,6 +117,8 @@ def load_model(config, device: torch.device, local_rank: int):
     vision_adapter_bottleneck = method_cfg.get('vision_adapter_bottleneck', 256)
     text_adapter_bottleneck = method_cfg.get('text_adapter_bottleneck', 256)
     generator_adapter_bottleneck = method_cfg.get('generator_adapter_bottleneck', 512)
+    adapter_alpha_init = method_cfg.get('adapter_alpha_init', 0.1)
+    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
 
     # Delayed repair adapter（语言侧，仅 gen_answer tokens）
     use_repair_adapter = method_cfg.get('use_repair_adapter', False)
@@ -153,10 +155,6 @@ def load_model(config, device: torch.device, local_rank: int):
 
     if logger:
         logger.info(f"Loading base model from {model_path} (type: {model_type})...")
-
-    # 根据模型类型加载不同的基础模型
-    adapter_alpha_init = method_cfg.get('adapter_alpha_init', 0.1)
-    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
 
     if model_type == 'qwen2_vl':
         from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
