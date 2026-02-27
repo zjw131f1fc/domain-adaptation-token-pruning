@@ -63,6 +63,18 @@ def parse_args():
         default=1024,
         help="Tokenizer max_length (gap_impact uses engine.data_utils.preprocess_batch).",
     )
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=10,
+        help="In gap_impact: print top-k worst/best samples by delta_nll.",
+    )
+    parser.add_argument(
+        "--report_path",
+        type=str,
+        default="",
+        help="Optional: write a human-readable gap_impact report to this path.",
+    )
     return parser.parse_args()
 
 
@@ -605,6 +617,8 @@ def compute_and_export_gap_impact(
     seed=42,
     max_length: int = 1024,
     single_prune_layer: int | None = None,
+    topk: int = 10,
+    report_path: str = "",
 ):
     """在 gap_curve 的基础上，加上 teacher-forcing 下的行为指标（NLL/entropy）。
 
@@ -627,6 +641,7 @@ def compute_and_export_gap_impact(
     nll_base_list, nll_pruned_list = [], []
     ent_base_list, ent_pruned_list = [], []
     kept_ratio_lists = defaultdict(list)
+    meta_list = []
 
     print("Computing gap impact (per-sample gap vs teacher-forcing NLL)...")
     if single_prune_layer is not None:
@@ -681,6 +696,20 @@ def compute_and_export_gap_impact(
         nll_pruned_list.append(nll_pruned)
         ent_base_list.append(ent_base)
         ent_pruned_list.append(ent_pruned)
+        qid = sample.get("question_id", -1)
+        if isinstance(qid, (int, np.integer)):
+            qid_int = int(qid)
+        else:
+            qid_s = str(qid)
+            qid_int = int(qid_s) if qid_s.isdigit() else -1
+        meta_list.append(
+            {
+                "sample_idx": int(i),
+                "question_id": qid_int,
+                "question": str(sample.get("question", "")),
+                "answer": str(sample.get("answer", "")),
+            }
+        )
         n_used += 1
 
     if n_used == 0:
@@ -695,6 +724,8 @@ def compute_and_export_gap_impact(
         "n_used": np.array([n_used], dtype=np.int32),
         "proj_dim": np.array([proj_dim], dtype=np.int32),
         "seed": np.array([seed], dtype=np.int32),
+        "sample_idx": np.array([m["sample_idx"] for m in meta_list], dtype=np.int32),
+        "question_id": np.array([m["question_id"] for m in meta_list], dtype=np.int64),
         "nll_base": nll_base_arr,
         "nll_pruned": nll_pruned_arr,
         "delta_nll": (nll_pruned_arr - nll_base_arr),
@@ -719,28 +750,143 @@ def compute_and_export_gap_impact(
 
     # quick readout
     delta_nll = payload["delta_nll"]
+    delta_entropy = payload["delta_entropy"]
     print(f"Saved gap impact -> {out_path}")
     print("Quick readout (teacher-forcing, answer region):")
     print(f"  NLL base : mean={float(np.nanmean(nll_base_arr)):.4f}")
     print(f"  NLL pruned: mean={float(np.nanmean(nll_pruned_arr)):.4f}")
     print(f"  delta NLL (pruned-base): mean={float(np.nanmean(delta_nll)):.4f} ; worse@pruned={(delta_nll > 0).mean():.2%}")
-    print(f"  delta entropy: mean={float(np.nanmean(payload['delta_entropy'])):.4f}")
+    print(f"  delta entropy: mean={float(np.nanmean(delta_entropy)):.4f}")
 
-    # correlation: which layer's gen_answer gap best predicts delta_nll?
-    gen_gap = payload["gen_answer_gap_per_sample"]  # (n, n_layers)
-    corrs = []
-    for layer_idx in range(n_layers):
-        corrs.append(_pearsonr(gen_gap[:, layer_idx], delta_nll))
-    corrs = np.array(corrs, dtype=np.float32)
-    best = int(np.nanargmax(np.abs(corrs))) if np.any(np.isfinite(corrs)) else -1
-    if best >= 0:
-        print("Correlation (|Pearson r|) between per-layer gen_answer gap and delta_nll:")
-        print(f"  best layer={best}, r={float(corrs[best]):.4f}")
+    # quantiles help diagnose whether mean is dominated by outliers
+    def _quantiles(arr: np.ndarray, qs=None):
+        if qs is None:
+            qs = [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]
+        arr = np.asarray(arr, dtype=np.float64)
+        vals = np.nanpercentile(arr, qs)
+        return qs, vals
+
+    def _print_quantiles(name: str, arr: np.ndarray):
+        qs, vals = _quantiles(arr)
+        parts = ", ".join([f"p{q}={v:.4f}" for q, v in zip(qs, vals)])
+        print(f"  {name}: {parts}")
+        return parts
+
+    print("Quantiles (answer region):")
+    q_delta_nll = _print_quantiles("delta_nll", delta_nll)
+    q_delta_entropy = _print_quantiles("delta_entropy", delta_entropy)
+
+    # correlation: per-layer gap vs delta_nll / delta_entropy for each scope
+    print("Correlation (Pearson r) between per-layer gap and delta metrics:")
+    corr_tables = {}
+    for scope in scopes:
+        gaps = payload[f"{scope}_gap_per_sample"]  # (n, n_layers)
+        corrs_nll = np.array([_pearsonr(gaps[:, l], delta_nll) for l in range(n_layers)], dtype=np.float32)
+        corrs_ent = np.array([_pearsonr(gaps[:, l], delta_entropy) for l in range(n_layers)], dtype=np.float32)
+        corr_tables[scope] = {"delta_nll": corrs_nll, "delta_entropy": corrs_ent}
+
+        best_nll = int(np.nanargmax(np.abs(corrs_nll))) if np.any(np.isfinite(corrs_nll)) else -1
+        best_ent = int(np.nanargmax(np.abs(corrs_ent))) if np.any(np.isfinite(corrs_ent)) else -1
+        if best_nll >= 0:
+            print(f"  {scope:10s} vs delta_nll    : best layer={best_nll}, r={float(corrs_nll[best_nll]):.4f}")
+        if best_ent >= 0:
+            print(f"  {scope:10s} vs delta_entropy: best layer={best_ent}, r={float(corrs_ent[best_ent]):.4f}")
+
+    # top layers for gen_answer vs delta_nll (actionable for choosing where to repair)
+    gen_corr = corr_tables["gen_answer"]["delta_nll"]
+    finite = np.isfinite(gen_corr)
+    if finite.any():
+        layers_f = np.arange(n_layers)[finite]
+        order = np.argsort(-np.abs(gen_corr[finite]))
+        topn = min(5, len(order))
+        print("Top layers by |r| (gen_answer gap vs delta_nll):")
+        for j in range(topn):
+            l = int(layers_f[order[j]])
+            print(f"  #{j+1}: layer={l}, r={float(gen_corr[l]):.4f}")
+
+    # top-k worst/best samples by delta_nll
+    k = max(0, int(topk))
+    worst_idx = None
+    best_idx = None
+    if k > 0:
+        worst_idx = np.argsort(-delta_nll)[:k]
+        best_idx = np.argsort(delta_nll)[:k]
+        print(f"Top-{k} worst samples by delta_nll (pruned-base):")
+        for rank, idx in enumerate(worst_idx, start=1):
+            m = meta_list[int(idx)]
+            print(
+                f"  #{rank}: idx={m['sample_idx']} qid={m['question_id']} "
+                f"delta_nll={float(delta_nll[idx]):.4f} nll_base={float(nll_base_arr[idx]):.4f} nll_pruned={float(nll_pruned_arr[idx]):.4f} "
+                f"delta_ent={float(delta_entropy[idx]):.4f}"
+            )
+        print(f"Top-{k} best samples by delta_nll (most improved under pruning):")
+        for rank, idx in enumerate(best_idx, start=1):
+            m = meta_list[int(idx)]
+            print(
+                f"  #{rank}: idx={m['sample_idx']} qid={m['question_id']} "
+                f"delta_nll={float(delta_nll[idx]):.4f} nll_base={float(nll_base_arr[idx]):.4f} nll_pruned={float(nll_pruned_arr[idx]):.4f} "
+                f"delta_ent={float(delta_entropy[idx]):.4f}"
+            )
     if kept_ratio_lists:
         kept_str = ", ".join(
             f"L{layer_idx}={np.mean(vals):.2%}" for layer_idx, vals in sorted(kept_ratio_lists.items())
         )
         print(f"Kept ratio (avg, from pruning_infos): {kept_str}")
+
+    # optional human-readable report file
+    if report_path:
+        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("gap_impact report\n")
+            f.write(f"n_used={n_used} proj_dim={proj_dim} seed={seed}\n")
+            if single_prune_layer is not None:
+                f.write(f"single_prune_layer={single_prune_layer}\n")
+            f.write(f"checkpoint_mode=pruned_vs_keepall (teacher-forcing)\n")
+            f.write("\nQuick readout (answer region):\n")
+            f.write(f"nll_base_mean={float(np.nanmean(nll_base_arr)):.8f}\n")
+            f.write(f"nll_pruned_mean={float(np.nanmean(nll_pruned_arr)):.8f}\n")
+            f.write(f"delta_nll_mean={float(np.nanmean(delta_nll)):.8f}\n")
+            f.write(f"worse_at_pruned={(delta_nll > 0).mean():.8f}\n")
+            f.write(f"delta_entropy_mean={float(np.nanmean(delta_entropy)):.8f}\n")
+            f.write("\nQuantiles:\n")
+            f.write(f"delta_nll: {q_delta_nll}\n")
+            f.write(f"delta_entropy: {q_delta_entropy}\n")
+            f.write("\nCorrelation (best layer, Pearson r):\n")
+            for scope in scopes:
+                cn = corr_tables[scope]["delta_nll"]
+                ce = corr_tables[scope]["delta_entropy"]
+                bn = int(np.nanargmax(np.abs(cn))) if np.any(np.isfinite(cn)) else -1
+                be = int(np.nanargmax(np.abs(ce))) if np.any(np.isfinite(ce)) else -1
+                f.write(f"{scope:10s} vs delta_nll: layer={bn} r={float(cn[bn]) if bn>=0 else float('nan'):.8f}\n")
+                f.write(f"{scope:10s} vs delta_entropy: layer={be} r={float(ce[be]) if be>=0 else float('nan'):.8f}\n")
+            if kept_ratio_lists:
+                f.write(f"\nKept ratio (avg): {kept_str}\n")
+
+            if k > 0 and worst_idx is not None and best_idx is not None:
+                f.write(f"\nTop-{k} worst samples by delta_nll:\n")
+                for rank, idx in enumerate(worst_idx, start=1):
+                    m = meta_list[int(idx)]
+                    f.write(
+                        f"#{rank} sample_idx={m['sample_idx']} question_id={m['question_id']} "
+                        f"delta_nll={float(delta_nll[idx]):.8f} nll_base={float(nll_base_arr[idx]):.8f} nll_pruned={float(nll_pruned_arr[idx]):.8f} "
+                        f"delta_entropy={float(delta_entropy[idx]):.8f}\n"
+                    )
+                    q = m["question"].replace("\n", "\\n")
+                    a = m["answer"].replace("\n", "\\n")
+                    f.write(f"  Q: {q}\n")
+                    f.write(f"  A: {a}\n")
+                f.write(f"\nTop-{k} best samples by delta_nll:\n")
+                for rank, idx in enumerate(best_idx, start=1):
+                    m = meta_list[int(idx)]
+                    f.write(
+                        f"#{rank} sample_idx={m['sample_idx']} question_id={m['question_id']} "
+                        f"delta_nll={float(delta_nll[idx]):.8f} nll_base={float(nll_base_arr[idx]):.8f} nll_pruned={float(nll_pruned_arr[idx]):.8f} "
+                        f"delta_entropy={float(delta_entropy[idx]):.8f}\n"
+                    )
+                    q = m["question"].replace("\n", "\\n")
+                    a = m["answer"].replace("\n", "\\n")
+                    f.write(f"  Q: {q}\n")
+                    f.write(f"  A: {a}\n")
 
 
 def main():
@@ -790,6 +936,8 @@ def main():
             seed=args.seed,
             max_length=args.max_length,
             single_prune_layer=(None if args.single_prune_layer < 0 else args.single_prune_layer),
+            topk=args.topk,
+            report_path=args.report_path,
         )
 
 
