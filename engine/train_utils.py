@@ -8,6 +8,58 @@ from typing import Dict, Any, List
 from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
 
 
+def _flatten_masked(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """将 (batch, L, D) 按 mask 展平为 (N, D)。mask 为 0/1 或 bool。"""
+    if h is None or mask is None:
+        raise ValueError("_flatten_masked requires both h and mask.")
+    if h.dim() != 3 or mask.dim() != 2:
+        raise ValueError(f"Expected h=(b,L,D) and mask=(b,L), got {tuple(h.shape)} / {tuple(mask.shape)}")
+    b, L, d = h.shape
+    h2 = h.reshape(b * L, d)
+    m2 = mask.reshape(b * L).to(dtype=torch.bool)
+    if m2.sum().item() == 0:
+        # 兜底：返回一个 1xD 的零向量，避免下游 NaN
+        return torch.zeros(1, d, device=h.device, dtype=h.dtype)
+    return h2[m2]
+
+
+def compute_distribution_alignment_loss(
+    student_h: torch.Tensor,
+    teacher_h: torch.Tensor,
+    mask: torch.Tensor,
+    loss_type: str = "mean_var",
+    var_weight: float = 1.0,
+) -> torch.Tensor:
+    """分布级对齐损失（仅用于 gen_answer tokens）。
+
+    目标不是逐 token 点到点对齐，而是让 student/teacher 在该区域的表示分布接近。
+
+    Args:
+        student_h/teacher_h: (batch, Lmax, hidden)
+        mask: (batch, Lmax) 0/1，有效位置
+        loss_type:
+            - "mse": 点到点 MSE（作为对照）
+            - "mean_var": 对齐均值 + 方差（更像“分布接近”）
+    """
+    Xs = _flatten_masked(student_h, mask).float()
+    Xt = _flatten_masked(teacher_h, mask).float()
+
+    if loss_type == "mse":
+        # 点到点：要求 token 顺序一致（这里 pad 后是对齐的）
+        n = min(Xs.shape[0], Xt.shape[0])
+        return F.mse_loss(Xs[:n], Xt[:n])
+
+    # mean + diag(var) 对齐
+    ms = Xs.mean(dim=0)
+    mt = Xt.mean(dim=0)
+    vs = Xs.var(dim=0, unbiased=False)
+    vt = Xt.var(dim=0, unbiased=False)
+
+    mean_loss = F.mse_loss(ms, mt)
+    var_loss = F.mse_loss(vs, vt)
+    return mean_loss + var_weight * var_loss
+
+
 def compute_task_loss(
     logits: torch.Tensor,
     answer_starts: List[int],
@@ -82,7 +134,7 @@ def train_step(
         包含 losses, stats, pruning_infos 的字典
     """
     method_cfg = config.method_settings
-    adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
+    adversarial_mode = method_cfg.get('adversarial_mode', 'none')  # 'none' | 'discriminator' | 'mse'（旧逻辑）
 
     # === Gumbel Mode 两阶段调度 ===
     gumbel_mode = method_cfg.get('gumbel_mode', 'never')
@@ -160,7 +212,16 @@ def train_step(
     # 是否阻止 adv_loss 梯度流向 pruner
     detach_adv_from_pruner = method_cfg.get('detach_adv_from_pruner', False)
 
-    # 构建 forward 参数
+    # repair / teacher-forward 配置
+    repair_layers = method_cfg.get('repair_layers', [])
+    repair_loss_weight = method_cfg.get('repair_loss_weight', 0.0)
+    repair_loss_type = method_cfg.get('repair_loss_type', 'mean_var')
+    repair_var_weight = method_cfg.get('repair_var_weight', 1.0)
+    teacher_forward_enable = method_cfg.get('teacher_forward_enable', False)
+
+    capture_layers = repair_layers if (teacher_forward_enable and repair_loss_weight > 0 and repair_layers) else []
+
+    # 构建 student forward 参数
     forward_kwargs = {
         'input_ids': inputs['input_ids'],
         'pixel_values': inputs['pixel_values'],
@@ -171,8 +232,11 @@ def train_step(
         'question_ends': prep['question_ends'],
         'answer_starts': prep['answer_starts'],
         'answer_ends': prep['answer_ends'],
-        'return_pruning_info': True,
+        'return_pruning_info': True,  # student 需要 pruning_infos 来算 sparsity
         'detach_h_fake_for_adv': detach_adv_from_pruner,
+        'pruning_mode': 'normal',
+        'apply_repair': True,
+        'capture_layers': capture_layers,
     }
 
     # Qwen2-VL 需要 image_grid_thw
@@ -180,6 +244,16 @@ def train_step(
         forward_kwargs['image_grid_thw'] = inputs['image_grid_thw']
 
     output = model(**forward_kwargs)
+
+    # teacher forward（keep_all，无修复，用于定义“source 表示分布”）
+    teacher_output = None
+    if teacher_forward_enable and (repair_loss_weight > 0) and capture_layers:
+        teacher_kwargs = dict(forward_kwargs)
+        teacher_kwargs['return_pruning_info'] = False
+        teacher_kwargs['pruning_mode'] = method_cfg.get('teacher_pruning_mode', 'keep_all')
+        teacher_kwargs['apply_repair'] = False
+        with torch.no_grad():
+            teacher_output = model(**teacher_kwargs)
 
     # === 计算 Losses ===
     losses = {}
@@ -201,140 +275,41 @@ def train_step(
     losses['task_loss'] = task_loss
     stats['raw_task_loss'] = task_loss.item()
 
-    # 2. 如果有剪枝信息，计算对抗损失（Discriminator 或 MSE）
-    if output.pruning_infos and len(output.pruning_infos) > 0:
-        h_real_dict = {idx: info['h_real'] for idx, info in output.pruning_infos.items()}
-        h_fake_dict = {idx: info['h_fake'] for idx, info in output.pruning_infos.items()}
+    # 2. Repair loss（teacher-forcing, gen_answer region, distribution alignment）
+    if (teacher_output is not None) and output.captured and teacher_output.captured:
+        student_caps = output.captured_for_repair or output.captured
+        teacher_caps = teacher_output.captured
+        layer_losses = []
+        per_layer = {}
+        for layer_idx in capture_layers:
+            if layer_idx not in student_caps or layer_idx not in teacher_caps:
+                continue
+            s = student_caps[layer_idx]
+            t = teacher_caps[layer_idx]
+            m = s["mask"] * t["mask"]
+            layer_loss = compute_distribution_alignment_loss(
+                s["h"], t["h"], m,
+                loss_type=repair_loss_type,
+                var_weight=repair_var_weight,
+            )
+            layer_losses.append(layer_loss)
+            per_layer[layer_idx] = float(layer_loss.detach().item())
 
-        warmup_ratio = method_cfg.get('pruner_warmup_ratio', 0.0)
-        in_warmup = current_step < total_steps * warmup_ratio
-        gan_weight = 0.0 if in_warmup else 1.0
-        stats['in_warmup'] = in_warmup
-
-        if adversarial_mode == 'mse':
-            # === MSE 模式：直接约束 h_real 和 h_fake 的一致性 ===
-            mse_loss_type = method_cfg.get('mse_loss_type', 'mse')
-            mse_normalize = method_cfg.get('mse_normalize', False)
-            has_h_corrected = all(info.get('h_corrected') is not None for info in output.pruning_infos.values())
-            h_corrected_dict = {idx: info['h_corrected'] for idx, info in output.pruning_infos.items()} if has_h_corrected else None
-            h_align_dict = h_corrected_dict if has_h_corrected else h_fake_dict
-            stats['align_source'] = 'h_corrected' if has_h_corrected else 'h_fake'
-
-            alignment_loss_total = torch.tensor(0.0, device=device)
-            n_samples = 0
-
-            # 每层的对齐指标
-            mse_per_layer = {}
-            cosine_per_layer = {}
-            l1_per_layer = {}
-
-            for layer_idx in h_real_dict:
-                h_real_list = h_real_dict[layer_idx]
-                h_fake_list = h_align_dict[layer_idx]
-
-                layer_mse = 0.0
-                layer_cosine = 0.0
-                layer_l1 = 0.0
-                layer_samples = 0
-
-                # 逐样本计算
-                for h_real, h_fake in zip(h_real_list, h_fake_list):
-                    # h_real, h_fake: (heads, n_ans, head_dim)
-                    h_real_flat = h_real.reshape(-1)
-                    h_fake_flat = h_fake.reshape(-1)
-
-                    # 可选：归一化
-                    if mse_normalize:
-                        h_real_norm = F.normalize(h_real_flat, dim=0)
-                        h_fake_norm = F.normalize(h_fake_flat, dim=0)
-                    else:
-                        h_real_norm = h_real_flat
-                        h_fake_norm = h_fake_flat
-
-                    # 计算损失
-                    if mse_loss_type == 'l1':
-                        sample_loss = F.l1_loss(h_fake_norm, h_real_norm)
-                    elif mse_loss_type == 'smooth_l1':
-                        sample_loss = F.smooth_l1_loss(h_fake_norm, h_real_norm)
-                    elif mse_loss_type == 'cosine':
-                        # 余弦相似度损失: 1 - cosine_similarity
-                        cosine_sim = F.cosine_similarity(h_fake_flat.unsqueeze(0), h_real_flat.unsqueeze(0))
-                        sample_loss = 1.0 - cosine_sim.mean()
-                    else:  # mse
-                        sample_loss = F.mse_loss(h_fake_norm, h_real_norm)
-
-                    alignment_loss_total = alignment_loss_total + sample_loss
-
-                    # 计算指标（用于监控，不参与梯度）
-                    with torch.no_grad():
-                        layer_mse += F.mse_loss(h_fake_flat, h_real_flat).item()
-                        cosine_sim = F.cosine_similarity(h_fake_flat.unsqueeze(0), h_real_flat.unsqueeze(0))
-                        layer_cosine += cosine_sim.mean().item()
-                        layer_l1 += F.l1_loss(h_fake_flat, h_real_flat).item()
-                        layer_samples += 1
-
-                n_samples = len(h_real_list)
-
-                # 记录每层指标
-                if layer_samples > 0:
-                    mse_per_layer[layer_idx] = layer_mse / layer_samples
-                    cosine_per_layer[layer_idx] = layer_cosine / layer_samples
-                    l1_per_layer[layer_idx] = layer_l1 / layer_samples
-
-            # 除以样本数和层数
-            n_layers = len(h_real_dict)
-            alignment_loss = alignment_loss_total / (n_samples * n_layers)
-
-            # 使用专门的 mse_loss_weight，如果没有则使用 adv_loss_weight
-            losses['adv_loss'] = alignment_loss * gan_weight
-            stats['raw_adv_loss'] = alignment_loss.item()
-            stats['adversarial_mode'] = 'mse'
-            stats['mse_loss_type'] = mse_loss_type
-
-            # 记录对齐指标
-            stats['mse_per_layer'] = mse_per_layer
-            stats['cosine_per_layer'] = cosine_per_layer
-            stats['l1_per_layer'] = l1_per_layer
-
-            # 计算整体指标
-            if mse_per_layer:
-                stats['avg_mse'] = sum(mse_per_layer.values()) / len(mse_per_layer)
-                stats['avg_cosine'] = sum(cosine_per_layer.values()) / len(cosine_per_layer)
-                stats['avg_l1'] = sum(l1_per_layer.values()) / len(l1_per_layer)
-
-            # MSE 模式下没有判别器损失
-            losses['disc_loss'] = torch.tensor(0.0, device=device)
-            stats['raw_disc_loss'] = 0.0
+        if layer_losses:
+            repair_loss = torch.stack(layer_losses).mean()
         else:
-            # === Discriminator 模式：使用判别器进行对抗训练 ===
-            loss_type = method_cfg.get('disc_loss_type', 'bce')
-            gp_weight = method_cfg.get('disc_gp_weight', 10.0)
-            has_attn = all(('h_real_attn' in info and 'h_fake_attn' in info) for info in output.pruning_infos.values())
-            if not has_attn:
-                raise ValueError("Discriminator expects attn features, but h_real_attn/h_fake_attn not found in pruning_infos.")
-            h_disc_real_dict = {idx: info['h_real_attn'] for idx, info in output.pruning_infos.items()}
-            h_disc_fake_dict = {idx: info['h_fake_attn'] for idx, info in output.pruning_infos.items()}
-            stats['disc_source'] = 'attn'
+            repair_loss = torch.tensor(0.0, device=device)
 
-            # 获取 disc_manager（可能被 DDP 包装）
-            disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
+        losses['repair_loss'] = repair_loss
+        stats['raw_repair_loss'] = float(repair_loss.detach().item())
+        stats['repair_loss_type'] = repair_loss_type
+        stats['repair_per_layer'] = per_layer
+    else:
+        losses['repair_loss'] = torch.tensor(0.0, device=device)
+        stats['raw_repair_loss'] = 0.0
 
-            adv_loss = disc_manager.compute_adv_loss(h_disc_fake_dict, loss_type=loss_type)
-            losses['adv_loss'] = adv_loss * gan_weight
-            stats['raw_adv_loss'] = adv_loss.item()
-
-            disc_loss = disc_manager.compute_disc_loss(h_disc_real_dict, h_disc_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
-            losses['disc_loss'] = disc_loss * gan_weight
-            stats['raw_disc_loss'] = disc_loss.item()
-
-            acc_info = disc_manager.compute_accuracy(h_disc_real_dict, h_disc_fake_dict)
-            stats['disc_accuracy'] = acc_info['overall']
-            stats['disc_real_acc'] = acc_info['real_acc']
-            stats['disc_fake_acc'] = acc_info['fake_acc']
-            stats['disc_per_layer'] = acc_info['per_layer']
-            stats['adversarial_mode'] = 'discriminator'
-
-        # Sparsity Loss
+    # 3. Sparsity Loss
+    if output.pruning_infos and len(output.pruning_infos) > 0:
         target_token_num = method_cfg.get('target_token_num', 144)
         n_vision = prep['n_vision']
         final_target_ratio = target_token_num / n_vision
@@ -368,12 +343,12 @@ def train_step(
             cumulative_ratio = cumulative_mask.float().mean()
             cumulative_ratios.append(cumulative_ratio)
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
-
         # 计算独立保留率 p_i = 当前层的 current_mask 的平均值
-        # 不再使用除法 cumulative_r_i / cumulative_r_{i-1}，避免梯度计算问题
+        # 不再使用除法 cumulative_r_i / cumulative_r_{i-1}，避免梯度计算不稳定
         independent_ratios = []
         for i, layer_idx in enumerate(pruning_layers):
-            current_mask = output.pruning_infos[layer_idx].get('current_mask')
+            info = output.pruning_infos[layer_idx]
+            current_mask = info.get('current_mask')
             if current_mask is None:
                 # 向后兼容：如果没有 current_mask，使用除法计算
                 if i == 0:
@@ -386,64 +361,54 @@ def train_step(
             p_i = p_i.clamp(min=1e-6, max=1.0)
             independent_ratios.append(p_i)
 
-        # 计算各段的层数 [n0, n1, n2, n3]
-        n_segments = []
-        for i, layer_idx in enumerate(pruning_layers):
-            if i == 0:
-                n_segments.append(layer_idx)  # n0: 剪枝前的层数
-            if i < n_pruning_layers - 1:
-                n_segments.append(pruning_layers[i + 1] - layer_idx)
-            else:
-                n_segments.append(total_layers - layer_idx)
+        # 计算各段的层数：[n0, n1, ..., nK]，长度 = n_pruning_layers + 1
+        # n0 = 第一层剪枝前的层数（这些层没有被剪）
+        # n1 = 从 pruning_layers[0] 到 pruning_layers[1] 之间的层数（都受第一个 pruner 影响）
+        # ...
+        segment_lengths = []
+        segment_lengths.append(pruning_layers[0])  # 0..L0-1
+        for i in range(n_pruning_layers - 1):
+            segment_lengths.append(pruning_layers[i + 1] - pruning_layers[i])
+        segment_lengths.append(total_layers - pruning_layers[-1])
 
         if sparsity_loss_mode == 'exact':
-            # === 精确加权平均方案 ===
-            # avg = (n0*1 + n1*p1 + n2*p1*p2 + n3*p1*p2*p3) / total_layers
+            # avg = (n0*1 + n1*p1 + n2*p1*p2 + ...) / total_layers
             avg_kept = torch.tensor(0.0, device=device)
-            avg_kept = avg_kept + n_segments[0] * 1.0  # 剪枝前的层，保留率=1
-            cumulative_product = torch.tensor(1.0, device=device, requires_grad=True)
+            avg_kept = avg_kept + segment_lengths[0] * 1.0
+            cumulative_product = torch.tensor(1.0, device=device)
             for i in range(n_pruning_layers):
                 cumulative_product = cumulative_product * independent_ratios[i]
-                avg_kept = avg_kept + n_segments[i + 1] * cumulative_product
+                avg_kept = avg_kept + segment_lengths[i + 1] * cumulative_product
             avg_kept = avg_kept / total_layers
             sparsity_loss = torch.abs(avg_kept - target_ratio)
-
-            # 调试：检查梯度是否能传导
-            # 只在训练模式下检查梯度（eval 时在 torch.no_grad() 上下文中，没有梯度是正常的）
-            if torch.is_grad_enabled() and not sparsity_loss.requires_grad:
-                print(f"[WARNING] sparsity_loss has no grad! step={current_step}")
-                print(f"  avg_kept.requires_grad: {avg_kept.requires_grad}")
-                for i, p in enumerate(independent_ratios):
-                    print(f"  independent_ratios[{i}].requires_grad: {p.requires_grad}, grad_fn: {p.grad_fn}")
-
-        else:  # harmonic
-            # === 调和平均近似方案 ===
-            # hm = n / Σ(1/p_i)
+            stats['avg_kept_ratio'] = avg_kept.item()
+        else:
+            # harmonic mean 近似
             inv_sum = sum(1.0 / p for p in independent_ratios)
             hm = n_pruning_layers / inv_sum
-
-            # avg_approx = (n0*1 + n1*hm + n2*hm^2 + n3*hm^3) / total_layers
             avg_approx = torch.tensor(0.0, device=device)
-            avg_approx = avg_approx + n_segments[0] * 1.0
+            avg_approx = avg_approx + segment_lengths[0] * 1.0
             hm_power = hm
-            for i in range(1, len(n_segments)):
-                avg_approx = avg_approx + n_segments[i] * hm_power
+            for i in range(1, len(segment_lengths)):
+                avg_approx = avg_approx + segment_lengths[i] * hm_power
                 hm_power = hm_power * hm
             avg_approx = avg_approx / total_layers
             sparsity_loss = torch.abs(avg_approx - target_ratio)
-
             stats['harmonic_mean'] = hm.item()
+            stats['avg_kept_ratio'] = avg_approx.item()
 
         losses['sparsity_loss'] = sparsity_loss
         stats['raw_sparsity_loss'] = sparsity_loss.item()
-        # 显示平均每层保留率（与 sparsity loss 约束的目标一致）
-        if sparsity_loss_mode == 'exact':
-            stats['avg_kept_ratio'] = avg_kept.item()
-        else:
-            stats['avg_kept_ratio'] = avg_approx.item()
-        stats['final_kept_ratio'] = cumulative_ratios[-1].item()  # 最后一层的累积保留率
+        stats['final_kept_ratio'] = cumulative_ratios[-1].item()
         stats['target_kept_ratio'] = target_ratio
         stats['total_layers'] = total_layers
+    else:
+        losses['sparsity_loss'] = torch.tensor(0.0, device=device)
+        stats['raw_sparsity_loss'] = 0.0
+        stats['avg_kept_ratio'] = 1.0
+        stats['final_kept_ratio'] = 1.0
+        stats['target_kept_ratio'] = 1.0
+        stats['total_layers'] = 0
 
     # === Per-Pruner Tightening Loss: 惩罚每个 pruner 的保留率 ===
     # 使每个 pruner 独立地倾向于剪掉更多 tokens
@@ -517,9 +482,7 @@ def train_step(
 
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
-    adv_weight = method_cfg.get('adv_loss_weight', 0.5)
-    if adversarial_mode == 'mse':
-        adv_weight = method_cfg.get('mse_loss_weight', adv_weight)
+    repair_weight = method_cfg.get('repair_loss_weight', 0.0)
     sparsity_weight = method_cfg.get('sparsity_weight', 0.2)
 
     warmup_ratio = method_cfg.get('loss_weight_warmup_ratio', 0.0)
@@ -528,10 +491,7 @@ def train_step(
         cosine_factor = (1 - torch.cos(torch.tensor(warmup_progress * 3.14159))) / 2
 
         task_weight_start = method_cfg.get('task_loss_weight_start', task_weight)
-        adv_weight_start = method_cfg.get('adv_loss_weight_start', adv_weight)
-
         task_weight = task_weight_start + (task_weight - task_weight_start) * cosine_factor.item()
-        adv_weight = adv_weight_start + (adv_weight - adv_weight_start) * cosine_factor.item()
 
     if method_cfg.get('sparsity_warmup_enable', False):
         sparsity_warmup_ratio = method_cfg.get('sparsity_warmup_ratio', 0.2)
@@ -542,14 +502,14 @@ def train_step(
             sparsity_weight = sparsity_weight_max
 
     stats['task_weight'] = task_weight
-    stats['adv_weight'] = adv_weight
+    stats['repair_weight'] = repair_weight
     stats['sparsity_weight'] = sparsity_weight
 
     weighted_losses = {
         'task_loss': losses['task_loss'] * task_weight,
     }
-    if 'adv_loss' in losses:
-        weighted_losses['adv_loss'] = losses['adv_loss'] * adv_weight
+    if 'repair_loss' in losses:
+        weighted_losses['repair_loss'] = losses['repair_loss'] * repair_weight
     if 'sparsity_loss' in losses:
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
     if 'entropy_loss' in losses:
@@ -558,8 +518,7 @@ def train_step(
         weighted_losses['adapter_delta_loss'] = losses['adapter_delta_loss'] * adapter_delta_weight
     if 'tightening_loss' in losses:
         weighted_losses['tightening_loss'] = losses['tightening_loss']  # 权重已在计算时应用
-    if 'disc_loss' in losses:
-        weighted_losses['disc_loss'] = losses['disc_loss']
+    # 不再使用判别器相关损失（如需可恢复旧逻辑）
 
     return {
         'losses': weighted_losses,

@@ -118,6 +118,17 @@ def load_model(config, device: torch.device, local_rank: int):
     text_adapter_bottleneck = method_cfg.get('text_adapter_bottleneck', 256)
     generator_adapter_bottleneck = method_cfg.get('generator_adapter_bottleneck', 512)
 
+    # Delayed repair adapter（语言侧，仅 gen_answer tokens）
+    use_repair_adapter = method_cfg.get('use_repair_adapter', False)
+    repair_layers = method_cfg.get('repair_layers', None)
+    repair_source_layers = method_cfg.get('repair_source_layers', None)
+    repair_bottleneck_dim = method_cfg.get('repair_bottleneck_dim', 512)
+    repair_dropout = method_cfg.get('repair_dropout', adapter_dropout)
+    repair_mask_encoder_type = method_cfg.get('repair_mask_encoder_type', method_cfg.get('mask_encoder_type', 'attention'))
+    repair_use_pruned_info = method_cfg.get('repair_use_pruned_info', True)
+    repair_alpha_init = method_cfg.get('repair_alpha_init', adapter_alpha_init)
+    repair_detach_input = method_cfg.get('repair_detach_input', True)
+
     # Pruner query dropout
     pruner_query_dropout = method_cfg.get('pruner_query_dropout', 0.0)
 
@@ -226,6 +237,15 @@ def load_model(config, device: torch.device, local_rank: int):
             disc_use_spectral_norm=disc_spectral_norm,
             use_gumbel_noise=use_gumbel_noise,
             pruning_threshold=pruning_threshold,
+            use_repair_adapter=use_repair_adapter,
+            repair_layers=repair_layers,
+            repair_source_layers=repair_source_layers,
+            repair_bottleneck_dim=repair_bottleneck_dim,
+            repair_dropout=repair_dropout,
+            repair_mask_encoder_type=repair_mask_encoder_type,
+            repair_use_pruned_info=repair_use_pruned_info,
+            repair_alpha_init=repair_alpha_init,
+            repair_detach_input=repair_detach_input,
         )
 
     # 冻结基础模型
@@ -432,6 +452,19 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
                 if is_main_process():
                     logger.info("  Loaded separated_adapter_manager state")
+
+            # 新版 delayed repair adapter
+            if 'repair_context_encoder_state_dict' in checkpoint and getattr(model, 'use_repair_adapter', False):
+                if getattr(model, 'repair_context_encoder', None) is not None:
+                    model.repair_context_encoder.load_state_dict(checkpoint['repair_context_encoder_state_dict'])
+                    if is_main_process():
+                        logger.info("  Loaded repair_context_encoder state")
+
+            if 'repair_adapter_state_dict' in checkpoint and getattr(model, 'use_repair_adapter', False):
+                if getattr(model, 'repair_adapter_manager', None) is not None:
+                    model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
+                    if is_main_process():
+                        logger.info("  Loaded repair_adapter_manager state")
 
             if 'disc_state_dict' in checkpoint:
                 model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
@@ -832,6 +865,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
                     else:
                         ckpt_data['adapter_state_dict'] = model.adapter_manager.state_dict()
+                # 新版 delayed repair adapter
+                if getattr(model, 'use_repair_adapter', False):
+                    if getattr(model, 'repair_context_encoder', None) is not None:
+                        ckpt_data['repair_context_encoder_state_dict'] = model.repair_context_encoder.state_dict()
+                    if getattr(model, 'repair_adapter_manager', None) is not None:
+                        ckpt_data['repair_adapter_state_dict'] = model.repair_adapter_manager.state_dict()
                 if pruner_scheduler is not None:
                     ckpt_data['pruner_scheduler'] = pruner_scheduler.state_dict()
                 if disc_scheduler is not None:
@@ -859,6 +898,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 final_ckpt['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
             else:
                 final_ckpt['adapter_state_dict'] = model.adapter_manager.state_dict()
+        if getattr(model, 'use_repair_adapter', False):
+            if getattr(model, 'repair_context_encoder', None) is not None:
+                final_ckpt['repair_context_encoder_state_dict'] = model.repair_context_encoder.state_dict()
+            if getattr(model, 'repair_adapter_manager', None) is not None:
+                final_ckpt['repair_adapter_state_dict'] = model.repair_adapter_manager.state_dict()
         torch.save(final_ckpt, final_path)
         logger.info(f"Training completed. Final checkpoint saved to {final_path}")
 

@@ -96,11 +96,9 @@ method_settings:
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
   hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期和对齐期温度）
 
-  # ==================== Discriminator 配置 ====================
-  # 对抗损失模式：
-  # - "discriminator": 使用判别器进行对抗训练（默认）
-  # - "mse": 使用 MSE 损失直接约束 h_real 和 h_fake 的一致性
-  adversarial_mode: "mse"  # "discriminator" | "mse"
+  # ==================== 对抗训练（已禁用） ====================
+  # 当前实验：不使用判别器；用 teacher keep-all 做分布级对齐（repair loss）
+  adversarial_mode: "none"  # "none" | "discriminator" | "mse"(legacy)
 
   disc_d_d: 512
   disc_dropout: 0
@@ -114,15 +112,15 @@ method_settings:
   disc_reinit_threshold: 0.97     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
-  # ==================== Adapter 配置 ====================
-  # 是否启用 Adapter（如果为 false，则只使用 Pruner，不使用 Adapter）
-  use_adapter: true
+  # ==================== 旧版 Adapter（注意：当前实验禁用） ====================
+  # 旧版 adapter 是“同层、attn output 立即修复”；我们现在做的是 delayed repair（只修复 gen_answer tokens）
+  use_adapter: false
 
   # Adapter 补偿剪枝后的信息损失
   # - simple: 简单 MLP adapter
   # - lightweight: Mask-Aware FiLM adapter（轻量级，根据剪枝 pattern 动态调整）
   adapter_type: lightweight
-  adapter_bottleneck: 512         # adapter 瓶颈维度（统一 adapter 模式）
+  adapter_bottleneck: 512         # 保留字段（旧版 adapter 不启用时无效）
 
   # Mask encoder 类型
   # - attention: Attention 池化（更轻量，保留空间信息）
@@ -135,14 +133,35 @@ method_settings:
 
   # 分离式 Adapter：为 vision/text tokens 使用独立的 Adapter
   # text_adapter 同时处理 question 和 answer tokens
-  use_separated_adapters: true   # 是否启用分离式 Adapter
+  use_separated_adapters: false   # 旧版字段（当前实验无效）
   vision_adapter_bottleneck: 512  # vision tokens adapter 瓶颈维度
   text_adapter_bottleneck: 512    # text tokens adapter 瓶颈维度（包含 question 和 answer）
 
   # Adversarial Loss 梯度控制
   # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
   # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
-  detach_adv_from_pruner: false
+  detach_adv_from_pruner: false  # legacy（当前无对抗训练）
+
+  # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
+  use_repair_adapter: true
+  # 修复点：层输出后做修复（用于消融，建议 3 个：L4->13, L14->22, L24->29）
+  repair_layers: [13, 22, 29]
+  # 每个修复点使用哪个 pruning layer 的上下文（mask_emb/pruned_emb）
+  repair_source_layers: [4, 14, 24]
+  repair_bottleneck_dim: 512
+  repair_dropout: 0.0
+  repair_mask_encoder_type: attention
+  repair_use_pruned_info: true
+  repair_alpha_init: 0.1
+  repair_detach_input: true
+
+  # teacher 前向：keep-all 作为 source 分布
+  teacher_forward_enable: true
+  teacher_pruning_mode: keep_all
+  # repair loss：分布级对齐（均值 + 方差）
+  repair_loss_weight: 0.2
+  repair_loss_type: mean_var
+  repair_var_weight: 1.0
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练

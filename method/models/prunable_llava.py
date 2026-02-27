@@ -21,7 +21,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaDecoderLay
 from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer
-from .adapter import AdapterManager, SeparatedAdapterManager
+from .adapter import AdapterManager, SeparatedAdapterManager, RepairContextEncoder
 
 
 def build_vision_pruning_attention_mask(
@@ -81,6 +81,12 @@ class PrunableLlavaOutput:
     # 物理删除后调整的位置（用于 compute_task_loss）
     adjusted_answer_starts: Optional[List[int]] = None
     adjusted_answer_ends: Optional[List[int]] = None
+    # 额外捕获的中间层表示（用于 gap/repair 分析与训练）
+    # 约定格式：
+    #   {layer_idx: {"h": (batch, Lmax, hidden), "mask": (batch, Lmax)}}
+    captured: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    # 仅用于 repair loss 的捕获（可选：对 base hidden_states 做 stop-grad，避免 repair loss 回流到 pruner）
+    captured_for_repair: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
 
 
 class PrunableLlavaForConditionalGeneration(nn.Module):
@@ -123,6 +129,18 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的剪枝阈值
         use_question_condition: bool = False,  # 是否使用 question embedding 条件化 pruner
+        # ==================== Delayed Repair Adapter (language-side) ====================
+        # 设计目标：只修复 gen_answer tokens；修复点可配置（用于消融）
+        use_repair_adapter: bool = False,
+        repair_layers: Optional[List[int]] = None,  # 在哪些层输出后做修复（0-based layer idx）
+        repair_source_layers: Optional[List[int]] = None,  # 每个 repair_layer 使用哪个 pruning layer 的上下文；None=自动选最近的
+        repair_bottleneck_dim: int = 512,  # 修复 adapter / context bottleneck（必须一致）
+        repair_dropout: float = 0.15,
+        repair_mask_encoder_type: str = 'attention',
+        repair_use_pruned_info: bool = True,
+        repair_alpha_init: float = 0.1,
+        # 训练稳定性：adapter 的输入是否 stop-grad（避免 repair loss/adapter 路径把梯度回流到 pruner）
+        repair_detach_input: bool = True,
     ):
         super().__init__()
 
@@ -132,6 +150,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.pruning_layers = pruning_layers
         self.use_question_condition = use_question_condition
         self.use_adapter = use_adapter
+        self.use_repair_adapter = use_repair_adapter
+        self.repair_layers = list(repair_layers) if repair_layers is not None else []
+        self.repair_detach_input = repair_detach_input
 
         # 获取 LLM 配置
         llm_config = self.config.text_config
@@ -199,6 +220,43 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             self.adapter_manager = None
             self.separated_adapter_manager = None
 
+        # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
+        # - pruning layer: 缓存修复上下文 (mask_emb, pruned_emb)
+        # - repair layer: 基于缓存上下文对 gen_answer hidden_states 做轻量修复
+        self.repair_context_encoder = None
+        self.repair_adapter_manager = None
+        self._repair_source_by_layer = {}
+        if self.use_repair_adapter and self.repair_layers:
+            # repair_source_layers: 与 repair_layers 对齐；None 表示运行时自动选择最近的 pruning layer
+            if repair_source_layers is not None:
+                if len(repair_source_layers) != len(self.repair_layers):
+                    raise ValueError(
+                        f"repair_source_layers length ({len(repair_source_layers)}) must match "
+                        f"repair_layers length ({len(self.repair_layers)})."
+                    )
+                self._repair_source_by_layer = {
+                    int(r_layer): int(s_layer) for r_layer, s_layer in zip(self.repair_layers, repair_source_layers)
+                }
+
+            self.repair_context_encoder = RepairContextEncoder(
+                hidden_size=self.hidden_size,
+                bottleneck_dim=repair_bottleneck_dim,
+                n_vision=576,
+                mask_encoder_type=repair_mask_encoder_type,
+                use_pruned_info=repair_use_pruned_info,
+            )
+            self.repair_adapter_manager = AdapterManager(
+                layer_indices=self.repair_layers,
+                hidden_size=self.hidden_size,
+                bottleneck_dim=repair_bottleneck_dim,
+                adapter_type='lightweight',
+                n_vision=576,
+                dropout=repair_dropout,
+                mask_encoder_type=repair_mask_encoder_type,
+                use_pruned_info=repair_use_pruned_info,
+                adapter_alpha_init=repair_alpha_init,
+            )
+
         # 替换所有层为 PrunableLlamaDecoderLayer（剪枝层有 pruner，非剪枝层没有）
         self._replace_all_layers()
 
@@ -222,6 +280,13 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             layer_param = next(original_layer.parameters())
             layer_device = layer_param.device
             layer_dtype = layer_param.dtype
+
+            # repair modules（共享，但需要放到正确 device/dtype）
+            if self.repair_context_encoder is not None:
+                self.repair_context_encoder.to(device=layer_device, dtype=layer_dtype)
+            if self.repair_adapter_manager is not None and (layer_idx in self.repair_layers):
+                repair_adapter = self.repair_adapter_manager.get_adapter(layer_idx)
+                repair_adapter.to(device=layer_device, dtype=layer_dtype)
 
             if layer_idx in self.pruning_layers:
                 # 剪枝层：有 pruner, discriminator, adapter
@@ -250,7 +315,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     pruner=pruner,
                     discriminator=discriminator,
                     adapter=adapter,
-                    separated_adapters=separated_adapters
+                    separated_adapters=separated_adapters,
+                    repair_context_encoder=self.repair_context_encoder,
                 )
             else:
                 # 非剪枝层：没有 pruner，但可以应用 cumulative_mask
@@ -260,7 +326,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     pruner=None,
                     discriminator=None,
                     adapter=None,
-                    separated_adapters=None
+                    separated_adapters=None,
+                    repair_context_encoder=None,
                 )
 
     def _restore_original_layers(self):
@@ -326,6 +393,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         answer_ends: Optional[list] = None,
         return_pruning_info: bool = True,
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
+        pruning_mode: str = "normal",  # 'normal' | 'keep_all'（teacher baseline）
+        apply_repair: Optional[bool] = None,  # None=根据 self.use_repair_adapter 自动决定
+        capture_layers: Optional[List[int]] = None,  # 需要返回哪些层的 gen_answer 表征
         **kwargs
     ) -> PrunableLlavaOutput:
         """前向传播（训练时物理删除 vision tokens，与推理完全对齐）
@@ -393,6 +463,17 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
         # === 遍历所有层 ===
         pruning_infos = {}
+        capture_layers_set = set(capture_layers or [])
+        captured = {}
+        captured_for_repair = {}
+
+        # 运行时决定是否应用 repair（默认：仅当启用 repair_adapter 时才应用）
+        if apply_repair is None:
+            apply_repair = bool(self.use_repair_adapter and self.repair_adapter_manager is not None)
+
+        # 缓存来自 pruning layers 的修复上下文（低维向量）
+        # {prune_layer_idx: {"mask_emb": (b,d), "pruned_emb": (b,d) or None}}
+        repair_context_cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
         # 构建 causal mask（所有层共用，不包含 vision pruning）
         min_val = torch.finfo(dtype).min
@@ -401,40 +482,50 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             diagonal=1
         ).unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
+        # === gen_answer token 区域（固定位置，不做物理删除）===
+        # 训练的 task loss 使用 pred_start = answer_start - 1，因此这里也用同样的“gen_answer”定义：
+        # gen_answer positions = [answer_start-1, answer_end-1)
+        if (answer_starts is None) or (answer_ends is None):
+            gen_mask_full = None
+            gen_starts = None
+            gen_ends = None
+        else:
+            gen_starts = [max(int(s) - 1, 0) for s in answer_starts]
+            gen_ends = [max(int(e) - 1, gs) for e, gs in zip(answer_ends, gen_starts)]
+            gen_mask_full = torch.zeros(batch_size, orig_seq_len, device=device, dtype=dtype)
+            for i in range(batch_size):
+                if gen_ends[i] > gen_starts[i]:
+                    gen_mask_full[i, gen_starts[i]:gen_ends[i]] = 1
+
+        def _capture_gen_answer(h: torch.Tensor) -> Dict[str, torch.Tensor]:
+            """将不同样本长度的 gen_answer hidden states pad 成 batch tensor。"""
+            if gen_starts is None or gen_ends is None:
+                raise ValueError("capture_gen_answer requires answer_starts/answer_ends.")
+            lens = [max(ge - gs, 0) for gs, ge in zip(gen_starts, gen_ends)]
+            max_len = max(lens) if lens else 0
+            if max_len <= 0:
+                # 兜底：返回一个空的占位 tensor，避免下游崩溃
+                return {
+                    "h": torch.zeros(batch_size, 1, self.hidden_size, device=h.device, dtype=h.dtype),
+                    "mask": torch.zeros(batch_size, 1, device=h.device, dtype=h.dtype),
+                }
+            out = torch.zeros(batch_size, max_len, self.hidden_size, device=h.device, dtype=h.dtype)
+            m = torch.zeros(batch_size, max_len, device=h.device, dtype=h.dtype)
+            for i in range(batch_size):
+                L = lens[i]
+                if L <= 0:
+                    continue
+                out[i, :L] = h[i, gen_starts[i]:gen_ends[i], :]
+                m[i, :L] = 1
+            return {"h": out, "mask": m}
+
         for layer_idx, decoder_layer in enumerate(llm.layers):
             # position_ids 保持不变（不做物理删除）
             position_ids = torch.arange(orig_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             position_embeddings = llm.rotary_emb(hidden_states, position_ids)
 
-            if isinstance(decoder_layer, PrunableLlamaDecoderLayer) and return_pruning_info:
-                # PrunableLlamaDecoderLayer（剪枝层或非剪枝层）
-                # 使用 causal mask，vision pruning 通过 post-softmax masking 实现
-                hidden_states, pruning_info = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=None,
-                    position_embeddings=position_embeddings,
-                    vision_start=vision_start,
-                    vision_end=vision_end,
-                    question_starts=question_starts,
-                    question_ends=question_ends,
-                    answer_starts=answer_starts,
-                    answer_ends=answer_ends,
-                    return_pruning_info=True,
-                    cumulative_vision_mask=cumulative_mask,
-                    detach_h_fake_for_adv=detach_h_fake_for_adv,
-                )
-                if pruning_info is not None:
-                    pruning_infos[layer_idx] = pruning_info
-                    # 用新的累积 mask 更新
-                    if 'cumulative_mask' in pruning_info:
-                        cumulative_mask = pruning_info['cumulative_mask'].clone()
-
-            else:
-                # 非 PrunableLlamaDecoderLayer（不应该发生，因为所有层都被替换了）
+            if not isinstance(decoder_layer, PrunableLlamaDecoderLayer):
+                # 不应该发生（所有层都被替换了），但保留兜底
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -444,6 +535,89 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     cache_position=torch.arange(orig_seq_len, device=device),
                     position_embeddings=position_embeddings,
                 )
+                continue
+
+            # PrunableLlamaDecoderLayer（剪枝层或非剪枝层）
+            # 注意：即使 return_pruning_info=False，也必须计算 pruning_info，
+            # 否则无法更新 cumulative_mask，后续层不会继承剪枝效果。
+            hidden_states, pruning_info = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=None,
+                position_embeddings=position_embeddings,
+                vision_start=vision_start,
+                vision_end=vision_end,
+                question_starts=question_starts,
+                question_ends=question_ends,
+                answer_starts=answer_starts,
+                answer_ends=answer_ends,
+                return_pruning_info=True,
+                cumulative_vision_mask=cumulative_mask,
+                detach_h_fake_for_adv=detach_h_fake_for_adv,
+                pruning_mode=pruning_mode,
+            )
+
+            if pruning_info is not None:
+                # 用新的累积 mask 更新
+                if 'cumulative_mask' in pruning_info:
+                    cumulative_mask = pruning_info['cumulative_mask'].clone()
+
+                # 缓存 pruning layer 的 repair 上下文（只缓存低维 embedding）
+                if self.use_repair_adapter:
+                    if ('repair_mask_emb' in pruning_info) and (pruning_info['repair_mask_emb'] is not None):
+                        repair_context_cache[layer_idx] = {
+                            "mask_emb": pruning_info.get('repair_mask_emb'),
+                            "pruned_emb": pruning_info.get('repair_pruned_emb'),
+                        }
+
+                if return_pruning_info and (layer_idx in self.pruning_layers):
+                    pruning_infos[layer_idx] = pruning_info
+
+            # === Delayed repair: 仅修复 gen_answer tokens ===
+            hidden_states_for_repair = None
+            if (
+                apply_repair
+                and self.use_repair_adapter
+                and (self.repair_adapter_manager is not None)
+                and (gen_mask_full is not None)
+                and (layer_idx in self.repair_layers)
+            ):
+                # 选择 repair context 来源：显式指定 or 最近的 pruning layer
+                source_layer = self._repair_source_by_layer.get(layer_idx, None)
+                if source_layer is None:
+                    # 选取 <= layer_idx 的最近 pruning layer
+                    eligible = [k for k in repair_context_cache.keys() if k <= layer_idx]
+                    source_layer = max(eligible) if eligible else None
+
+                ctx = repair_context_cache.get(source_layer, None) if source_layer is not None else None
+                if ctx is not None:
+                    adapter = self.repair_adapter_manager.get_adapter(layer_idx)
+                    base = hidden_states
+                    adapter_in = base.detach() if self.repair_detach_input else base
+                    adapted = adapter(
+                        adapter_in,
+                        mask=None,
+                        query=adapter_in,
+                        mask_emb=ctx.get("mask_emb"),
+                        pruned_emb=ctx.get("pruned_emb"),
+                    )
+                    delta = adapted - adapter_in
+                    # task forward：允许梯度通过 base（用于训练 pruner），delta 梯度只回到 adapter（若 detach_input=True）
+                    hidden_states = base + gen_mask_full.unsqueeze(-1) * delta
+                    # repair loss：stop-grad base，避免 repair 目标回流到 pruner
+                    hidden_states_for_repair = base.detach() + gen_mask_full.unsqueeze(-1) * delta
+
+            # === Capture ===
+            if layer_idx in capture_layers_set:
+                captured[layer_idx] = _capture_gen_answer(hidden_states)
+                if hidden_states_for_repair is not None:
+                    captured_for_repair[layer_idx] = _capture_gen_answer(hidden_states_for_repair)
+                else:
+                    # 非 repair layer：保持一致（但 detach 一下以避免无意义的图保留）
+                    captured_for_repair[layer_idx] = _capture_gen_answer(hidden_states.detach())
 
 
         # Final LayerNorm
@@ -471,6 +645,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             pruning_infos=pruning_infos if return_pruning_info else None,
             adjusted_answer_starts=answer_starts,  # 位置不变
             adjusted_answer_ends=answer_ends,
+            captured=captured if capture_layers_set else None,
+            captured_for_repair=captured_for_repair if capture_layers_set else None,
         )
 
     def set_temperature(self, temperature: float):
@@ -495,12 +671,29 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
     def get_adapter_parameters(self):
         """获取所有 adapter 的参数"""
-        if not self.use_adapter:
+        from itertools import chain
+
+        param_iters = []
+
+        # 旧版 attention-output adapter（如果仍启用）
+        if getattr(self, 'use_adapter', False):
+            if self.use_separated_adapters and self.separated_adapter_manager is not None:
+                param_iters.append(self.separated_adapter_manager.parameters())
+            elif self.adapter_manager is not None:
+                param_iters.append(self.adapter_manager.parameters())
+
+        # 新版 delayed repair adapter（语言侧）
+        if getattr(self, 'use_repair_adapter', False):
+            if self.repair_context_encoder is not None:
+                param_iters.append(self.repair_context_encoder.parameters())
+            if self.repair_adapter_manager is not None:
+                param_iters.append(self.repair_adapter_manager.parameters())
+
+        if not param_iters:
             return []
-        if self.use_separated_adapters:
-            return self.separated_adapter_manager.parameters()
-        else:
-            return self.adapter_manager.parameters()
+        if len(param_iters) == 1:
+            return param_iters[0]
+        return chain(*param_iters)
 
     def freeze_base_model(self):
         """冻结基础模型参数（但保持 pruner, discriminator, adapter 可训练）"""

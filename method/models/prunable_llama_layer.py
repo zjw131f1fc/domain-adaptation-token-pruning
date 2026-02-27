@@ -44,7 +44,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
         pruner: Optional[nn.Module] = None,
         discriminator: Optional[nn.Module] = None,
         adapter: Optional[nn.Module] = None,
-        separated_adapters: Optional[Tuple[nn.Module, nn.Module, nn.Module]] = None
+        separated_adapters: Optional[Tuple[nn.Module, nn.Module, nn.Module]] = None,
+        repair_context_encoder: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.original_layer = original_layer
@@ -53,6 +54,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         self.discriminator = discriminator
         self.adapter = adapter
         self.separated_adapters = separated_adapters  # (vision, text, answer)
+        self.repair_context_encoder = repair_context_encoder
         self.is_pruning_layer = pruner is not None
 
         # 从原始层获取配置
@@ -77,6 +79,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         return_pruning_info: bool = False,
         cumulative_vision_mask: Optional[torch.Tensor] = None,  # 累积 vision mask
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
+        pruning_mode: str = "normal",  # 'normal' or 'keep_all'
         **kwargs
     ):
         """前向传播
@@ -112,8 +115,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
         if not self.is_pruning_layer:
             # 非剪枝层：如果有 cumulative_mask，应用 post-softmax masking
-            if cumulative_vision_mask is not None and return_pruning_info:
-                return self._forward_with_mask_only(
+            if cumulative_vision_mask is not None:
+                hidden_states_out, _ = self._forward_with_mask_only(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -126,6 +129,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
                     cumulative_mask=cumulative_vision_mask,
                     **kwargs
                 )
+                if return_pruning_info:
+                    return hidden_states_out, None
+                return hidden_states_out
             else:
                 # 没有 cumulative_mask，直接调用原始 layer
                 output = self.original_layer(
@@ -160,6 +166,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
             return_pruning_info=return_pruning_info,
             cumulative_mask=cumulative_vision_mask,  # 兼容旧参数名
             detach_h_fake_for_adv=detach_h_fake_for_adv,
+            pruning_mode=pruning_mode,
             **kwargs
         )
 
@@ -293,6 +300,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         return_pruning_info: bool,
         cumulative_mask: Optional[torch.Tensor] = None,  # 之前层的累积 mask
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
+        pruning_mode: str = "normal",  # 'normal' or 'keep_all'
         **kwargs
     ):
         """剪枝层的前向传播
@@ -405,13 +413,17 @@ class PrunableLlamaDecoderLayer(nn.Module):
             question_lengths = torch.tensor(question_lengths_list, device=device, dtype=torch.long)
 
         # Pruner 生成当前层的 mask
-        current_mask, pruner_info = self.pruner.forward_full(
-            vision_hidden, q2v_attn_avg,
-            cumulative_vision_mask=cumulative_mask,
-            question_hidden=question_hidden,
-            question_lengths=question_lengths,
-            return_debug=True
-        )
+        if pruning_mode == "keep_all":
+            current_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
+            pruner_info = {}
+        else:
+            current_mask, pruner_info = self.pruner.forward_full(
+                vision_hidden, q2v_attn_avg,
+                cumulative_vision_mask=cumulative_mask,
+                question_hidden=question_hidden,
+                question_lengths=question_lengths,
+                return_debug=True
+            )
         # current_mask: (batch, n_vision) - 当前层的决策
 
         # === 计算新的累积 mask ===
@@ -421,184 +433,57 @@ class PrunableLlamaDecoderLayer(nn.Module):
         else:
             new_cumulative_mask = current_mask
 
-        # === Step 4: 计算 h_real 和 h_fake ===
-        # h_real: 完整 attention 聚合
-        attn_output_real = torch.matmul(attn_weights, value_states)
-
-        # h_fake: 当前层 mask 剪枝后的 attention 聚合
-        # 使用 post-softmax mask + renormalize（与推理一致）
-        # 如果 detach_h_fake_for_adv=True，则 detach mask，阻止 adv_loss 梯度流向 pruner
+        # === Step 4: 在 attention weights 上应用 new_cumulative_mask（post-softmax masking）===
+        # 注意：这里必须用 new_cumulative_mask（而不是 current_mask），否则之前被剪掉的 token 会“复活”
         if detach_h_fake_for_adv:
-            current_mask_for_fake = current_mask.detach()
-            cumulative_mask_for_adapter = new_cumulative_mask.detach()
+            mask_for_attn = new_cumulative_mask.detach()
         else:
-            current_mask_for_fake = current_mask
-            cumulative_mask_for_adapter = new_cumulative_mask
-        mask_expanded = current_mask_for_fake.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+            mask_for_attn = new_cumulative_mask
 
-        # 创建完整的 mask（非 vision 部分为 1，vision 部分为 current_mask）
-        ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start,
-                                 device=device, dtype=dtype)
-        ones_after = torch.ones(batch_size, num_heads, seq_len, kv_len - vision_end,
-                                device=device, dtype=dtype)
+        mask_expanded = mask_for_attn.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
+        ones_before = torch.ones(batch_size, num_heads, seq_len, vision_start, device=device, dtype=dtype)
+        ones_after = torch.ones(batch_size, num_heads, seq_len, kv_len - vision_end, device=device, dtype=dtype)
         mask_vision = mask_expanded.expand(-1, num_heads, seq_len, -1)
         full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
 
-        # 应用 mask 并重新归一化
-        attn_weights_fake = attn_weights * full_mask
-        attn_sum = attn_weights_fake.sum(dim=-1, keepdim=True)
-        attn_weights_fake = (attn_weights_fake / (attn_sum + 1e-8)).to(dtype)
+        attn_weights_masked = attn_weights * full_mask
+        attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
+        attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
 
-        attn_output_fake = torch.matmul(attn_weights_fake, value_states)
+        attn_output = torch.matmul(attn_weights_masked, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+        attn_output = attn.o_proj(attn_output)
 
-        # === Step 4.5: Adapter 修正 ===
-        # 保存 Adapter 处理前的 attn_output_fake（用于可视化分析）
-        attn_output_fake_before_adapter = attn_output_fake.clone()
+        # 残差连接
+        hidden_states = residual + attn_output
 
-        if self.separated_adapters is not None:
-            # 分离式 Adapter：对 vision/text 分别处理（text 包含 question 和 answer）
-            vision_adapter, text_adapter = self.separated_adapters
-            attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-            adapted_output = attn_output_fake_flat.clone()
-
-            # Vision tokens: [vision_start, vision_end)
-            vision_slice = attn_output_fake_flat[:, vision_start:vision_end, :]
-            vision_query = query_states_flat[:, vision_start:vision_end, :]
-            adapted_vision = vision_adapter(
-                vision_slice,
-                mask=cumulative_mask_for_adapter,
-                query=vision_query,
-                vision_hidden=vision_hidden  # 传入 vision hidden states
-            )
-            adapted_output[:, vision_start:vision_end, :] = adapted_vision
-
-            # Text tokens (question): 每个样本可能不同
-            for i in range(batch_size):
-                q_start, q_end = question_starts[i], question_ends[i]
-                text_slice = attn_output_fake_flat[i:i+1, q_start:q_end, :]
-                text_query = query_states_flat[i:i+1, q_start:q_end, :]
-                adapted_text = text_adapter(
-                    text_slice,
-                    mask=cumulative_mask_for_adapter[i:i+1],
-                    query=text_query,
-                    vision_hidden=vision_hidden[i:i+1]  # 传入 vision hidden states
-                )
-                adapted_output[i, q_start:q_end, :] = adapted_text.squeeze(0)
-
-            # Generator tokens (answer): 使用 text_adapter
-            for i in range(batch_size):
-                gen_start = answer_starts[i] - 1
-                gen_end = answer_ends[i] - 1
-                gen_slice = attn_output_fake_flat[i:i+1, gen_start:gen_end, :]
-                gen_query = query_states_flat[i:i+1, gen_start:gen_end, :]
-                adapted_gen = text_adapter(
-                    gen_slice,
-                    mask=cumulative_mask_for_adapter[i:i+1],
-                    query=gen_query,
-                    vision_hidden=vision_hidden[i:i+1]  # 传入 vision hidden states
-                )
-                adapted_output[i, gen_start:gen_end, :] = adapted_gen.squeeze(0)
-
-            attn_output_fake = adapted_output.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-        elif self.adapter is not None:
-            # 统一 Adapter（向后兼容）
-            attn_output_fake_flat = attn_output_fake.permute(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-            attn_output_fake_adapted = self.adapter(
-                attn_output_fake_flat,
-                mask=cumulative_mask_for_adapter,
-                query=query_states_flat,
-                vision_hidden=vision_hidden  # 传入 vision hidden states
-            )
-            attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-
-        # === Step 5: 提取 h_real 和 h_fake（answer 位置）- 暂存，后面 FFN 后再更新 ===
-        # 注意：这里先保存 attention output，后面会用 FFN 后的 hidden states 替换
-        h_real_attn_list = []
-        h_fake_attn_list = []
-        for i in range(batch_size):
-            ans_start, ans_end = answer_starts[i], answer_ends[i]
-            gen_start = ans_start - 1
-            gen_end = ans_end - 1
-            h_real_attn_list.append(attn_output_real[i, :, gen_start:gen_end, :])
-            h_fake_attn_list.append(attn_output_fake[i, :, gen_start:gen_end, :])
-        h_real_attn = h_real_attn_list
-        h_fake_attn = h_fake_attn_list
-
-        # === Step 6: 分别计算 real 和 fake 的完整前向（包括 o_proj + 残差 + FFN）===
-        # Real 路径：使用完整的 attention output
-        attn_output_real_flat = attn_output_real.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
-        attn_output_real_proj = attn.o_proj(attn_output_real_flat)
-        hidden_states_real = residual + attn_output_real_proj
-        residual_real = hidden_states_real
-        hidden_states_real = layer.post_attention_layernorm(hidden_states_real)
-        hidden_states_real = layer.mlp(hidden_states_real)
-        hidden_states_real = residual_real + hidden_states_real
-
-        # Fake 路径：使用剪枝后的 attention output（已经过 Adapter）
-        attn_output_fake_flat = attn_output_fake.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
-        attn_output_fake_proj = attn.o_proj(attn_output_fake_flat)
-        hidden_states_fake = residual + attn_output_fake_proj
-        residual_fake = hidden_states_fake
-        hidden_states_fake = layer.post_attention_layernorm(hidden_states_fake)
-        hidden_states_fake = layer.mlp(hidden_states_fake)
-        hidden_states_fake = residual_fake + hidden_states_fake
-
-        # Fake 路径（Adapter 前）：用于可视化分析
-        attn_output_fake_before_flat = attn_output_fake_before_adapter.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
-        attn_output_fake_before_proj = attn.o_proj(attn_output_fake_before_flat)
-        hidden_states_fake_before = residual + attn_output_fake_before_proj
-        residual_fake_before = hidden_states_fake_before
-        hidden_states_fake_before = layer.post_attention_layernorm(hidden_states_fake_before)
-        hidden_states_fake_before = layer.mlp(hidden_states_fake_before)
-        hidden_states_fake_before = residual_fake_before + hidden_states_fake_before
-
-        # === Step 7: 提取 FFN 后的 h_real, h_fake (Adapter 前), h_corrected (Adapter 后) ===
-        h_real_list = []
-        h_fake_list = []  # Adapter 前
-        h_corrected_list = []  # Adapter 后
-        for i in range(batch_size):
-            ans_start, ans_end = answer_starts[i], answer_ends[i]
-            gen_start = ans_start - 1
-            gen_end = ans_end - 1
-            # FFN 后的 hidden states: (batch, seq, hidden_size)
-            # 转换为 (heads, n_ans, head_dim) 格式以兼容判别器
-            h_real_i = hidden_states_real[i, gen_start:gen_end, :]  # (n_ans, hidden_size)
-            h_fake_before_i = hidden_states_fake_before[i, gen_start:gen_end, :]  # Adapter 前
-            h_corrected_i = hidden_states_fake[i, gen_start:gen_end, :]  # Adapter 后
-            # 重塑为 (heads, n_ans, head_dim) 以兼容现有判别器
-            h_real_i = h_real_i.view(-1, num_heads, head_dim).permute(1, 0, 2)  # (heads, n_ans, head_dim)
-            h_fake_before_i = h_fake_before_i.view(-1, num_heads, head_dim).permute(1, 0, 2)
-            h_corrected_i = h_corrected_i.view(-1, num_heads, head_dim).permute(1, 0, 2)
-            h_real_list.append(h_real_i)
-            h_fake_list.append(h_fake_before_i)
-            h_corrected_list.append(h_corrected_i)
-
-        h_real = h_real_list
-        h_fake = h_fake_list  # 注意：这里改为 Adapter 前的版本
-        h_corrected = h_corrected_list  # Adapter 后的版本
-
-        # 使用 fake 路径的输出作为最终输出
-        hidden_states = hidden_states_fake
+        # MLP
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
         if return_pruning_info:
             pruning_info = {
-                'h_real': h_real,
-                'h_fake': h_fake,  # Adapter 前
-                'h_corrected': h_corrected,  # Adapter 后
-                'h_real_attn': h_real_attn,  # attention 输出（未过 FFN）
-                'h_fake_attn': h_fake_attn,  # attention 输出（未过 FFN）
-                'cumulative_mask': new_cumulative_mask,  # 新的累积 mask
-                'current_mask': current_mask,            # 当前层的决策
+                'cumulative_mask': new_cumulative_mask,
+                'current_mask': current_mask,
                 'q2v_attn': q2v_attn_avg,
-                'keep_logits': pruner_info.get('keep_logits'),
-                'attn_score': pruner_info.get('attn_score'),
-                'token_score': pruner_info.get('token_score'),
-                'baseline': pruner_info.get('baseline'),
-                'delta': pruner_info.get('delta'),
-                'gumbel_debug': pruner_info.get('gumbel_debug'),
+                'keep_logits': pruner_info.get('keep_logits') if isinstance(pruner_info, dict) else None,
+                'attn_score': pruner_info.get('attn_score') if isinstance(pruner_info, dict) else None,
+                'token_score': pruner_info.get('token_score') if isinstance(pruner_info, dict) else None,
+                'baseline': pruner_info.get('baseline') if isinstance(pruner_info, dict) else None,
+                'delta': pruner_info.get('delta') if isinstance(pruner_info, dict) else None,
+                'gumbel_debug': pruner_info.get('gumbel_debug') if isinstance(pruner_info, dict) else None,
                 'layer_idx': self.layer_idx,
                 'n_vision': n_vision,
             }
+
+            # 为 delayed repair 缓存修复上下文（低维向量）
+            if self.repair_context_encoder is not None:
+                mask_emb, pruned_emb = self.repair_context_encoder(vision_hidden, new_cumulative_mask)
+                pruning_info['repair_mask_emb'] = mask_emb
+                pruning_info['repair_pruned_emb'] = pruned_emb
+
             return hidden_states, pruning_info
 
         return hidden_states

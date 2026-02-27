@@ -122,6 +122,54 @@ class MaskAttentionEncoder(nn.Module):
         return self.out_proj(pooled)  # (batch, bottleneck_dim)
 
 
+class RepairContextEncoder(nn.Module):
+    """将 (vision_hidden, mask) 编码成可缓存的修复上下文。
+
+    设计目标：
+    - 不缓存被剪掉 token 序列（显存/带宽代价大）
+    - 只缓存低维向量，供后续“延迟修复”层使用
+
+    输出：
+    - mask_emb: (batch, bottleneck_dim)
+    - pruned_emb: (batch, bottleneck_dim) 或 None（取决于 use_pruned_info）
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        bottleneck_dim: int = 256,
+        n_vision: int = 576,
+        mask_encoder_type: str = "attention",
+        use_pruned_info: bool = True,
+    ):
+        super().__init__()
+        self.use_pruned_info = use_pruned_info
+
+        if mask_encoder_type == "attention":
+            self.mask_encoder = MaskAttentionEncoder(
+                n_vision=n_vision,
+                d_pos=64,
+                bottleneck_dim=bottleneck_dim,
+            )
+        else:
+            # 兼容旧逻辑：Linear 编码 mask
+            self.mask_encoder = nn.Sequential(
+                nn.Linear(n_vision, bottleneck_dim),
+                nn.GELU(),
+                nn.Linear(bottleneck_dim, bottleneck_dim),
+            )
+
+        self.pruned_aggregator = PrunedTokenAggregator(hidden_size, bottleneck_dim)
+
+    def forward(self, vision_hidden: torch.Tensor, mask: torch.Tensor):
+        mask_input = mask.to(dtype=vision_hidden.dtype)
+        mask_emb = self.mask_encoder(mask_input)
+        pruned_emb = None
+        if self.use_pruned_info:
+            pruned_emb = self.pruned_aggregator(vision_hidden, mask)
+        return mask_emb, pruned_emb
+
+
 class LightweightAdapter(nn.Module):
     """轻量级 Adapter：Mask-Aware + Query-Aware + Pruned-Info-Aware FiLM 调制
 
@@ -222,9 +270,19 @@ class LightweightAdapter(nn.Module):
         # 构建 condition
         condition = torch.zeros_like(h)  # (batch, seq, bottleneck)
 
-        if mask is not None:
+        # 可选：使用外部缓存的 embedding（用于 delayed repair）
+        cached_mask_emb = kwargs.get('mask_emb', None)
+        cached_pruned_emb = kwargs.get('pruned_emb', None)
+
+        # --- mask embedding ---
+        # delayed repair 场景下可能只有 cached_mask_emb，没有完整的 mask
+        mask_emb = None
+        if cached_mask_emb is not None:
+            mask_emb = cached_mask_emb
+        elif mask is not None:
             mask_input = mask.to(dtype=x.dtype)
             mask_emb = self.mask_encoder(mask_input)  # (batch, bottleneck)
+        if mask_emb is not None:
             condition = condition + mask_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
         if query is not None:
@@ -232,8 +290,12 @@ class LightweightAdapter(nn.Module):
             condition = condition + query_emb
 
         # 新增：被剪枝信息
-        if vision_hidden is not None and mask is not None and self.use_pruned_info:
+        pruned_emb = None
+        if cached_pruned_emb is not None:
+            pruned_emb = cached_pruned_emb
+        elif self.use_pruned_info and (mask is not None) and (vision_hidden is not None):
             pruned_emb = self.pruned_aggregator(vision_hidden, mask)  # (batch, bottleneck)
+        if pruned_emb is not None:
             condition = condition + pruned_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
         # FiLM modulation
