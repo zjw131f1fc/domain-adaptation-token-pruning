@@ -14,7 +14,10 @@
     ./scripts/run_eval_ddp.sh 4,5,6,7 --checkpoint outputs/checkpoints/checkpoint_final.pt
 
 配置说明：
-    - eval_mode: 在配置文件 evaluation_settings.eval_mode 中设置，如 ["origin", "hard"]
+    - eval_mode: 在配置文件 evaluation_settings.eval_mode 中设置
+        - "origin": 不剪枝，直接 generate
+        - "hard": 物理剪枝推理（用于测速度/保留率；可能存在已知 bug）
+        - "hard_forward": forward()+greedy decode（不物理删除，更稳，且适配 delayed repair adapter）
     - max_samples: 在配置文件 trainer_settings.dl_settings.eval_max_samples 中设置
 """
 
