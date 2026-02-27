@@ -88,6 +88,17 @@ def load_checkpoint(
         if logger:
             logger.info("  Loaded disc_manager state")
 
+    # 新版 delayed repair adapter（语言侧）
+    if getattr(model, "use_repair_adapter", False):
+        if 'repair_context_encoder_state_dict' in checkpoint and getattr(model, "repair_context_encoder", None) is not None:
+            model.repair_context_encoder.load_state_dict(checkpoint['repair_context_encoder_state_dict'])
+            if logger:
+                logger.info("  Loaded repair_context_encoder state")
+        if 'repair_adapter_state_dict' in checkpoint and getattr(model, "repair_adapter_manager", None) is not None:
+            model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
+            if logger:
+                logger.info("  Loaded repair_adapter_manager state")
+
     if logger:
         if 'step' in checkpoint:
             logger.info(f"  Checkpoint from step {checkpoint['step']}")

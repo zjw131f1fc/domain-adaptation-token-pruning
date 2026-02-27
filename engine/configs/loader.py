@@ -19,6 +19,18 @@ import yaml
 # import numpy as np
 # import torch
 
+
+def _env_rank() -> int:
+    """从 torchrun 环境变量读取 rank（避免在 loader 里 import torch.distributed）。"""
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except Exception:
+        return 0
+
+
+def _is_main_rank() -> bool:
+    return _env_rank() == 0
+
 # ==================== AttrDict: 支持属性访问的字典 ====================
 class AttrDict(dict):
     """支持属性访问的字典类
@@ -296,11 +308,12 @@ def _setup_logger(config: Dict[str, Any]) -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    # Console handler：DDP 下只在 rank0 打印到控制台，避免每个 rank 重复刷屏
+    if _is_main_rank():
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     return logger
 
@@ -384,6 +397,9 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     返回:
         config: 配置字典，包含logger属性
     """
+    # DDP 下只让 rank0 输出配置/提示，避免每个 rank 重复刷屏
+    verbose = _is_main_rank()
+
     # 1. 创建默认配置的深拷贝
     config = deepcopy(DEFAULT_CONFIG)
     
@@ -394,9 +410,11 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
             _merge_dict(config["config_settings"], override_dict["config_settings"])
         
         if not config["config_settings"]["enable_yaml_overrides"]:
-            print("[Warning] YAML文件覆盖已禁用，忽略 override_file 参数")
+            if verbose:
+                print("[Warning] YAML文件覆盖已禁用，忽略 override_file 参数")
         elif not os.path.isfile(override_file):
-            print(f"[Warning] 配置文件未找到: {override_file}")
+            if verbose:
+                print(f"[Warning] 配置文件未找到: {override_file}")
         else:
             try:
                 with open(override_file, 'r', encoding='utf-8') as f:
@@ -404,11 +422,14 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
                 if isinstance(yaml_data, dict):
                     _merge_dict(config, yaml_data)
                     _auto_normalize_types(config, DEFAULT_CONFIG)
-                    print(f"[Info] 成功加载配置文件: {override_file}")
+                    if verbose:
+                        print(f"[Info] 成功加载配置文件: {override_file}")
                 else:
-                    print(f"[Warning] 配置文件格式错误: {override_file}")
+                    if verbose:
+                        print(f"[Warning] 配置文件格式错误: {override_file}")
             except Exception as e:
-                print(f"[Error] 读取配置文件失败: {override_file}, 错误: {e}")
+                if verbose:
+                    print(f"[Error] 读取配置文件失败: {override_file}, 错误: {e}")
     
     # 3. 应用字典覆盖（如果启用）- 后应用字典，优先级更高
     if override_dict:
@@ -418,7 +439,8 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
         
         # 然后根据设置决定是否应用其他覆盖
         if not config["config_settings"]["enable_dict_overrides"]:
-            print("[Warning] 字典覆盖已禁用，忽略 override_dict 中的非 config_settings 参数")
+            if verbose:
+                print("[Warning] 字典覆盖已禁用，忽略 override_dict 中的非 config_settings 参数")
         else:
             _merge_dict(config, override_dict)
     
@@ -489,7 +511,8 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
             
             if gpu_str:
                 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_str
-                print(f"[ConfigLoader] Set CUDA_VISIBLE_DEVICES={gpu_str} (mode={mode})")
+                if verbose:
+                    print(f"[ConfigLoader] Set CUDA_VISIBLE_DEVICES={gpu_str} (mode={mode})")
 
     # 设置PYTORCH_CUDA_ALLOC_CONF
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = config["global_settings"]["pytorch_cuda_alloc_conf"]
@@ -504,8 +527,8 @@ def load_config(override_dict: Optional[Dict[str, Any]] = None,
     logger.info(f"Setting random seed to: {seed}")
     set_random_seed(seed)
     
-    # 10. 打印配置（如果启用）
-    if config["config_settings"]["log_config_on_load"]:
+    # 10. 打印配置（如果启用，且仅 rank0）
+    if config["config_settings"]["log_config_on_load"] and verbose:
         _log_config(logger, config, config["timestamp"])
     
     # 11. 转换为AttrDict支持属性访问

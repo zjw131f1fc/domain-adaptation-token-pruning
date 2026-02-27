@@ -629,6 +629,9 @@ def _gather_distributed_results(
         merged_kept_ratios.extend(ratios)
 
     for layer_ratios in all_layer_kept_ratios:
+        # 兼容异常/旧数据：某些 rank 可能返回非 dict（例如空 list）
+        if not isinstance(layer_ratios, dict):
+            continue
         for key, values in layer_ratios.items():
             if key not in merged_layer_kept_ratios:
                 merged_layer_kept_ratios[key] = []
