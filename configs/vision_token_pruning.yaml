@@ -21,9 +21,9 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 2  # 64: 3 128 192 :4
+    batch_size: 1  # 64: 3 128 192 :4
     # gradient_accumulation_steps: 4  # 梯度累积步数，有效 batch_size = batch_size * world_size * accumulation_steps   # 3 * 4 * 2   2 * 3 * 4
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 3
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -100,7 +100,7 @@ method_settings:
   # 对抗损失模式：
   # - "discriminator": 使用判别器进行对抗训练（默认）
   # - "mse": 使用 MSE 损失直接约束 h_real 和 h_fake 的一致性
-  adversarial_mode: "mse"  # "discriminator" | "mse"
+  adversarial_mode: "discriminator"  # "discriminator" | "mse"
 
   # ==================== MSE 模式配置 ====================
   # 仅在 adversarial_mode="mse" 时生效
@@ -190,7 +190,7 @@ method_settings:
   # sparsity_loss: 约束保留率到目标值
 
   task_loss_weight: 1.5
-  adv_loss_weight: 0.5
+  adv_loss_weight: 1.0
   sparsity_weight: 10.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens

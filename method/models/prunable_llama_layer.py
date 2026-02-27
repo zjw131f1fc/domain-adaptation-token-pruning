@@ -521,6 +521,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
             gen_end = ans_end - 1
             h_real_attn_list.append(attn_output_real[i, :, gen_start:gen_end, :])
             h_fake_attn_list.append(attn_output_fake[i, :, gen_start:gen_end, :])
+        h_real_attn = h_real_attn_list
+        h_fake_attn = h_fake_attn_list
 
         # === Step 6: 分别计算 real 和 fake 的完整前向（包括 o_proj + 残差 + FFN）===
         # Real 路径：使用完整的 attention output
@@ -583,6 +585,8 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 'h_real': h_real,
                 'h_fake': h_fake,  # Adapter 前
                 'h_corrected': h_corrected,  # Adapter 后
+                'h_real_attn': h_real_attn,  # attention 输出（未过 FFN）
+                'h_fake_attn': h_fake_attn,  # attention 输出（未过 FFN）
                 'cumulative_mask': new_cumulative_mask,  # 新的累积 mask
                 'current_mask': current_mask,            # 当前层的决策
                 'q2v_attn': q2v_attn_avg,

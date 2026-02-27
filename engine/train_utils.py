@@ -309,19 +309,23 @@ def train_step(
             # === Discriminator 模式：使用判别器进行对抗训练 ===
             loss_type = method_cfg.get('disc_loss_type', 'bce')
             gp_weight = method_cfg.get('disc_gp_weight', 10.0)
+            has_attn = all(('h_real_attn' in info and 'h_fake_attn' in info) for info in output.pruning_infos.values())
+            h_disc_real_dict = {idx: info['h_real_attn'] for idx, info in output.pruning_infos.items()} if has_attn else h_real_dict
+            h_disc_fake_dict = {idx: info['h_fake_attn'] for idx, info in output.pruning_infos.items()} if has_attn else h_fake_dict
+            stats['disc_source'] = 'attn' if has_attn else 'ffn'
 
             # 获取 disc_manager（可能被 DDP 包装）
             disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
 
-            adv_loss = disc_manager.compute_adv_loss(h_fake_dict, loss_type=loss_type)
+            adv_loss = disc_manager.compute_adv_loss(h_disc_fake_dict, loss_type=loss_type)
             losses['adv_loss'] = adv_loss * gan_weight
             stats['raw_adv_loss'] = adv_loss.item()
 
-            disc_loss = disc_manager.compute_disc_loss(h_real_dict, h_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
+            disc_loss = disc_manager.compute_disc_loss(h_disc_real_dict, h_disc_fake_dict, loss_type=loss_type, gp_weight=gp_weight)
             losses['disc_loss'] = disc_loss * gan_weight
             stats['raw_disc_loss'] = disc_loss.item()
 
-            acc_info = disc_manager.compute_accuracy(h_real_dict, h_fake_dict)
+            acc_info = disc_manager.compute_accuracy(h_disc_real_dict, h_disc_fake_dict)
             stats['disc_accuracy'] = acc_info['overall']
             stats['disc_real_acc'] = acc_info['real_acc']
             stats['disc_fake_acc'] = acc_info['fake_acc']
