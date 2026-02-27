@@ -215,23 +215,90 @@ def train_step(
 
         if adversarial_mode == 'mse':
             # === MSE 模式：直接约束 h_real 和 h_fake 的一致性 ===
-            mse_loss_total = torch.tensor(0.0, device=device)
+            mse_loss_type = method_cfg.get('mse_loss_type', 'mse')
+            mse_normalize = method_cfg.get('mse_normalize', False)
+
+            alignment_loss_total = torch.tensor(0.0, device=device)
             n_samples = 0
+
+            # 每层的对齐指标
+            mse_per_layer = {}
+            cosine_per_layer = {}
+            l1_per_layer = {}
+
             for layer_idx in h_real_dict:
                 h_real_list = h_real_dict[layer_idx]
                 h_fake_list = h_fake_dict[layer_idx]
-                # 逐样本计算 MSE
+
+                layer_mse = 0.0
+                layer_cosine = 0.0
+                layer_l1 = 0.0
+                layer_samples = 0
+
+                # 逐样本计算
                 for h_real, h_fake in zip(h_real_list, h_fake_list):
                     # h_real, h_fake: (heads, n_ans, head_dim)
-                    mse_loss_total = mse_loss_total + F.mse_loss(h_fake, h_real)
+                    h_real_flat = h_real.reshape(-1)
+                    h_fake_flat = h_fake.reshape(-1)
+
+                    # 可选：归一化
+                    if mse_normalize:
+                        h_real_norm = F.normalize(h_real_flat, dim=0)
+                        h_fake_norm = F.normalize(h_fake_flat, dim=0)
+                    else:
+                        h_real_norm = h_real_flat
+                        h_fake_norm = h_fake_flat
+
+                    # 计算损失
+                    if mse_loss_type == 'l1':
+                        sample_loss = F.l1_loss(h_fake_norm, h_real_norm)
+                    elif mse_loss_type == 'smooth_l1':
+                        sample_loss = F.smooth_l1_loss(h_fake_norm, h_real_norm)
+                    elif mse_loss_type == 'cosine':
+                        # 余弦相似度损失: 1 - cosine_similarity
+                        cosine_sim = F.cosine_similarity(h_fake_flat.unsqueeze(0), h_real_flat.unsqueeze(0))
+                        sample_loss = 1.0 - cosine_sim.mean()
+                    else:  # mse
+                        sample_loss = F.mse_loss(h_fake_norm, h_real_norm)
+
+                    alignment_loss_total = alignment_loss_total + sample_loss
+
+                    # 计算指标（用于监控，不参与梯度）
+                    with torch.no_grad():
+                        layer_mse += F.mse_loss(h_fake_flat, h_real_flat).item()
+                        cosine_sim = F.cosine_similarity(h_fake_flat.unsqueeze(0), h_real_flat.unsqueeze(0))
+                        layer_cosine += cosine_sim.mean().item()
+                        layer_l1 += F.l1_loss(h_fake_flat, h_real_flat).item()
+                        layer_samples += 1
+
                 n_samples = len(h_real_list)
+
+                # 记录每层指标
+                if layer_samples > 0:
+                    mse_per_layer[layer_idx] = layer_mse / layer_samples
+                    cosine_per_layer[layer_idx] = layer_cosine / layer_samples
+                    l1_per_layer[layer_idx] = layer_l1 / layer_samples
 
             # 除以样本数和层数
             n_layers = len(h_real_dict)
-            mse_loss = mse_loss_total / (n_samples * n_layers)
-            losses['adv_loss'] = mse_loss * gan_weight
-            stats['raw_adv_loss'] = mse_loss.item()
+            alignment_loss = alignment_loss_total / (n_samples * n_layers)
+
+            # 使用专门的 mse_loss_weight，如果没有则使用 adv_loss_weight
+            losses['adv_loss'] = alignment_loss * gan_weight
+            stats['raw_adv_loss'] = alignment_loss.item()
             stats['adversarial_mode'] = 'mse'
+            stats['mse_loss_type'] = mse_loss_type
+
+            # 记录对齐指标
+            stats['mse_per_layer'] = mse_per_layer
+            stats['cosine_per_layer'] = cosine_per_layer
+            stats['l1_per_layer'] = l1_per_layer
+
+            # 计算整体指标
+            if mse_per_layer:
+                stats['avg_mse'] = sum(mse_per_layer.values()) / len(mse_per_layer)
+                stats['avg_cosine'] = sum(cosine_per_layer.values()) / len(cosine_per_layer)
+                stats['avg_l1'] = sum(l1_per_layer.values()) / len(l1_per_layer)
 
             # MSE 模式下没有判别器损失
             losses['disc_loss'] = torch.tensor(0.0, device=device)

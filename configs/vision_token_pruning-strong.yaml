@@ -13,20 +13,20 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null
+  checkpoint: outputs/tasks/20260225-1708_vqa-sqa_llava157b_1152/checkpoints/checkpoint_final.pt
   # 加载 checkpoint 时是否重置 step 计数（用于在新数据集上微调时重新开始退火）
   reset_step_on_load: true
 
 # 观察到总batch增加后，准确率大幅上升
 trainer_settings:
   dl_settings:
-    epochs: 1
-    batch_size: 2  # 64: 3 128 192 :4
+    epochs: 2
+    batch_size: 4  # 64: 3 128 192 :4
     # gradient_accumulation_steps: 4  # 梯度累积步数，有效 batch_size = batch_size * world_size * accumulation_steps   # 3 * 4 * 2   2 * 3 * 4
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 2
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
-    max_length: 1024
+    max_length: 2048
     optimizers:
       layer_pruners:
         type: "adam"
@@ -34,7 +34,7 @@ trainer_settings:
         weight_decay: 0.01  # 防止过拟合
       discriminator:
         type: "adam"
-        lr: 4.0e-04
+        lr: 2.0e-04
       # 学习率调度器配置
       lr_scheduler:
         type: "cosine"  # 'none', 'cosine', 'linear'
@@ -42,16 +42,16 @@ trainer_settings:
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
     print_loss_every_batches: 10  # 隔多久打印一次损失
     eval_loss_every_batches: 10  # 隔多久计算一次 eval loss（用于检测过拟合）
-    eval_every_batches: 200  # 隔多久评估一次（计算 accuracy）
+    eval_every_batches: 10000  # 隔多久评估一次（计算 accuracy）
     eval_max_samples: 20000000 # 每次评估使用多少数据
     save_every_batches: 4000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null
 
 dataset_settings:
-  name: "vqa-vqav2"
+  name: "vqa-sqa"
   split:
-    train: 8000
-    test: 100
+    train: "all"
+    test: "all"
   fast_load_no_random: false
   category_priority:
     enable: false
@@ -72,7 +72,7 @@ method_settings:
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
   pruner_d_internal: 512   # 内部特征维度
   pruner_n_heads: 4        # Cross-attention 头数
-  pruner_n_queries: 16      # Pruning queries 数量（更多 = 更多"看图角度"，成本增加很小）
+  pruner_n_queries: 32      # Pruning queries 数量（更多 = 更多"看图角度"，成本增加很小）
   pruner_dropout: 0.1
   pruner_query_dropout: 0.2  # Query-wise dropout，防止过拟合
   use_question_condition: true  # 是否使用 question embedding 条件化 pruner
@@ -92,45 +92,31 @@ method_settings:
 
   # 混合模式三阶段配置（仅 gumbel_mode="hybrid" 时生效）
   hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
-  hybrid_phase2_end: 0.8    # 稳定期结束点，之后进入对齐期（关闭 noise）
+  hybrid_phase2_end: 0.9    # 稳定期结束点，之后进入对齐期（关闭 noise）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
-  hybrid_phase1_temp_end: 0.5     # 探索期结束温度（也是稳定期和对齐期温度）
+  hybrid_phase1_temp_end: 0.1     # 探索期结束温度（也是稳定期和对齐期温度）
 
   # ==================== Discriminator 配置 ====================
   # 对抗损失模式：
   # - "discriminator": 使用判别器进行对抗训练（默认）
   # - "mse": 使用 MSE 损失直接约束 h_real 和 h_fake 的一致性
-  adversarial_mode: "mse"  # "discriminator" | "mse"
+  adversarial_mode: "discriminator"  # "discriminator" | "mse"
 
-  # ==================== MSE 模式配置 ====================
-  # 仅在 adversarial_mode="mse" 时生效
-  # MSE 损失类型：
-  # - "mse": 均方误差 (默认)
-  # - "l1": L1 距离（更鲁棒）
-  # - "smooth_l1": Smooth L1（结合 MSE 和 L1 的优点）
-  # - "cosine": 余弦相似度损失 (1 - cosine_similarity)
-  mse_loss_type: "mse"
-  # 是否对特征进行归一化后再计算 MSE（可以让不同层的 loss 量级一致）
-  mse_normalize: false
-  # MSE 损失权重（如果不设置，则使用 adv_loss_weight）
-  mse_loss_weight: 10.0
-
-  # Discriminator 配置（仅在 adversarial_mode="discriminator" 时生效）
   disc_d_d: 512
-  disc_dropout: 0
-  disc_use_spectral_norm: false  # 谱归一化（提高训练稳定性）
+  disc_dropout: 0.2
+  disc_use_spectral_norm: true  # 谱归一化（提高训练稳定性）
   disc_loss_type: hinge            # 损失类型: bce, wgan, hinge
   disc_gp_weight: 10.0           # WGAN-GP 梯度惩罚权重
 
   # 判别器重初始化配置
-  disc_reinit_enable: false       # 是否启用判别器重新初始化
+  disc_reinit_enable: true       # 是否启用判别器重新初始化
   disc_reinit_mode: random     # 重初始化模式: threshold(准确率阈值) 或 random(随机概率)
   disc_reinit_threshold: 0.97     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
   # ==================== Adapter 配置 ====================
   # 是否启用 Adapter（如果为 false，则只使用 Pruner，不使用 Adapter）
-  use_adapter: true
+  use_adapter: false
 
   # Adapter 补偿剪枝后的信息损失
   # - simple: 简单 MLP adapter
@@ -142,10 +128,7 @@ method_settings:
   # - attention: Attention 池化（更轻量，保留空间信息）
   # - linear: 原始 Linear encoder（向后兼容）
   mask_encoder_type: attention
-  adapter_dropout: 0.1  # Adapter 的 dropout 比例
-
-  # 被剪枝信息：是否使用被剪枝 token 的信息来补偿
-  use_pruned_info: true  # 启用后，Adapter 会接收被剪枝 tokens 的聚合表示
+  adapter_dropout: 0.15  # Adapter 的 dropout 比例
 
   # 分离式 Adapter：为 vision/text tokens 使用独立的 Adapter
   # text_adapter 同时处理 question 和 answer tokens
@@ -156,17 +139,17 @@ method_settings:
   # Adversarial Loss 梯度控制
   # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
   # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
-  detach_adv_from_pruner: true
+  detach_adv_from_pruner: false
 
   # ==================== Pruner Warmup ====================
-  pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
+  pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
   target_token_num: 128  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
-  sparsity_anneal_ratio: 0.1
+  sparsity_anneal_ratio: 0.15
   # Sparsity loss 计算模式：
   # - 'exact': 精确加权平均，梯度比例约 14:3.7:1
   # - 'harmonic': 调和平均近似，梯度比例约 4:1.4:1（更均匀）
@@ -179,7 +162,7 @@ method_settings:
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
-  eval_temperature: 0.5
+  eval_temperature: 0.1
   # 评估时的剪枝阈值（sigmoid 后的阈值，默认 0.5）
   # 降低阈值会保留更多 token，提高阈值会剪掉更多 token
   eval_pruning_threshold: 0.5
@@ -209,4 +192,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard"]
+  eval_mode: ["origin", "hard"]

@@ -180,10 +180,10 @@ class CrossAttentionPruner(nn.Module):
                 # 创建 mask: (batch, max_q_len)
                 max_q_len = question_hidden.shape[1]
                 mask = torch.arange(max_q_len, device=question_hidden.device).unsqueeze(0) < question_lengths.unsqueeze(1)
-                mask = mask.unsqueeze(-1).float()  # (batch, max_q_len, 1)
+                mask = mask.unsqueeze(-1).to(dtype=question_hidden.dtype)  # (batch, max_q_len, 1) - 保持与 question_hidden 相同的 dtype
                 # Masked sum / count
                 question_sum = (question_hidden * mask).sum(dim=1)  # (batch, d_model)
-                question_emb = question_sum / question_lengths.unsqueeze(-1).clamp(min=1)  # (batch, d_model)
+                question_emb = question_sum / question_lengths.unsqueeze(-1).to(dtype=question_hidden.dtype).clamp(min=1)  # (batch, d_model)
             else:
                 # Fallback: 普通均值（假设无 padding）
                 question_emb = question_hidden.mean(dim=1)  # (batch, d_model)

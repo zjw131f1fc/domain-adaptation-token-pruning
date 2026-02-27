@@ -121,6 +121,10 @@ def load_model(config, device: torch.device, local_rank: int):
     # Pruner query dropout
     pruner_query_dropout = method_cfg.get('pruner_query_dropout', 0.0)
 
+    # Pruner 额外配置
+    pruner_n_queries = method_cfg.get('pruner_n_queries', 4)
+    use_question_condition = method_cfg.get('use_question_condition', False)
+
     # 剪枝阈值（sigmoid 后的阈值，用于训练第三阶段和推理）
     pruning_threshold = method_cfg.get('pruning_threshold', 0.5)
 
@@ -198,7 +202,9 @@ def load_model(config, device: torch.device, local_rank: int):
             pruning_layers=pruning_layers,
             pruner_d_internal=pruner_d_internal,
             pruner_n_heads=pruner_n_heads,
+            pruner_n_queries=pruner_n_queries,
             pruner_query_dropout=pruner_query_dropout,
+            use_question_condition=use_question_condition,
             disc_d_hidden=disc_d_hidden,
             use_adapter=use_adapter,
             adapter_bottleneck=adapter_bottleneck,
@@ -702,6 +708,15 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         layer_acc = (real_acc + fake_acc) / 2
                         per_layer_strs.append(f"L{layer_idx}={layer_acc:.0%}(R{real_acc:.0%}/F{fake_acc:.0%})")
                     logger.info(f"  Disc acc: {stats['disc_accuracy']:.2%} [{', '.join(per_layer_strs)}]")
+
+                # MSE 模式：显示对齐指标
+                if 'mse_per_layer' in stats:
+                    per_layer_strs = []
+                    for layer_idx in sorted(stats['mse_per_layer'].keys()):
+                        mse_val = stats['mse_per_layer'][layer_idx]
+                        cosine_val = stats['cosine_per_layer'][layer_idx]
+                        per_layer_strs.append(f"L{layer_idx}={mse_val:.4f}(cos={cosine_val:.3f})")
+                    logger.info(f"  Alignment: MSE={stats['avg_mse']:.4f}, Cosine={stats['avg_cosine']:.3f} [{', '.join(per_layer_strs)}]")
 
             # 计算 eval loss（用于检测过拟合，按 batch 数判断）
             if eval_loss_loader is not None and global_batch % eval_loss_every == 0:

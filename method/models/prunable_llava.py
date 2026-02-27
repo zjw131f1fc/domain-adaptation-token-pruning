@@ -657,10 +657,12 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # 获取该层的 mask 信息
             mask_info = masks[layer_idx]
             if isinstance(mask_info, tuple):
-                if len(mask_info) == 3:
-                    hard_mask, n_kept_absolute, _ = mask_info  # 新格式：包含 padded_mask
+                if len(mask_info) == 4:
+                    hard_mask, n_kept_absolute, _, _ = mask_info  # 新格式：包含 scattered_mask 和 vision_hidden_padded
+                elif len(mask_info) == 3:
+                    hard_mask, n_kept_absolute, _ = mask_info  # 旧格式：包含 padded_mask
                 else:
-                    hard_mask, n_kept_absolute = mask_info  # 旧格式
+                    hard_mask, n_kept_absolute = mask_info  # 更旧格式
             else:
                 # 兼容旧格式：只有 hard_mask
                 hard_mask = mask_info

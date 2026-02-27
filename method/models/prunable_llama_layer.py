@@ -452,6 +452,9 @@ class PrunableLlamaDecoderLayer(nn.Module):
         attn_output_fake = torch.matmul(attn_weights_fake, value_states)
 
         # === Step 4.5: Adapter 修正 ===
+        # 保存 Adapter 处理前的 attn_output_fake（用于可视化分析）
+        attn_output_fake_before_adapter = attn_output_fake.clone()
+
         if self.separated_adapters is not None:
             # 分离式 Adapter：对 vision/text 分别处理（text 包含 question 和 answer）
             vision_adapter, text_adapter = self.separated_adapters
@@ -508,38 +511,78 @@ class PrunableLlamaDecoderLayer(nn.Module):
             )
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
-        # === Step 5: 提取 h_real 和 h_fake（answer 位置）===
-        h_real_list = []
-        h_fake_list = []
+        # === Step 5: 提取 h_real 和 h_fake（answer 位置）- 暂存，后面 FFN 后再更新 ===
+        # 注意：这里先保存 attention output，后面会用 FFN 后的 hidden states 替换
+        h_real_attn_list = []
+        h_fake_attn_list = []
         for i in range(batch_size):
             ans_start, ans_end = answer_starts[i], answer_ends[i]
             gen_start = ans_start - 1
             gen_end = ans_end - 1
-            h_real_list.append(attn_output_real[i, :, gen_start:gen_end, :])
-            h_fake_list.append(attn_output_fake[i, :, gen_start:gen_end, :])
+            h_real_attn_list.append(attn_output_real[i, :, gen_start:gen_end, :])
+            h_fake_attn_list.append(attn_output_fake[i, :, gen_start:gen_end, :])
+
+        # === Step 6: 分别计算 real 和 fake 的完整前向（包括 o_proj + 残差 + FFN）===
+        # Real 路径：使用完整的 attention output
+        attn_output_real_flat = attn_output_real.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+        attn_output_real_proj = attn.o_proj(attn_output_real_flat)
+        hidden_states_real = residual + attn_output_real_proj
+        residual_real = hidden_states_real
+        hidden_states_real = layer.post_attention_layernorm(hidden_states_real)
+        hidden_states_real = layer.mlp(hidden_states_real)
+        hidden_states_real = residual_real + hidden_states_real
+
+        # Fake 路径：使用剪枝后的 attention output（已经过 Adapter）
+        attn_output_fake_flat = attn_output_fake.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+        attn_output_fake_proj = attn.o_proj(attn_output_fake_flat)
+        hidden_states_fake = residual + attn_output_fake_proj
+        residual_fake = hidden_states_fake
+        hidden_states_fake = layer.post_attention_layernorm(hidden_states_fake)
+        hidden_states_fake = layer.mlp(hidden_states_fake)
+        hidden_states_fake = residual_fake + hidden_states_fake
+
+        # Fake 路径（Adapter 前）：用于可视化分析
+        attn_output_fake_before_flat = attn_output_fake_before_adapter.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+        attn_output_fake_before_proj = attn.o_proj(attn_output_fake_before_flat)
+        hidden_states_fake_before = residual + attn_output_fake_before_proj
+        residual_fake_before = hidden_states_fake_before
+        hidden_states_fake_before = layer.post_attention_layernorm(hidden_states_fake_before)
+        hidden_states_fake_before = layer.mlp(hidden_states_fake_before)
+        hidden_states_fake_before = residual_fake_before + hidden_states_fake_before
+
+        # === Step 7: 提取 FFN 后的 h_real, h_fake (Adapter 前), h_corrected (Adapter 后) ===
+        h_real_list = []
+        h_fake_list = []  # Adapter 前
+        h_corrected_list = []  # Adapter 后
+        for i in range(batch_size):
+            ans_start, ans_end = answer_starts[i], answer_ends[i]
+            gen_start = ans_start - 1
+            gen_end = ans_end - 1
+            # FFN 后的 hidden states: (batch, seq, hidden_size)
+            # 转换为 (heads, n_ans, head_dim) 格式以兼容判别器
+            h_real_i = hidden_states_real[i, gen_start:gen_end, :]  # (n_ans, hidden_size)
+            h_fake_before_i = hidden_states_fake_before[i, gen_start:gen_end, :]  # Adapter 前
+            h_corrected_i = hidden_states_fake[i, gen_start:gen_end, :]  # Adapter 后
+            # 重塑为 (heads, n_ans, head_dim) 以兼容现有判别器
+            h_real_i = h_real_i.view(-1, num_heads, head_dim).permute(1, 0, 2)  # (heads, n_ans, head_dim)
+            h_fake_before_i = h_fake_before_i.view(-1, num_heads, head_dim).permute(1, 0, 2)
+            h_corrected_i = h_corrected_i.view(-1, num_heads, head_dim).permute(1, 0, 2)
+            h_real_list.append(h_real_i)
+            h_fake_list.append(h_fake_before_i)
+            h_corrected_list.append(h_corrected_i)
 
         h_real = h_real_list
-        h_fake = h_fake_list
+        h_fake = h_fake_list  # 注意：这里改为 Adapter 前的版本
+        h_corrected = h_corrected_list  # Adapter 后的版本
 
-        # === Step 6: 使用 fake attention 作为输出 ===
-        attn_output = attn_output_fake
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, seq_len, -1)
-        attn_output = attn.o_proj(attn_output)
-
-        # 残差连接
-        hidden_states = residual + attn_output
-
-        # === Step 7: MLP ===
-        residual = hidden_states
-        hidden_states = layer.post_attention_layernorm(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        # 使用 fake 路径的输出作为最终输出
+        hidden_states = hidden_states_fake
 
         if return_pruning_info:
             pruning_info = {
                 'h_real': h_real,
-                'h_fake': h_fake,
+                'h_fake': h_fake,  # Adapter 前
+                'h_corrected': h_corrected,  # Adapter 后
                 'cumulative_mask': new_cumulative_mask,  # 新的累积 mask
                 'current_mask': current_mask,            # 当前层的决策
                 'q2v_attn': q2v_attn_avg,

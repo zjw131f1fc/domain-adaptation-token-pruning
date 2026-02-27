@@ -129,12 +129,36 @@ hybrid_phase1_temp_end: 0.3
    - 判别器学习区分 h_real 和 h_fake
    - Pruner 和 Adapter 学习欺骗判别器
    - 配置：`adversarial_mode: "discriminator"`
+   - 监控指标：`disc_accuracy`（判别器准确率，越低说明 fake 越接近 real）
 
 2. **MSE 模式**：
-   - 直接使用 MSE 损失约束 h_real 和 h_fake 的一致性
-   - 不需要判别器，训练更简单
+   - 直接使用损失函数约束 h_real 和 h_fake 的一致性
+   - 不需要判别器，训练更简单稳定
    - 适合快速实验和消融研究
    - 配置：`adversarial_mode: "mse"`
+
+#### MSE 模式配置
+
+```yaml
+adversarial_mode: "mse"
+
+# 损失类型
+mse_loss_type: "mse"      # "mse" | "l1" | "smooth_l1" | "cosine"
+mse_normalize: false       # 是否归一化特征后再计算损失
+# mse_loss_weight: 0.5     # 可选，不设置则使用 adv_loss_weight
+```
+
+#### MSE 模式监控指标
+
+日志输出示例：
+```
+Step 400 [Phase 2]: task_loss=1.23, adv_loss=0.0012, sparsity_loss=0.02
+  Alignment: MSE=0.0012, Cosine=0.987 [L4=0.0015(cos=0.982), L14=0.0010(cos=0.991), L24=0.0011(cos=0.988)]
+```
+
+- `MSE`: 平均 MSE 损失（越小越好，表示 h_fake 越接近 h_real）
+- `Cosine`: 平均余弦相似度（越接近 1 越好，表示方向对齐）
+- 每层指标：`L{idx}=MSE(cos=余弦相似度)`
 
 ### 关键超参数
 
