@@ -83,6 +83,8 @@ class PrunableQwen2VLForConditionalGeneration(nn.Module):
         vision_adapter_bottleneck: int = 256,
         text_adapter_bottleneck: int = 256,
         generator_adapter_bottleneck: int = 512,
+        adapter_alpha_init: float = 0.1,
+        adapter_delta_weight: float = 0.0,
         mask_encoder_type: str = 'attention',
         temperature: float = 1.0,
         dropout: float = 0.1,
@@ -146,6 +148,8 @@ class PrunableQwen2VLForConditionalGeneration(nn.Module):
                 n_vision=n_vision,
                 dropout=adapter_dropout,
                 mask_encoder_type=mask_encoder_type,
+                adapter_alpha_init=adapter_alpha_init,
+                track_delta_loss=adapter_delta_weight > 0,
             )
             self.adapter_manager = None
         else:
@@ -157,6 +161,8 @@ class PrunableQwen2VLForConditionalGeneration(nn.Module):
                 n_vision=n_vision,
                 mask_encoder_type=mask_encoder_type,
                 dropout=adapter_dropout,
+                adapter_alpha_init=adapter_alpha_init,
+                track_delta_loss=adapter_delta_weight > 0,
             )
             self.separated_adapter_manager = None
 

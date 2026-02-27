@@ -136,12 +136,17 @@ class LightweightAdapter(nn.Module):
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',  # 'attention' or 'linear'
         use_pruned_info: bool = True,  # 是否使用被剪枝信息
+        alpha_init: float = 0.1,
+        track_delta_loss: bool = False,
         **kwargs
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.bottleneck_dim = bottleneck_dim
         self.use_pruned_info = use_pruned_info
+        self.track_delta_loss = track_delta_loss
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self._last_delta_loss = None
 
         # Dropout 防止过拟合
         self.dropout = nn.Dropout(dropout)
@@ -238,7 +243,16 @@ class LightweightAdapter(nn.Module):
 
         h = self.dropout(h)  # Dropout after FiLM
 
-        return x + self.up(h)
+        delta = self.up(h)
+        delta_scaled = self.alpha * delta
+        if self.training and self.track_delta_loss:
+            self._last_delta_loss = (delta_scaled.float() ** 2).mean()
+        return x + delta_scaled
+
+    def pop_delta_loss(self) -> Optional[torch.Tensor]:
+        loss = self._last_delta_loss
+        self._last_delta_loss = None
+        return loss
 
 
 class AdapterManager(nn.Module):
@@ -254,6 +268,8 @@ class AdapterManager(nn.Module):
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',
         use_pruned_info: bool = True,  # 新增
+        adapter_alpha_init: float = 0.1,
+        track_delta_loss: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -271,13 +287,28 @@ class AdapterManager(nn.Module):
                 n_vision=n_vision,
                 dropout=dropout,
                 mask_encoder_type=mask_encoder_type,
-                use_pruned_info=use_pruned_info  # 新增
+                use_pruned_info=use_pruned_info,
+                alpha_init=adapter_alpha_init,
+                track_delta_loss=track_delta_loss,
             )
             for idx in layer_indices
         })
 
     def get_adapter(self, layer_idx: int):
         return self.adapters[str(layer_idx)]
+
+    def collect_delta_loss(self) -> Optional[torch.Tensor]:
+        total = None
+        count = 0
+        for adapter in self.adapters.values():
+            loss = adapter.pop_delta_loss()
+            if loss is None:
+                continue
+            total = loss if total is None else total + loss
+            count += 1
+        if total is None:
+            return None
+        return total / max(count, 1)
 
 
 class SeparatedAdapterManager(nn.Module):
@@ -297,6 +328,8 @@ class SeparatedAdapterManager(nn.Module):
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',
         use_pruned_info: bool = True,  # 新增
+        adapter_alpha_init: float = 0.1,
+        track_delta_loss: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -313,7 +346,9 @@ class SeparatedAdapterManager(nn.Module):
                 n_vision=n_vision,
                 dropout=dropout,
                 mask_encoder_type=mask_encoder_type,
-                use_pruned_info=use_pruned_info  # 新增
+                use_pruned_info=use_pruned_info,
+                alpha_init=adapter_alpha_init,
+                track_delta_loss=track_delta_loss,
             )
             self.text_adapters[str(idx)] = LightweightAdapter(
                 hidden_size=hidden_size,
@@ -321,7 +356,9 @@ class SeparatedAdapterManager(nn.Module):
                 n_vision=n_vision,
                 dropout=dropout,
                 mask_encoder_type=mask_encoder_type,
-                use_pruned_info=use_pruned_info  # 新增
+                use_pruned_info=use_pruned_info,
+                alpha_init=adapter_alpha_init,
+                track_delta_loss=track_delta_loss,
             )
 
     def get_adapters(self, layer_idx: int):
@@ -331,3 +368,16 @@ class SeparatedAdapterManager(nn.Module):
             self.vision_adapters[idx_str],
             self.text_adapters[idx_str],
         )
+
+    def collect_delta_loss(self) -> Optional[torch.Tensor]:
+        total = None
+        count = 0
+        for adapter in list(self.vision_adapters.values()) + list(self.text_adapters.values()):
+            loss = adapter.pop_delta_loss()
+            if loss is None:
+                continue
+            total = loss if total is None else total + loss
+            count += 1
+        if total is None:
+            return None
+        return total / max(count, 1)

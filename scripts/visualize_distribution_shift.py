@@ -124,10 +124,9 @@ def load_samples(num_samples, config_path):
     from engine.datas.loader import load_dataset
 
     config = load_config(override_file=config_path)
-    config['dataset_settings']['split'] = {'train': num_samples * 2, 'test': num_samples}
 
     data_bundle = load_dataset(config)
-    test_dataset = data_bundle['splits']['test']
+    test_dataset = data_bundle['splits']['train']
 
     return list(test_dataset)[:num_samples]
 

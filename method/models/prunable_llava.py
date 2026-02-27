@@ -113,6 +113,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         vision_adapter_bottleneck: int = 256,  # vision adapter 瓶颈维度
         text_adapter_bottleneck: int = 256,    # text adapter 瓶颈维度
         generator_adapter_bottleneck: int = 512,  # generator adapter 瓶颈维度
+        adapter_alpha_init: float = 0.1,  # adapter 输出缩放初始化
+        adapter_delta_weight: float = 0.0,  # adapter 修正幅度正则权重
         mask_encoder_type: str = 'attention',  # mask encoder 类型: 'attention' 或 'linear'
         temperature: float = 1.0,
         dropout: float = 0.1,
@@ -175,6 +177,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     n_vision=576,
                     dropout=adapter_dropout,
                     mask_encoder_type=mask_encoder_type,
+                    adapter_alpha_init=adapter_alpha_init,
+                    track_delta_loss=adapter_delta_weight > 0,
                 )
                 self.adapter_manager = None
             else:
@@ -186,6 +190,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     n_vision=576,  # LLaVA 1.5 的 vision token 数量
                     mask_encoder_type=mask_encoder_type,
                     dropout=adapter_dropout,
+                    adapter_alpha_init=adapter_alpha_init,
+                    track_delta_loss=adapter_delta_weight > 0,
                 )
                 self.separated_adapter_manager = None
         else:
@@ -1323,4 +1329,3 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         output_ids = torch.cat([input_ids, generated], dim=1)
 
         return output_ids, kept_stats
-

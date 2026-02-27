@@ -310,9 +310,11 @@ def train_step(
             loss_type = method_cfg.get('disc_loss_type', 'bce')
             gp_weight = method_cfg.get('disc_gp_weight', 10.0)
             has_attn = all(('h_real_attn' in info and 'h_fake_attn' in info) for info in output.pruning_infos.values())
-            h_disc_real_dict = {idx: info['h_real_attn'] for idx, info in output.pruning_infos.items()} if has_attn else h_real_dict
-            h_disc_fake_dict = {idx: info['h_fake_attn'] for idx, info in output.pruning_infos.items()} if has_attn else h_fake_dict
-            stats['disc_source'] = 'attn' if has_attn else 'ffn'
+            if not has_attn:
+                raise ValueError("Discriminator expects attn features, but h_real_attn/h_fake_attn not found in pruning_infos.")
+            h_disc_real_dict = {idx: info['h_real_attn'] for idx, info in output.pruning_infos.items()}
+            h_disc_fake_dict = {idx: info['h_fake_attn'] for idx, info in output.pruning_infos.items()}
+            stats['disc_source'] = 'attn'
 
             # 获取 disc_manager（可能被 DDP 包装）
             disc_manager = model.disc_manager.module if hasattr(model.disc_manager, 'module') else model.disc_manager
@@ -498,6 +500,21 @@ def train_step(
             losses['entropy_loss'] = entropy_loss
             stats['entropy_loss'] = entropy_loss.item()
 
+    # === Adapter Delta 正则：限制修正幅度 ===
+    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
+    if adapter_delta_weight > 0:
+        base_model = model.module if hasattr(model, 'module') else model
+        delta_loss = None
+        if getattr(base_model, 'use_adapter', False):
+            if base_model.use_separated_adapters and base_model.separated_adapter_manager is not None:
+                delta_loss = base_model.separated_adapter_manager.collect_delta_loss()
+            elif base_model.adapter_manager is not None:
+                delta_loss = base_model.adapter_manager.collect_delta_loss()
+        if delta_loss is not None:
+            losses['adapter_delta_loss'] = delta_loss
+            stats['adapter_delta_loss'] = delta_loss.item()
+            stats['adapter_delta_weight'] = adapter_delta_weight
+
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     adv_weight = method_cfg.get('adv_loss_weight', 0.5)
@@ -537,6 +554,8 @@ def train_step(
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
     if 'entropy_loss' in losses:
         weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
+    if 'adapter_delta_loss' in losses:
+        weighted_losses['adapter_delta_loss'] = losses['adapter_delta_loss'] * adapter_delta_weight
     if 'tightening_loss' in losses:
         weighted_losses['tightening_loss'] = losses['tightening_loss']  # 权重已在计算时应用
     if 'disc_loss' in losses:

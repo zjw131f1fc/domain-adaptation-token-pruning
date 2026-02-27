@@ -144,6 +144,9 @@ def load_model(config, device: torch.device, local_rank: int):
         logger.info(f"Loading base model from {model_path} (type: {model_type})...")
 
     # 根据模型类型加载不同的基础模型
+    adapter_alpha_init = method_cfg.get('adapter_alpha_init', 0.1)
+    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
+
     if model_type == 'qwen2_vl':
         from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
         base_model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -188,6 +191,8 @@ def load_model(config, device: torch.device, local_rank: int):
             vision_adapter_bottleneck=vision_adapter_bottleneck,
             text_adapter_bottleneck=text_adapter_bottleneck,
             generator_adapter_bottleneck=generator_adapter_bottleneck,
+            adapter_alpha_init=adapter_alpha_init,
+            adapter_delta_weight=adapter_delta_weight,
             temperature=temperature,
             dropout=dropout,
             adapter_dropout=adapter_dropout,
@@ -213,6 +218,8 @@ def load_model(config, device: torch.device, local_rank: int):
             vision_adapter_bottleneck=vision_adapter_bottleneck,
             text_adapter_bottleneck=text_adapter_bottleneck,
             generator_adapter_bottleneck=generator_adapter_bottleneck,
+            adapter_alpha_init=adapter_alpha_init,
+            adapter_delta_weight=adapter_delta_weight,
             temperature=temperature,
             dropout=dropout,
             adapter_dropout=adapter_dropout,
