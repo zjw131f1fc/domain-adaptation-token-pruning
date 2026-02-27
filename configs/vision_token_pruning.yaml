@@ -21,9 +21,8 @@ global_settings:
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 1  # 64: 3 128 192 :4
-    # gradient_accumulation_steps: 4  # 梯度累积步数，有效 batch_size = batch_size * world_size * accumulation_steps   # 3 * 4 * 2   2 * 3 * 4
-    gradient_accumulation_steps: 3
+    batch_size: 1
+    gradient_accumulation_steps: 4
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
     max_length: 1024
@@ -40,18 +39,18 @@ trainer_settings:
         type: "cosine"  # 'none', 'cosine', 'linear'
         warmup_ratio: 0.1  # warmup 步数占总步数的比例
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
-    print_loss_every_batches: 10  # 隔多久打印一次损失
-    eval_loss_every_batches: 10  # 隔多久计算一次 eval loss（用于检测过拟合）
-    eval_every_batches: 200  # 隔多久评估一次（计算 accuracy）
+    print_loss_every_batches: 20  # 隔多久打印一次损失
+    eval_loss_every_batches: 100  # 隔多久计算一次 eval loss（用于检测过拟合）
+    eval_every_batches: 1000  # 隔多久评估一次（计算 accuracy）
     eval_max_samples: 20000000 # 每次评估使用多少数据
-    save_every_batches: 4000 # 隔多久保存一个checkpoint
+    save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null
 
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 8000
-    test: 100
+    train: 30000
+    test: 5000
   fast_load_no_random: false
   category_priority:
     enable: false
@@ -96,11 +95,10 @@ method_settings:
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
   hybrid_phase1_temp_end: 0.5     # 探索期结束温度（也是稳定期和对齐期温度）
 
-  # ==================== Discriminator 配置 ====================
-  # 对抗损失模式：
-  # - "discriminator": 使用判别器进行对抗训练（默认）
-  # - "mse": 使用 MSE 损失直接约束 h_real 和 h_fake 的一致性
-  adversarial_mode: "discriminator"  # "discriminator" | "mse"
+  # ==================== 对抗训练（禁用） ====================
+  # 当前训练：不使用判别器；用 teacher keep-all 前向作为 source 分布，
+  # 在 gen_answer token 区域做“分布级对齐”的 repair loss。
+  adversarial_mode: "none"  # "none" | "discriminator" | "mse"(legacy)
 
   # ==================== MSE 模式配置 ====================
   # 仅在 adversarial_mode="mse" 时生效
@@ -128,9 +126,10 @@ method_settings:
   disc_reinit_threshold: 0.97     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
-  # ==================== Adapter 配置 ====================
-  # 是否启用 Adapter（如果为 false，则只使用 Pruner，不使用 Adapter）
-  use_adapter: true
+  # ==================== 旧版 Adapter（禁用） ====================
+  # 旧版 adapter 是“同层、attn output 立即修复”，与我们当前的 delayed repair 方案不一致；
+  # 这里关闭，避免训练时引入不受控的破坏性映射。
+  use_adapter: false
 
   # Adapter 补偿剪枝后的信息损失
   # - simple: 简单 MLP adapter
@@ -138,27 +137,56 @@ method_settings:
   adapter_type: lightweight
   adapter_bottleneck: 512         # adapter 瓶颈维度（统一 adapter 模式）
   adapter_alpha_init: 0.1         # adapter 输出缩放初始化
-  adapter_delta_weight: 0.001     # adapter 修正幅度正则权重
+  adapter_delta_weight: 0.001     # 保留字段（use_adapter=false 时无效）
 
   # Mask encoder 类型
   # - attention: Attention 池化（更轻量，保留空间信息）
   # - linear: 原始 Linear encoder（向后兼容）
   mask_encoder_type: attention
-  adapter_dropout: 0.2  # Adapter 的 dropout 比例
+  adapter_dropout: 0.2  # 保留字段（use_adapter=false 时无效）
 
   # 被剪枝信息：是否使用被剪枝 token 的信息来补偿
   use_pruned_info: true  # 启用后，Adapter 会接收被剪枝 tokens 的聚合表示
 
   # 分离式 Adapter：为 vision/text tokens 使用独立的 Adapter
   # text_adapter 同时处理 question 和 answer tokens
-  use_separated_adapters: true   # 是否启用分离式 Adapter
+  use_separated_adapters: false   # 保留字段（use_adapter=false 时无效）
   vision_adapter_bottleneck: 512  # vision tokens adapter 瓶颈维度
   text_adapter_bottleneck: 512    # text tokens adapter 瓶颈维度（包含 question 和 answer）
 
   # Adversarial Loss 梯度控制
   # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
   # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
-  detach_adv_from_pruner: true
+  detach_adv_from_pruner: true  # legacy（adversarial_mode=none 时无效）
+
+  # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
+  # 机制：
+  # - pruning layer（如 L4/L14/L24）缓存 repair context（mask_emb/pruned_emb，低维）
+  # - repair layer（可配置）仅对 gen_answer token 做修复
+  use_repair_adapter: true
+  # repair 插入点（你要的“三段修复”默认设置）
+  # L4 之后：修复点放在 13
+  # L14 之后：修复点放在 22
+  # L24 之后：修复点放在 29
+  repair_layers: [13, 22, 29]
+  # repair 上下文来源（与 repair_layers 一一对应）
+  repair_source_layers: [4, 14, 24]
+  repair_bottleneck_dim: 512
+  repair_dropout: 0.0
+  repair_mask_encoder_type: attention
+  repair_use_pruned_info: true
+  repair_alpha_init: 0.1
+  # 默认 detach 输入：repair 的梯度不回流到 pruner（更稳定）
+  repair_detach_input: true
+
+  # teacher 前向（每 step 一次）：keep_all 作为 source 分布
+  teacher_forward_enable: true
+  teacher_pruning_mode: keep_all
+
+  # repair loss（分布级对齐，而非点到点对齐）
+  repair_loss_weight: 0.1
+  repair_loss_type: mean_var   # mean_var | mse
+  repair_var_weight: 1.0
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
