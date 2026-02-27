@@ -87,6 +87,8 @@ class LayerDiscriminator(nn.Module):
         if h.dim() == 3:
             # 单个 answer token: (batch, heads, head_dim)
             h_flat = h.view(h.shape[0], -1)  # (batch, heads * head_dim)
+            # 对输入做 L2 归一化，让判别器关注方向而非幅度
+            h_flat = F.normalize(h_flat, p=2, dim=-1)
             return self.net(h_flat).squeeze(-1)  # (batch,)
         elif h.dim() == 4:
             # 多个 answer tokens: (batch, heads, n_ans, head_dim)
@@ -95,6 +97,8 @@ class LayerDiscriminator(nn.Module):
             h = h.permute(0, 2, 1, 3)
             # Flatten: (batch, n_ans, heads * head_dim)
             h_flat = h.reshape(batch, n_ans, -1)
+            # 对输入做 L2 归一化
+            h_flat = F.normalize(h_flat, p=2, dim=-1)
             # 对每个 answer token 判别: (batch, n_ans, 1) -> (batch, n_ans)
             return self.net(h_flat).squeeze(-1)
         else:
@@ -214,7 +218,8 @@ class LayerDiscriminatorManager(nn.Module):
             # 逐样本计算
             for h_real, h_fake in zip(h_real_list, h_fake_list):
                 # h_real/h_fake: (heads, n_ans, head_dim) -> (1, heads, n_ans, head_dim)
-                h_real = h_real.unsqueeze(0)
+                # CRITICAL: 判别器训练时，对两者都 detach，避免梯度流向 Pruner/Adapter
+                h_real = h_real.unsqueeze(0).detach()
                 h_fake = h_fake.unsqueeze(0).detach()
 
                 real_pred = disc.forward_batch_answers(h_real, reduce='mean')

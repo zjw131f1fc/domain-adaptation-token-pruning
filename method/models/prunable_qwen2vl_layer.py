@@ -453,7 +453,7 @@ class PrunableQwen2VLDecoderLayer(nn.Module):
             # Vision tokens
             vision_slice = attn_output_fake_flat[:, vision_start:vision_end, :]
             vision_query = query_states_flat[:, vision_start:vision_end, :]
-            adapted_vision = vision_adapter(vision_slice, mask=cumulative_mask_for_adapter, query=vision_query)
+            adapted_vision = vision_adapter(vision_slice, mask=cumulative_mask_for_adapter, query=vision_query, vision_hidden=vision_hidden)
             adapted_output[:, vision_start:vision_end, :] = adapted_vision
 
             # Text tokens (question)
@@ -461,7 +461,7 @@ class PrunableQwen2VLDecoderLayer(nn.Module):
                 q_start, q_end = question_starts[i], question_ends[i]
                 text_slice = attn_output_fake_flat[i:i+1, q_start:q_end, :]
                 text_query = query_states_flat[i:i+1, q_start:q_end, :]
-                adapted_text = text_adapter(text_slice, mask=cumulative_mask_for_adapter[i:i+1], query=text_query)
+                adapted_text = text_adapter(text_slice, mask=cumulative_mask_for_adapter[i:i+1], query=text_query, vision_hidden=vision_hidden[i:i+1])
                 adapted_output[i, q_start:q_end, :] = adapted_text.squeeze(0)
 
             # Generator tokens (answer)
@@ -470,7 +470,7 @@ class PrunableQwen2VLDecoderLayer(nn.Module):
                 gen_end = answer_ends[i] - 1
                 gen_slice = attn_output_fake_flat[i:i+1, gen_start:gen_end, :]
                 gen_query = query_states_flat[i:i+1, gen_start:gen_end, :]
-                adapted_gen = text_adapter(gen_slice, mask=cumulative_mask_for_adapter[i:i+1], query=gen_query)
+                adapted_gen = text_adapter(gen_slice, mask=cumulative_mask_for_adapter[i:i+1], query=gen_query, vision_hidden=vision_hidden[i:i+1])
                 adapted_output[i, gen_start:gen_end, :] = adapted_gen.squeeze(0)
 
             attn_output_fake = adapted_output.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
@@ -479,7 +479,8 @@ class PrunableQwen2VLDecoderLayer(nn.Module):
             attn_output_fake_adapted = self.adapter(
                 attn_output_fake_flat,
                 mask=cumulative_mask_for_adapter,
-                query=query_states_flat
+                query=query_states_flat,
+                vision_hidden=vision_hidden
             )
             attn_output_fake = attn_output_fake_adapted.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 

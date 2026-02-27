@@ -1005,20 +1005,29 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     # Vision tokens: [current_vision_start, current_vision_end)
                     vision_slice = attn_output[:, current_vision_start:current_vision_end, :]
                     vision_query = query_states_flat[:, current_vision_start:current_vision_end, :]
-                    adapted_vision = vision_adapter(vision_slice, mask=scattered_mask, query=vision_query)
+                    adapted_vision = vision_adapter(
+                        vision_slice, mask=scattered_mask, query=vision_query,
+                        vision_hidden=vision_hidden_padded
+                    )
                     adapted_output[:, current_vision_start:current_vision_end, :] = adapted_vision
 
                     # Text tokens (除最后一个): [current_vision_end, current_seq_len-1)
                     if current_vision_end < current_seq_len - 1:
                         text_slice = attn_output[:, current_vision_end:current_seq_len-1, :]
                         text_query = query_states_flat[:, current_vision_end:current_seq_len-1, :]
-                        adapted_text = text_adapter(text_slice, mask=scattered_mask, query=text_query)
+                        adapted_text = text_adapter(
+                            text_slice, mask=scattered_mask, query=text_query,
+                            vision_hidden=vision_hidden_padded
+                        )
                         adapted_output[:, current_vision_end:current_seq_len-1, :] = adapted_text
 
                     # Generator token (最后一个，用于生成第一个 answer token): 使用 text_adapter
                     gen_slice = attn_output[:, current_seq_len-1:current_seq_len, :]
                     gen_query = query_states_flat[:, current_seq_len-1:current_seq_len, :]
-                    adapted_gen = text_adapter(gen_slice, mask=scattered_mask, query=gen_query)
+                    adapted_gen = text_adapter(
+                        gen_slice, mask=scattered_mask, query=gen_query,
+                        vision_hidden=vision_hidden_padded
+                    )
                     adapted_output[:, current_seq_len-1:current_seq_len, :] = adapted_gen
 
                     attn_output = adapted_output
@@ -1028,16 +1037,17 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         attn_output = adapter(
                             attn_output,
                             mask=scattered_mask,
-                            query=query_states_flat
+                            query=query_states_flat,
+                            vision_hidden=vision_hidden_padded
                         )
 
             # Step 6: 更新累积 vision mask（用于后续层的物理删除）
             # 直接使用 scattered_mask 作为新的累积 mask
             cumulative_vision_mask = scattered_mask.clone()
 
-            # 记录 mask 用于统计（保存 scattered_mask 供 Generate 阶段使用）
+            # 记录 mask 用于统计（保存 scattered_mask 和 vision_hidden_padded 供 Generate 阶段使用）
             n_kept_absolute = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
-            masks[layer_idx] = (hard_mask, n_kept_absolute, scattered_mask)
+            masks[layer_idx] = (hard_mask, n_kept_absolute, scattered_mask, vision_hidden_padded)
 
             attn_output = attn.o_proj(attn_output)
 
@@ -1259,15 +1269,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
                 # 在剪枝层应用 Adapter（使用 Prefill 阶段保存的 padded_mask）
                 if layer_idx in self.pruning_layers and self.use_adapter:
-                    # 从 masks 中获取 scattered_mask（与训练时一致的 scatter 格式）
-                    _, _, scattered_mask = masks[layer_idx]
+                    # 从 masks 中获取 scattered_mask 和 vision_hidden_padded（与训练时一致）
+                    _, _, scattered_mask, vision_hidden_padded = masks[layer_idx]
                     if self.use_separated_adapters:
                         # 分离式 Adapter：Generate 阶段使用 text_adapter
                         _, text_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
                         attn_output_gen = text_adapter(
                             attn_output_gen,
                             mask=scattered_mask,
-                            query=query_states_flat_gen
+                            query=query_states_flat_gen,
+                            vision_hidden=vision_hidden_padded
                         )
                     else:
                         adapter = self.adapter_manager.get_adapter(layer_idx)
@@ -1275,7 +1286,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             attn_output_gen = adapter(
                                 attn_output_gen,
                                 mask=scattered_mask,
-                                query=query_states_flat_gen  # Decode 阶段的 query
+                                query=query_states_flat_gen,
+                                vision_hidden=vision_hidden_padded
                             )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)

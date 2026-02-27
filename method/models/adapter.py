@@ -7,6 +7,55 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+class PrunedTokenAggregator(nn.Module):
+    """聚合被剪枝 token 的信息
+
+    将被剪掉的 vision tokens 的 hidden states 加权聚合，
+    为 Adapter 提供"丢失了什么信息"的上下文。
+    """
+
+    def __init__(self, hidden_size: int, bottleneck_dim: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bottleneck_dim = bottleneck_dim
+
+        # 投影到 bottleneck
+        self.proj = nn.Linear(hidden_size, bottleneck_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        vision_hidden: torch.Tensor,
+        mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            vision_hidden: (batch, n_vision, hidden_size) - 所有 vision tokens
+            mask: (batch, n_vision) - pruning mask (1=keep, 0=prune)
+
+        Returns:
+            pruned_summary: (batch, bottleneck_dim) - 被剪枝 tokens 的聚合表示
+        """
+        # 反转 mask：1=被剪, 0=保留
+        pruned_mask = 1 - mask  # (batch, n_vision)
+
+        # 提取被剪枝 tokens 的 hidden states
+        pruned_hidden = vision_hidden * pruned_mask.unsqueeze(-1)  # (batch, n_vision, hidden)
+
+        # 加权平均（避免除零）
+        pruned_sum = pruned_hidden.sum(dim=1)  # (batch, hidden)
+        pruned_count = pruned_mask.sum(dim=1, keepdim=True).clamp(min=1)  # (batch, 1)
+        pruned_avg = pruned_sum / pruned_count  # (batch, hidden)
+
+        # 投影到 bottleneck
+        return self.proj(pruned_avg)  # (batch, bottleneck)
+
+
 class MaskAttentionEncoder(nn.Module):
     """Attention 池化的 Mask Encoder
 
@@ -74,9 +123,9 @@ class MaskAttentionEncoder(nn.Module):
 
 
 class LightweightAdapter(nn.Module):
-    """轻量级 Adapter：Mask-Aware + Query-Aware FiLM 调制
+    """轻量级 Adapter：Mask-Aware + Query-Aware + Pruned-Info-Aware FiLM 调制
 
-    用 pruning mask + 当前 token 的 attention query 进行补偿。
+    用 pruning mask + 当前 token 的 attention query + 被剪枝信息 进行补偿。
     """
 
     def __init__(
@@ -86,11 +135,13 @@ class LightweightAdapter(nn.Module):
         n_vision: int = 576,
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',  # 'attention' or 'linear'
+        use_pruned_info: bool = True,  # 是否使用被剪枝信息
         **kwargs
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.bottleneck_dim = bottleneck_dim
+        self.use_pruned_info = use_pruned_info
 
         # Dropout 防止过拟合
         self.dropout = nn.Dropout(dropout)
@@ -114,8 +165,11 @@ class LightweightAdapter(nn.Module):
         # Query encoder: 投影 attention query 到 bottleneck
         self.query_proj = nn.Linear(hidden_size, bottleneck_dim)
 
-        # FiLM: 根据 (mask + query) 生成调制参数
-        # 输入是 mask_emb + query_emb，都是 bottleneck 维度
+        # Pruned info aggregator: 聚合被剪枝 token 的信息
+        if use_pruned_info:
+            self.pruned_aggregator = PrunedTokenAggregator(hidden_size, bottleneck_dim)
+
+        # FiLM: 根据 (mask + query + pruned_info) 生成调制参数
         self.gamma_net = nn.Linear(bottleneck_dim, bottleneck_dim)
         self.beta_net = nn.Linear(bottleneck_dim, bottleneck_dim)
 
@@ -130,6 +184,8 @@ class LightweightAdapter(nn.Module):
         # Query proj 小值初始化
         nn.init.xavier_uniform_(self.query_proj.weight, gain=0.1)
         nn.init.zeros_(self.query_proj.bias)
+
+        # Pruned aggregator 已经在自己的 __init__ 中初始化了，不需要在这里初始化
 
         # FiLM 初始化：gamma=1, beta=0
         nn.init.zeros_(self.gamma_net.weight)
@@ -146,6 +202,7 @@ class LightweightAdapter(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         query: Optional[torch.Tensor] = None,
+        vision_hidden: Optional[torch.Tensor] = None,  # 新增：vision tokens 的 hidden states
         **kwargs
     ) -> torch.Tensor:
         """
@@ -153,6 +210,7 @@ class LightweightAdapter(nn.Module):
             x: (batch, seq, hidden_size) - attention output
             mask: (batch, n_vision) - pruning mask (1=keep, 0=prune)
             query: (batch, seq, hidden_size) - attention query states
+            vision_hidden: (batch, n_vision, hidden_size) - vision tokens 的 hidden states
         """
         h = self.dropout(self.act(self.down(x)))  # (batch, seq, bottleneck)
 
@@ -167,6 +225,11 @@ class LightweightAdapter(nn.Module):
         if query is not None:
             query_emb = self.query_proj(query)  # (batch, seq, bottleneck)
             condition = condition + query_emb
+
+        # 新增：被剪枝信息
+        if vision_hidden is not None and mask is not None and self.use_pruned_info:
+            pruned_emb = self.pruned_aggregator(vision_hidden, mask)  # (batch, bottleneck)
+            condition = condition + pruned_emb.unsqueeze(1)  # broadcast to (batch, seq, bottleneck)
 
         # FiLM modulation
         gamma = 1 + self.gamma_net(condition)  # (batch, seq, bottleneck)
@@ -190,6 +253,7 @@ class AdapterManager(nn.Module):
         n_vision: int = 576,
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',
+        use_pruned_info: bool = True,  # 新增
         **kwargs
     ):
         super().__init__()
@@ -206,7 +270,8 @@ class AdapterManager(nn.Module):
                 bottleneck_dim=bottleneck_dim,
                 n_vision=n_vision,
                 dropout=dropout,
-                mask_encoder_type=mask_encoder_type
+                mask_encoder_type=mask_encoder_type,
+                use_pruned_info=use_pruned_info  # 新增
             )
             for idx in layer_indices
         })
@@ -231,6 +296,7 @@ class SeparatedAdapterManager(nn.Module):
         n_vision: int = 576,
         dropout: float = 0.15,
         mask_encoder_type: str = 'attention',
+        use_pruned_info: bool = True,  # 新增
         **kwargs
     ):
         super().__init__()
@@ -246,14 +312,16 @@ class SeparatedAdapterManager(nn.Module):
                 bottleneck_dim=vision_bottleneck_dim,
                 n_vision=n_vision,
                 dropout=dropout,
-                mask_encoder_type=mask_encoder_type
+                mask_encoder_type=mask_encoder_type,
+                use_pruned_info=use_pruned_info  # 新增
             )
             self.text_adapters[str(idx)] = LightweightAdapter(
                 hidden_size=hidden_size,
                 bottleneck_dim=text_bottleneck_dim,
                 n_vision=n_vision,
                 dropout=dropout,
-                mask_encoder_type=mask_encoder_type
+                mask_encoder_type=mask_encoder_type,
+                use_pruned_info=use_pruned_info  # 新增
             )
 
     def get_adapters(self, layer_idx: int):
