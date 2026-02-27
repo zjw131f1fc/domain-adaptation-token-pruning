@@ -3,6 +3,7 @@
 
 global_settings:
   seed: 42
+  study_name: "t192"
   device: "cuda"
   dtype: "bfloat16"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
@@ -197,7 +198,7 @@ method_settings:
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 192  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火

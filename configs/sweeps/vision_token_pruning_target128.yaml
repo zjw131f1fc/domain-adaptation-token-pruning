@@ -3,6 +3,7 @@
 
 global_settings:
   seed: 42
+  study_name: "t128"
   device: "cuda"
   dtype: "bfloat16"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
