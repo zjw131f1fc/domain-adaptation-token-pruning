@@ -41,8 +41,10 @@ trainer_settings:
         min_lr_ratio: 0.1  # 最小学习率 = 初始学习率 * min_lr_ratio
     print_loss_every_batches: 20  # 隔多久打印一次损失
     eval_loss_every_batches: 100  # 隔多久计算一次 eval loss（用于检测过拟合）
-    eval_every_batches: 100  # 隔多久评估一次（计算 accuracy）
-    eval_max_samples: 20000000 # 每次评估使用多少数据
+    eval_every_batches: 10000  # 隔多久评估一次（计算 accuracy）
+    # TODO(2026-02-28): 目前 hard eval/generate 路径尚未接入 delayed repair adapter，
+    # accuracy 不能反映 repair 的收益；先把评估样本数改成 1 作为占位，避免浪费时间/误导判断。
+    eval_max_samples: 1 # 每次评估使用多少数据（占位）
     save_every_batches: 2000 # 隔多久保存一个checkpoint
     grad_clip_max_norm: null
 
@@ -50,7 +52,7 @@ dataset_settings:
   name: "vqa-vqav2"
   split:
     train: 30000
-    test: 500
+    test: 5000
   fast_load_no_random: false
   category_priority:
     enable: false
