@@ -177,9 +177,9 @@ method_settings:
   # L4 之后：修复点放在 7
   # L14 之后：修复点放在 17
   # L24 之后：修复点放在 27
-  repair_layers: [7, 17, 27]
+  repair_layers: [17, 27]
   # repair 上下文来源（与 repair_layers 一一对应）
-  repair_source_layers: [4, 14, 24]
+  repair_source_layers: [14, 24]
   repair_bottleneck_dim: 512
   repair_dropout: 0.0
   repair_mask_encoder_type: attention
@@ -228,7 +228,7 @@ method_settings:
   # - calib_samples: 用多少训练样本估计子空间（只在 rank0 跑一遍，然后广播到各 rank）
   # - calib_max_tokens_per_layer: 每层最多用多少 token 向量做 PCA（防止内存爆）
   # 先开强版本：orth_scale=0 完全压制正交分量，验证是否能让 corrected 更“像 teacher”
-  repair_subspace_enable: true
+  repair_subspace_enable: false
   # 更强表达能力：先把 rank 提到 128，并允许少量正交残差（避免投影过硬导致欠拟合）
   repair_subspace_rank: 128
   repair_subspace_orth_scale: 0.1
