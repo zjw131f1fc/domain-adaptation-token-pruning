@@ -3,7 +3,7 @@
 
 global_settings:
   seed: 42
-  study_name: "t192"
+  study_name: "t64"
   device: "cuda"
   dtype: "bfloat16"
   pytorch_cuda_alloc_conf: "expandable_segments:True"
@@ -19,7 +19,7 @@ global_settings:
   reset_step_on_load: true
 
 config_settings:
-  # sweep/eval 时配置打印太长，默认先关掉；需要时再在 YAML 里改回 true。
+  # 每次启动都把整份配置打印到 log 里会很长；默认关闭，只保留关键日志。
   log_config_on_load: false
 
 # 观察到总batch增加后，准确率大幅上升
@@ -202,7 +202,7 @@ method_settings:
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 192  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
@@ -249,5 +249,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  # hard_forward: forward()+greedy decode，不做物理删除，更稳，且适配 delayed repair adapter
-  eval_mode: ["hard_forward"]
+  eval_mode: ["hard"]

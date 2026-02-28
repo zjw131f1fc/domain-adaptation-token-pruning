@@ -429,9 +429,19 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 vision_feature_layer=vision_feature_layer,
                 vision_feature_select_strategy=vision_feature_select_strategy,
             )
-            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor
+            # transformers>=5.2: get_image_features() 返回 BaseModelOutputWithPooling，
+            # 且将投影后的 features 放在 .pooler_output 里（通常是 List[Tensor]）。
+            if not torch.is_tensor(image_features) and hasattr(image_features, "pooler_output"):
+                image_features = image_features.pooler_output
+
+            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor。
+            # - List[Tensor(seq, hidden)] -> stack 成 (batch, seq, hidden)
+            # - List[Tensor(batch, seq, hidden)] -> cat 沿 batch 维拼回 (batch, seq, hidden)
             if isinstance(image_features, (list, tuple)):
-                image_features = torch.cat(image_features, dim=0)
+                if len(image_features) > 0 and torch.is_tensor(image_features[0]) and image_features[0].dim() == 2:
+                    image_features = torch.stack(list(image_features), dim=0)
+                else:
+                    image_features = torch.cat(list(image_features), dim=0)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             special_image_mask = model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
@@ -943,9 +953,17 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 vision_feature_layer=vision_feature_layer,
                 vision_feature_select_strategy=vision_feature_select_strategy,
             )
-            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor
+            # transformers>=5.2: get_image_features() 返回 BaseModelOutputWithPooling，
+            # 且将投影后的 features 放在 .pooler_output 里（通常是 List[Tensor]）。
+            if not torch.is_tensor(image_features) and hasattr(image_features, "pooler_output"):
+                image_features = image_features.pooler_output
+
+            # 兼容不同版本的 transformers：可能返回 list/tuple 或单个 tensor。
             if isinstance(image_features, (list, tuple)):
-                image_features = torch.cat(image_features, dim=0)
+                if len(image_features) > 0 and torch.is_tensor(image_features[0]) and image_features[0].dim() == 2:
+                    image_features = torch.stack(list(image_features), dim=0)
+                else:
+                    image_features = torch.cat(list(image_features), dim=0)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             special_image_mask = model.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_features
