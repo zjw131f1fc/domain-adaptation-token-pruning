@@ -62,7 +62,8 @@ def load_checkpoint(
     if logger:
         logger.info(f"Loading checkpoint from {checkpoint_path}...")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # 评估时优先在 CPU 读取 checkpoint，避免瞬时占用大量 GPU 显存。
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if 'pruner_state_dict' in checkpoint:
         model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
@@ -105,6 +106,41 @@ def load_checkpoint(
         logger.info("Checkpoint loaded successfully.")
 
     return checkpoint
+
+
+def infer_model_flags_from_checkpoint(
+    checkpoint: Dict[str, Any],
+    config,
+    logger=None,
+) -> None:
+    """根据 checkpoint 内容自动推断是否启用 adapter（尤其是 delayed repair adapter）。
+
+    目的：支持直接评估 pruner-only checkpoint（没有 repair adapter state），避免在 config 打开 use_repair_adapter
+    时构建随机初始化的 adapter 影响 hard_forward 指标。
+    """
+    method_cfg = config.method_settings
+
+    # delayed repair adapter：必须至少存在 repair_adapter_state_dict 才认为 checkpoint 支持 repair
+    has_repair_adapter = 'repair_adapter_state_dict' in checkpoint
+    has_repair_ctx = 'repair_context_encoder_state_dict' in checkpoint
+    inferred_use_repair = bool(has_repair_adapter)
+
+    # 旧版 attention-output adapter（如果未来要评估，也可按 state_dict 推断；当前默认不自动开启）
+    # inferred_use_adapter = bool(('adapter_state_dict' in checkpoint) or ('separated_adapter_state_dict' in checkpoint))
+
+    prev = bool(method_cfg.get('use_repair_adapter', False))
+    method_cfg['use_repair_adapter'] = inferred_use_repair
+
+    if logger:
+        logger.info(
+            f"Auto-infer repair adapter from checkpoint: use_repair_adapter={inferred_use_repair} "
+            f"(was {prev}) [has_adapter={has_repair_adapter}, has_ctx={has_repair_ctx}]"
+        )
+        if inferred_use_repair and (not has_repair_ctx):
+            logger.warning(
+                "Checkpoint has repair_adapter_state_dict but no repair_context_encoder_state_dict; "
+                "context encoder will stay randomly initialized and may hurt metrics."
+            )
 
 
 def evaluate_no_image_samples(
@@ -294,6 +330,12 @@ def main():
         if logger:
             logger.info(f"Checkpoint: {checkpoint_path}")
 
+        # === 自动推断 adapter 开关（在构建模型前）===
+        # hard_forward 模式会走 forward()，如果 use_repair_adapter=True 但 ckpt 里没有修复模块权重，
+        # 会导致随机初始化 adapter 参与 forward，指标失真；因此这里自动推断是否启用 repair adapter。
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        infer_model_flags_from_checkpoint(checkpoint, config, logger)
+
         # 获取配置
         method_cfg = config.method_settings
         pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
@@ -302,7 +344,47 @@ def main():
         if logger:
             logger.info("Loading model...")
         model, processor = load_model(config, device, local_rank)
-        load_checkpoint(model, checkpoint_path, device, logger)
+        # 复用已加载的 checkpoint，避免重复 IO
+        # （兼容：load_checkpoint 仍支持从文件加载，这里直接走 state_dict 加载逻辑）
+        # 将 checkpoint 临时写回变量名以复用原逻辑结构
+        # 直接调用 load_checkpoint 的实现：为了最小改动，传路径再读一次也行；但这里复用更快
+        if logger:
+            logger.info("Loading checkpoint weights into model...")
+        # 手动复用 load_checkpoint 逻辑：保持行为一致
+        # 这里不再重复 torch.load
+        if 'pruner_state_dict' in checkpoint:
+            model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
+            if logger:
+                logger.info("  Loaded pruner_manager state")
+        if hasattr(model, 'use_adapter') and model.use_adapter:
+            if 'separated_adapter_state_dict' in checkpoint and model.use_separated_adapters:
+                model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
+                if logger:
+                    logger.info("  Loaded separated_adapter_manager state")
+            elif 'adapter_state_dict' in checkpoint and not model.use_separated_adapters:
+                model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
+                if logger:
+                    logger.info("  Loaded adapter_manager state")
+        else:
+            if logger and ('adapter_state_dict' in checkpoint or 'separated_adapter_state_dict' in checkpoint):
+                logger.info("  Skipped adapter state (use_adapter=False)")
+        if getattr(model, "use_repair_adapter", False):
+            if 'repair_context_encoder_state_dict' in checkpoint and getattr(model, "repair_context_encoder", None) is not None:
+                model.repair_context_encoder.load_state_dict(checkpoint['repair_context_encoder_state_dict'])
+                if logger:
+                    logger.info("  Loaded repair_context_encoder state")
+            if 'repair_adapter_state_dict' in checkpoint and getattr(model, "repair_adapter_manager", None) is not None:
+                model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
+                if logger:
+                    logger.info("  Loaded repair_adapter_manager state")
+        if 'disc_state_dict' in checkpoint:
+            model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
+            if logger:
+                logger.info("  Loaded disc_manager state")
+        if logger:
+            if 'step' in checkpoint:
+                logger.info(f"  Checkpoint from step {checkpoint['step']}")
+            logger.info("Checkpoint loaded successfully.")
 
         if logger:
             logger.info(f"Pruning layers: {pruning_layers}")
