@@ -177,7 +177,7 @@ method_settings:
   # L4 之后：修复点放在 13
   # L14 之后：修复点放在 22
   # L24 之后：修复点放在 29
-  repair_layers: [13, 22, 29]
+  repair_layers: [7, 17, 27]
   # repair 上下文来源（与 repair_layers 一一对应）
   repair_source_layers: [4, 14, 24]
   repair_bottleneck_dim: 512

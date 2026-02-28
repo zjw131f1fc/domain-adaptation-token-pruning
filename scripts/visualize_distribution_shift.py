@@ -164,7 +164,7 @@ def load_samples(num_samples, config_path):
     config = load_config(override_file=config_path)
 
     data_bundle = load_dataset(config)
-    test_dataset = data_bundle['splits']['train']
+    test_dataset = data_bundle['splits']['test']
 
     # 使用 islice 避免加载整个数据集
     return list(islice(test_dataset, num_samples))
