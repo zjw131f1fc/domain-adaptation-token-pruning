@@ -616,7 +616,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 if pruner_has_grad:
                     if grad_clip:
-                        torch.nn.utils.clip_grad_norm_(model.get_pruner_parameters(), grad_clip)
+                        # pruner_optimizer 同时包含 pruner + (delayed) adapters 参数；这里一起 clip 更安全
+                        from itertools import chain
+                        torch.nn.utils.clip_grad_norm_(
+                            chain(model.get_pruner_parameters(), model.get_adapter_parameters()),
+                            grad_clip,
+                        )
                     pruner_optimizer.step()
 
                 # 清零梯度，准备下一轮累积
@@ -719,6 +724,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 phase_str = ""
                 if 'hybrid_phase' in stats:
                     phase_str = f" [Phase {stats['hybrid_phase']}]"
+                if 'two_stage' in stats and isinstance(stats['two_stage'], dict) and stats['two_stage'].get('enabled'):
+                    phase_str = f"{phase_str} [Stage {stats['two_stage'].get('stage', '?')}]"
                 noise_str = "noise=ON" if stats.get('use_gumbel_noise', False) else "noise=OFF"
                 logger.info(f"Step {global_step}{phase_str}: {loss_str} (temp={stats['temperature']:.2f}, {noise_str})")
 
@@ -755,6 +762,59 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         cosine_val = stats['cosine_per_layer'][layer_idx]
                         per_layer_strs.append(f"L{layer_idx}={mse_val:.4f}(cos={cosine_val:.3f})")
                     logger.info(f"  Alignment: MSE={stats['avg_mse']:.4f}, Cosine={stats['avg_cosine']:.3f} [{', '.join(per_layer_strs)}]")
+
+                # Repair Adapter 详细指标
+                if 'repair_per_layer_stats' in stats and stats['repair_per_layer_stats']:
+                    per_layer_strs = []
+                    avg_var_ratio = 0
+                    avg_cosine = 0
+                    n_layers = 0
+                    for layer_idx in sorted(stats['repair_per_layer_stats'].keys()):
+                        layer_stats = stats['repair_per_layer_stats'][layer_idx]
+                        mean_l = layer_stats.get('mean_loss', 0)
+                        var_l = layer_stats.get('var_loss', 0)
+                        var_ratio = layer_stats.get('var_ratio', 1.0)
+                        cosine = layer_stats.get('cosine_sim', 0)
+                        per_layer_strs.append(f"L{layer_idx}(m={mean_l:.4f},v={var_l:.4f},vr={var_ratio:.2f},cos={cosine:.3f})")
+                        avg_var_ratio += var_ratio
+                        avg_cosine += cosine
+                        n_layers += 1
+                    if n_layers > 0:
+                        avg_var_ratio /= n_layers
+                        avg_cosine /= n_layers
+                    logger.info(f"  Repair: var_ratio={avg_var_ratio:.2f}, cosine={avg_cosine:.3f} [{', '.join(per_layer_strs)}]")
+
+                # Adapter 修复效果指标
+                if 'adapter_stats_per_layer' in stats and stats['adapter_stats_per_layer']:
+                    per_layer_strs = []
+                    for layer_idx in sorted(stats['adapter_stats_per_layer'].keys()):
+                        layer_stats = stats['adapter_stats_per_layer'][layer_idx]
+                        dir_cos = layer_stats.get('direction_cosine', 0)
+                        mag_ratio = layer_stats.get('magnitude_ratio', 0)
+                        per_layer_strs.append(f"L{layer_idx}(dir={dir_cos:.3f},mag={mag_ratio:.2f})")
+                    avg_dir = stats.get('adapter_avg_direction_cosine', 0)
+                    avg_mag = stats.get('adapter_avg_magnitude_ratio', 0)
+                    logger.info(f"  Adapter: dir_cos={avg_dir:.3f}, mag_ratio={avg_mag:.2f} [{', '.join(per_layer_strs)}]")
+
+                # Repair delta decomposition diagnostics (optional regularizer)
+                # Helps detect the "mostly orthogonal delta" failure mode early.
+                if 'raw_repair_delta_reg_loss' in stats:
+                    logger.info(
+                        f"  RepairDeltaReg: loss={stats.get('raw_repair_delta_reg_loss', 0.0):.6f} "
+                        f"(w_l2={method_cfg.get('repair_delta_l2_weight', 0.0)}, "
+                        f"w_orth={method_cfg.get('repair_delta_orth_weight', 0.0)}, "
+                        f"w_frac={method_cfg.get('repair_delta_frac_weight', 0.0)})"
+                    )
+                if 'repair_delta_diag_per_layer' in stats and stats['repair_delta_diag_per_layer']:
+                    per_layer_strs = []
+                    for layer_idx in sorted(stats['repair_delta_diag_per_layer'].keys()):
+                        d = stats['repair_delta_diag_per_layer'][layer_idx]
+                        per_layer_strs.append(
+                            f"L{layer_idx}(frac={d.get('frac_mean', 0.0):.3f},"
+                            f"orth={d.get('orth_mse', 0.0):.4f},"
+                            f"dl2={d.get('delta_l2', 0.0):.4f})"
+                        )
+                    logger.info(f"  RepairDeltaDiag: [{', '.join(per_layer_strs)}]")
 
             # 计算 eval loss（用于检测过拟合，按 batch 数判断）
             if eval_loss_loader is not None and global_batch % eval_loss_every == 0:

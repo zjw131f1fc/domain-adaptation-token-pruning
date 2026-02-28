@@ -21,6 +21,7 @@ import sys
 import argparse
 from pathlib import Path
 from collections import defaultdict
+import csv
 
 import torch
 import numpy as np
@@ -31,6 +32,7 @@ from sklearn.manifold import TSNE
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KernelDensity
 from sklearn.preprocessing import StandardScaler
 
 # 添加项目根目录
@@ -45,6 +47,14 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=100, help="Number of samples")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--output_dir", type=str, default="outputs/visualizations", help="Output directory")
+    parser.add_argument("--no_layernorm", action="store_true", help="Don't apply next layer's LayerNorm (show raw adapter output)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (subsampling, t-SNE, etc.)")
+    parser.add_argument("--max_vis_tokens", type=int, default=1000, help="Max tokens used for PCA/t-SNE per group")
+    parser.add_argument("--tsne_pca_dim", type=int, default=50, help="PCA reduce dim before t-SNE (0 disables)")
+    parser.add_argument("--no_tsne_standardize", action="store_true", help="Disable StandardScaler before t-SNE")
+    parser.add_argument("--tsne_metric", type=str, default="euclidean", choices=["euclidean", "cosine"], help="t-SNE metric")
+    parser.add_argument("--tag", type=str, default="", help="Optional run tag (used as output subdir name)")
+    parser.add_argument("--flat_output", action="store_true", help="Write directly into output_dir (may overwrite files)")
     return parser.parse_args()
 
 
@@ -336,21 +346,248 @@ def cohens_d(x, y):
     return (np.mean(x) - np.mean(y)) / (pooled_std + 1e-8)
 
 
-def collect_h_vectors(model, processor, samples, device):
+def _describe_vectors(name: str, X: np.ndarray) -> None:
+    """Quick numeric sanity checks for pooled token vectors."""
+    if X is None:
+        print(f"      {name}: None")
+        return
+    if not isinstance(X, np.ndarray):
+        print(f"      {name}: (non-numpy) {type(X)}")
+        return
+    if X.ndim != 2:
+        print(f"      {name}: shape={X.shape} (expected 2D)")
+        return
+    n, d = X.shape
+    if n <= 0:
+        print(f"      {name}: empty, dim={d}")
+        return
+
+    finite_rows = np.isfinite(X).all(axis=1)
+    frac_finite = float(finite_rows.mean())
+    X0 = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    norms = np.linalg.norm(X0, axis=1)
+    rms = np.sqrt((X0 ** 2).mean(axis=1))
+    print(
+        f"      {name}: n_tokens={n}, dim={d}, finite_rows={frac_finite*100:.1f}%, "
+        f"||x|| mean={norms.mean():.3f} std={norms.std():.3f} min={norms.min():.3f} max={norms.max():.3f}, "
+        f"rms mean={rms.mean():.3f}"
+    )
+
+
+def _silverman_bandwidth(x: np.ndarray) -> float:
+    """Silverman's rule-of-thumb bandwidth for 1D KDE."""
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n <= 1:
+        return 1.0
+    std = float(np.std(x, ddof=1))
+    if std <= 1e-12:
+        return 1.0
+    return 1.06 * std * (n ** (-1 / 5))
+
+
+def _plot_1d_density(ax, series, *, bins=60, kde_points=400, kde_bw=None, title="", xlabel=""):
+    """Overlay hist + KDE for multiple 1D series. series: list of (name, data, color)."""
+    cleaned = []
+    for name, data, color in series:
+        if data is None:
+            continue
+        x = np.asarray(data, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        if len(x) == 0:
+            continue
+        cleaned.append((name, x, color))
+
+    if not cleaned:
+        ax.axis("off")
+        ax.set_title(title)
+        return
+
+    all_x = np.concatenate([x for _, x, _ in cleaned], axis=0)
+    lo = float(np.percentile(all_x, 0.5))
+    hi = float(np.percentile(all_x, 99.5))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(all_x))
+        hi = float(np.max(all_x) + 1e-6)
+
+    edges = np.linspace(lo, hi, bins + 1)
+    grid = np.linspace(lo, hi, kde_points).reshape(-1, 1)
+
+    for name, x, color in cleaned:
+        ax.hist(
+            x,
+            bins=edges,
+            density=True,
+            alpha=0.20,
+            color=color,
+            edgecolor="none",
+            label=name,
+        )
+        bw = float(kde_bw) if kde_bw is not None else _silverman_bandwidth(x)
+        kde = KernelDensity(kernel="gaussian", bandwidth=bw)
+        kde.fit(x.reshape(-1, 1))
+        logp = kde.score_samples(grid)
+        p = np.exp(logp)
+        ax.plot(grid[:, 0], p, color=color, linewidth=2.0)
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Density")
+    ax.legend(fontsize=10)
+
+
+def _mean_var_alignment_stats(Xs: np.ndarray, Xt: np.ndarray) -> dict:
+    """Training-aligned summary: compare mean + diagonal variance between two token sets.
+
+    Note: this matches the *statistics* logged in training for mean/var/cos/var_ratio,
+    but does not require token-wise alignment.
+    """
+    if Xs is None or Xt is None:
+        return {}
+    Xs = np.asarray(Xs, dtype=np.float32)
+    Xt = np.asarray(Xt, dtype=np.float32)
+    if Xs.ndim != 2 or Xt.ndim != 2:
+        return {}
+    if Xs.shape[1] != Xt.shape[1]:
+        return {}
+
+    ms = Xs.mean(axis=0)
+    mt = Xt.mean(axis=0)
+    vs = Xs.var(axis=0)
+    vt = Xt.var(axis=0)
+
+    mean_loss = float(((ms - mt) ** 2).mean())
+    var_loss = float(((vs - vt) ** 2).mean())
+    var_ratio = float(vs.mean() / (vt.mean() + 1e-8))
+    cos = float(np.dot(ms, mt) / (np.linalg.norm(ms) * np.linalg.norm(mt) + 1e-8))
+    return {
+        "mean_loss": mean_loss,
+        "var_loss": var_loss,
+        "var_ratio": var_ratio,
+        "cosine": cos,
+        "student_var_mean": float(vs.mean()),
+        "teacher_var_mean": float(vt.mean()),
+        "n_student": int(Xs.shape[0]),
+        "n_teacher": int(Xt.shape[0]),
+        "dim": int(Xs.shape[1]),
+    }
+
+
+def _save_layerwise_alignment_report(report_rows: list[dict], output_dir: str) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "layerwise_repair_alignment.csv")
+    if not report_rows:
+        return out_path
+
+    # stable header order
+    fieldnames = [
+        "layer",
+        "kept_ratio_target",
+        "mode",
+        "cosine",
+        "var_ratio",
+        "mean_loss",
+        "var_loss",
+        "student_var_mean",
+        "teacher_var_mean",
+        "n_student",
+        "n_teacher",
+        "dim",
+    ]
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in report_rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+    return out_path
+
+
+def _plot_layerwise_alignment_report(report_rows: list[dict], output_dir: str) -> None:
+    """Plot layer-wise cosine/var_ratio for fake/corrected vs real."""
+    if not report_rows:
+        return
+    # group rows by mode
+    rows_fake = [r for r in report_rows if r.get("mode") == "fake_vs_real"]
+    rows_corr = [r for r in report_rows if r.get("mode") == "corrected_vs_real"]
+    if not rows_fake and not rows_corr:
+        return
+
+    def _extract(rows, key):
+        rows2 = sorted(rows, key=lambda x: x["layer"])
+        layers = [int(r["layer"]) for r in rows2]
+        vals = [float(r.get(key, np.nan)) for r in rows2]
+        return layers, vals
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    if rows_fake:
+        x, y = _extract(rows_fake, "cosine")
+        axes[0].plot(x, y, marker="o", linewidth=2, label="fake vs real", color="orange")
+        x2, y2 = _extract(rows_fake, "var_ratio")
+        axes[1].plot(x2, y2, marker="o", linewidth=2, label="fake vs real", color="orange")
+    if rows_corr:
+        x, y = _extract(rows_corr, "cosine")
+        axes[0].plot(x, y, marker="o", linewidth=2, label="corrected vs real", color="green")
+        x2, y2 = _extract(rows_corr, "var_ratio")
+        axes[1].plot(x2, y2, marker="o", linewidth=2, label="corrected vs real", color="green")
+
+    axes[0].set_title("Layer-wise mean direction (cosine)")
+    axes[0].set_xlabel("Layer")
+    axes[0].set_ylabel("cosine(ms, mt)")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].axhline(1.0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+    axes[1].set_title("Layer-wise variance scale (var_ratio)")
+    axes[1].set_xlabel("Layer")
+    axes[1].set_ylabel("mean(var_s) / mean(var_t)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "layerwise_repair_alignment.png"), dpi=150)
+    plt.close()
+
+
+def collect_h_vectors(model, processor, samples, device, apply_next_layernorm: bool = True):
     """收集所有样本的 h_real, h_fake, h_corrected
 
     新版架构（Delayed Repair）：
-    - h_real: 不做剪枝时的表征（需要单独跑一次 forward）
-    - h_fake: 剪枝后、repair 前的表征（captured_for_repair）
-    - h_corrected: 剪枝后、repair 后的表征（captured）
+    - h_real: teacher（pruning_mode="keep_all"，不剪枝）
+    - h_fake: 剪枝后、repair 前（pruning_mode="normal", apply_repair=False）
+    - h_corrected: 剪枝后、repair 后（pruning_mode="normal", apply_repair=True）
 
     在 repair_layers 捕获这些表征。
+
+    Args:
+        apply_next_layernorm: 是否应用下一层的 input_layernorm，
+            这样可视化的是 LLM 下一层实际看到的分布
     """
     # 获取 repair_layers
     repair_layers = getattr(model, 'repair_layers', [])
     if not repair_layers:
         print("Warning: No repair_layers configured, using pruning_layers instead")
         repair_layers = model.pruning_layers
+
+    # 获取各层的 input_layernorm（用于归一化）
+    llm = model.base_model.model.language_model
+    layer_norms = {}
+    if apply_next_layernorm:
+        for layer_idx in repair_layers:
+            next_layer_idx = layer_idx + 1
+            if next_layer_idx < len(llm.layers):
+                # 获取下一层的 input_layernorm
+                next_layer = llm.layers[next_layer_idx]
+                if hasattr(next_layer, 'original_layer'):
+                    # PrunableLlamaDecoderLayer
+                    layer_norms[layer_idx] = next_layer.original_layer.input_layernorm
+                else:
+                    layer_norms[layer_idx] = next_layer.input_layernorm
+            else:
+                # 最后一层，用 final norm
+                layer_norms[layer_idx] = llm.norm
+        print(f"  Will apply next layer's input_layernorm for visualization")
 
     h_real_all = defaultdict(list)
     h_fake_all = defaultdict(list)
@@ -366,72 +603,70 @@ def collect_h_vectors(model, processor, samples, device):
             continue
 
         inputs = prep['inputs']
+        common_kwargs = dict(
+            input_ids=inputs['input_ids'],
+            pixel_values=inputs['pixel_values'],
+            attention_mask=inputs['attention_mask'],
+            vision_start=prep['vision_start'],
+            vision_end=prep['vision_end'],
+            question_starts=prep['question_starts'],
+            question_ends=prep['question_ends'],
+            answer_starts=prep['answer_starts'],
+            answer_ends=prep['answer_ends'],
+            return_pruning_info=False,
+            capture_layers=repair_layers,
+        )
 
         with torch.no_grad():
-            # 1. 跑一次带剪枝和 repair 的 forward，获取 h_fake 和 h_corrected
-            output_pruned = model(
-                input_ids=inputs['input_ids'],
-                pixel_values=inputs['pixel_values'],
-                attention_mask=inputs['attention_mask'],
-                vision_start=prep['vision_start'],
-                vision_end=prep['vision_end'],
-                question_starts=prep['question_starts'],
-                question_ends=prep['question_ends'],
-                answer_starts=prep['answer_starts'],
-                answer_ends=prep['answer_ends'],
-                return_pruning_info=True,
-                apply_repair=True,
-                capture_layers=repair_layers,
-            )
+            # 1. h_real: teacher（不剪枝）
+            output_real = model(**common_kwargs, pruning_mode="keep_all", apply_repair=False)
 
-            # 2. 跑一次不做剪枝的 forward，获取 h_real
-            # 临时禁用剪枝：设置一个极高的阈值使所有 token 都保留
-            # 从第一个 pruner 获取当前阈值
-            first_pruner = list(model.pruner_manager.pruners.values())[0]
-            old_threshold = first_pruner.pruning_threshold
-            model.pruner_manager.set_pruning_threshold(-1e9)  # 所有 token 都保留
+            # 2. h_fake: 剪枝后、repair 前
+            output_fake = model(**common_kwargs, pruning_mode="normal", apply_repair=False)
 
-            output_full = model(
-                input_ids=inputs['input_ids'],
-                pixel_values=inputs['pixel_values'],
-                attention_mask=inputs['attention_mask'],
-                vision_start=prep['vision_start'],
-                vision_end=prep['vision_end'],
-                question_starts=prep['question_starts'],
-                question_ends=prep['question_ends'],
-                answer_starts=prep['answer_starts'],
-                answer_ends=prep['answer_ends'],
-                return_pruning_info=False,
-                apply_repair=False,
-                capture_layers=repair_layers,
-            )
+            # 3. h_corrected: 剪枝后、repair 后
+            output_corrected = model(**common_kwargs, pruning_mode="normal", apply_repair=True)
 
-            # 恢复阈值
-            model.pruner_manager.set_pruning_threshold(old_threshold)
-
-        # 从 captured 和 captured_for_repair 提取表征
-        captured = getattr(output_pruned, 'captured', None) or {}
-        captured_for_repair = getattr(output_pruned, 'captured_for_repair', None) or {}
-        captured_full = getattr(output_full, 'captured', None) or {}
+        # 提取表征
+        captured_real = getattr(output_real, 'captured', None) or {}
+        captured_fake = getattr(output_fake, 'captured', None) or {}
+        captured_corrected = getattr(output_corrected, 'captured', None) or {}
 
         for layer_idx in repair_layers:
-            # h_real: 不做剪枝时的表征
-            if layer_idx in captured_full:
-                h_real = captured_full[layer_idx]  # (batch, n_ans, hidden_size)
-                for b in range(h_real.shape[0]):
-                    h_real_all[layer_idx].append(h_real[b].float().cpu().numpy())
+            ln = layer_norms.get(layer_idx, None)
 
-            # h_fake: 剪枝后、repair 前的表征
-            if layer_idx in captured_for_repair:
-                h_fake = captured_for_repair[layer_idx]
-                for b in range(h_fake.shape[0]):
-                    h_fake_all[layer_idx].append(h_fake[b].float().cpu().numpy())
+            # h_real
+            if layer_idx in captured_real:
+                h = captured_real[layer_idx]['h']
+                if ln is not None:
+                    h = ln(h)
+                mask = captured_real[layer_idx]['mask']
+                for b in range(h.shape[0]):
+                    valid_len = int(mask[b].sum().item())
+                    if valid_len > 0:
+                        h_real_all[layer_idx].append(h[b, :valid_len].float().cpu().numpy())
 
-            # h_corrected: 剪枝后、repair 后的表征
-            if layer_idx in captured:
-                h_corr = captured[layer_idx]
-                for b in range(h_corr.shape[0]):
-                    h_corrected_all[layer_idx].append(h_corr[b].float().cpu().numpy())
+            # h_fake
+            if layer_idx in captured_fake:
+                h = captured_fake[layer_idx]['h']
+                if ln is not None:
+                    h = ln(h)
+                mask = captured_fake[layer_idx]['mask']
+                for b in range(h.shape[0]):
+                    valid_len = int(mask[b].sum().item())
+                    if valid_len > 0:
+                        h_fake_all[layer_idx].append(h[b, :valid_len].float().cpu().numpy())
+
+            # h_corrected
+            if layer_idx in captured_corrected:
+                h = captured_corrected[layer_idx]['h']
+                if ln is not None:
+                    h = ln(h)
+                mask = captured_corrected[layer_idx]['mask']
+                for b in range(h.shape[0]):
+                    valid_len = int(mask[b].sum().item())
+                    if valid_len > 0:
+                        h_corrected_all[layer_idx].append(h[b, :valid_len].float().cpu().numpy())
 
     # 合并所有样本
     result = {}
@@ -451,21 +686,36 @@ def collect_h_vectors(model, processor, samples, device):
     return result
 
 
-def analyze_and_visualize(h_data, layer_idx, output_dir):
+def analyze_and_visualize(
+    h_data,
+    layer_idx,
+    output_dir,
+    *,
+    seed: int = 42,
+    max_vis_tokens: int = 1000,
+    tsne_pca_dim: int = 50,
+    tsne_standardize: bool = True,
+    tsne_metric: str = "euclidean",
+):
     """分析并可视化单层的分布偏移"""
     h_real = h_data['h_real']
     h_fake = h_data['h_fake']
     h_corrected = h_data['h_corrected']
+    rng = np.random.default_rng(seed)
 
     # 检查数据有效性
     if h_fake is None and h_corrected is None:
         print(f"  Layer {layer_idx}: No h_fake or h_corrected data, skipping...")
         return
 
-    n_samples = h_real.shape[0]
-    n_fake = h_fake.shape[0] if h_fake is not None else 0
-    n_corrected = h_corrected.shape[0] if h_corrected is not None else 0
-    print(f"  Layer {layer_idx}: h_real={n_samples}, h_fake={n_fake}, h_corrected={n_corrected}")
+    n_real = int(h_real.shape[0])
+    n_fake = int(h_fake.shape[0]) if h_fake is not None else 0
+    n_corrected = int(h_corrected.shape[0]) if h_corrected is not None else 0
+    print(f"  Layer {layer_idx}: n_tokens real={n_real}, fake={n_fake}, corrected={n_corrected}")
+    print("    Vector sanity stats (t-SNE axis scale is arbitrary):")
+    _describe_vectors("h_real", h_real)
+    _describe_vectors("h_fake", h_fake)
+    _describe_vectors("h_corrected", h_corrected)
 
     # 如果 h_fake 为 None，用 h_corrected 作为 h_fake（只分析 corrected vs real）
     if h_fake is None:
@@ -496,27 +746,51 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     print(f"      Center cosine dist (h_corrected -> h_real): {cos_corrected:.4f}")
     print(f"      Cosine improvement: {cos_improvement:.1f}%")
 
-    # ==================== [2] Per-Sample Distance ====================
-    print(f"\n    [2] Per-Sample Distance (判别器看到的是样本级差异):")
+    # ==================== [2] Token-wise Distance ====================
+    print(f"\n    [2] Token-wise Distance (需要 h_* 数组 token 对齐):")
 
-    per_sample_l2_fake = np.linalg.norm(h_fake - h_real, axis=1)
-    per_sample_l2_corrected = np.linalg.norm(h_corrected - h_real, axis=1) if h_corrected is not None else np.zeros(n_samples)
+    per_sample_l2_fake = None
+    per_sample_l2_corrected = None
+    per_sample_cos_fake = None
+    per_sample_cos_corrected = None
 
-    per_sample_cos_fake = 1 - np.sum(h_fake * h_real, axis=1) / (np.linalg.norm(h_fake, axis=1) * np.linalg.norm(h_real, axis=1) + 1e-8)
-    per_sample_cos_corrected = 1 - np.sum(h_corrected * h_real, axis=1) / (np.linalg.norm(h_corrected, axis=1) * np.linalg.norm(h_real, axis=1) + 1e-8) if h_corrected is not None else np.zeros(n_samples)
+    # Token-wise distances only make sense when arrays are aligned (same tokens, same order).
+    if h_fake.shape == h_real.shape:
+        per_sample_l2_fake = np.linalg.norm(h_fake - h_real, axis=1)
+        per_sample_cos_fake = 1 - np.sum(h_fake * h_real, axis=1) / (
+            np.linalg.norm(h_fake, axis=1) * np.linalg.norm(h_real, axis=1) + 1e-8
+        )
+    else:
+        print(
+            f"      Warning: h_fake shape {h_fake.shape} != h_real shape {h_real.shape}; "
+            f"skip token-wise distance (needs alignment)."
+        )
 
-    l2_imp = (per_sample_l2_fake.mean() - per_sample_l2_corrected.mean()) / (per_sample_l2_fake.mean() + 1e-8) * 100
-    cos_imp = (per_sample_cos_fake.mean() - per_sample_cos_corrected.mean()) / (per_sample_cos_fake.mean() + 1e-8) * 100
+    if (h_corrected is not None) and (h_corrected.shape == h_real.shape):
+        per_sample_l2_corrected = np.linalg.norm(h_corrected - h_real, axis=1)
+        per_sample_cos_corrected = 1 - np.sum(h_corrected * h_real, axis=1) / (
+            np.linalg.norm(h_corrected, axis=1) * np.linalg.norm(h_real, axis=1) + 1e-8
+        )
+    elif h_corrected is not None:
+        print(
+            f"      Warning: h_corrected shape {h_corrected.shape} != h_real shape {h_real.shape}; "
+            f"skip token-wise distance (needs alignment)."
+        )
 
-    print(f"      Per-sample L2 (h_fake -> h_real): mean={per_sample_l2_fake.mean():.4f}, std={per_sample_l2_fake.std():.4f}")
-    print(f"      Per-sample L2 (h_corrected -> h_real): mean={per_sample_l2_corrected.mean():.4f}, std={per_sample_l2_corrected.std():.4f}")
-    print(f"      Per-sample L2 improvement: {l2_imp:.1f}%")
-    print(f"      Per-sample cosine (h_fake -> h_real): mean={per_sample_cos_fake.mean():.4f}, std={per_sample_cos_fake.std():.4f}")
-    print(f"      Per-sample cosine (h_corrected -> h_real): mean={per_sample_cos_corrected.mean():.4f}, std={per_sample_cos_corrected.std():.4f}")
-    print(f"      Per-sample cosine improvement: {cos_imp:.1f}%")
+    if per_sample_l2_fake is not None and per_sample_l2_corrected is not None:
+        l2_imp = (per_sample_l2_fake.mean() - per_sample_l2_corrected.mean()) / (per_sample_l2_fake.mean() + 1e-8) * 100
+        print(f"      Token-wise L2 (h_fake -> h_real): mean={per_sample_l2_fake.mean():.4f}, std={per_sample_l2_fake.std():.4f}")
+        print(f"      Token-wise L2 (h_corrected -> h_real): mean={per_sample_l2_corrected.mean():.4f}, std={per_sample_l2_corrected.std():.4f}")
+        print(f"      Token-wise L2 improvement: {l2_imp:.1f}%")
+
+    if per_sample_cos_fake is not None and per_sample_cos_corrected is not None:
+        cos_imp = (per_sample_cos_fake.mean() - per_sample_cos_corrected.mean()) / (per_sample_cos_fake.mean() + 1e-8) * 100
+        print(f"      Token-wise cosine (h_fake -> h_real): mean={per_sample_cos_fake.mean():.4f}, std={per_sample_cos_fake.std():.4f}")
+        print(f"      Token-wise cosine (h_corrected -> h_real): mean={per_sample_cos_corrected.mean():.4f}, std={per_sample_cos_corrected.std():.4f}")
+        print(f"      Token-wise cosine improvement: {cos_imp:.1f}%")
 
     # ==================== [3] Distribution Shape ====================
-    print(f"\n    [3] Distribution Shape (方差、标准差 - 关键诊断):")
+    print(f"\n    [3] Distribution Shape (方差、标准差 - 关键诊断；这里的“样本”指 token):")
 
     std_real = h_real.std(axis=1).mean()
     std_fake = h_fake.std(axis=1).mean()
@@ -526,24 +800,82 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     var_fake = h_fake.var(axis=0).mean()
     var_corrected = h_corrected.var(axis=0).mean() if h_corrected is not None else 0
 
-    print(f"      Mean std across samples (h_real): {std_real:.4f}")
-    print(f"      Mean std across samples (h_fake): {std_fake:.4f}")
-    print(f"      Mean std across samples (h_corrected): {std_corrected:.4f}")
+    print(f"      Mean std across tokens (h_real): {std_real:.4f}")
+    print(f"      Mean std across tokens (h_fake): {std_fake:.4f}")
+    print(f"      Mean std across tokens (h_corrected): {std_corrected:.4f}")
     print(f"      Std ratio (fake/real): {std_fake / (std_real + 1e-8):.4f}")
     print(f"      Std ratio (corrected/real): {std_corrected / (std_real + 1e-8):.4f}")
     print(f"      Mean var across dimensions (h_real): {var_real:.4f}")
     print(f"      Mean var across dimensions (h_fake): {var_fake:.4f}")
     print(f"      Mean var across dimensions (h_corrected): {var_corrected:.4f}")
 
+    # ==================== [3.5] Correction Diagnostics ====================
+    # This directly answers: "does the adapter output different magnitude/direction residuals per token?"
+    # It decomposes correction into components parallel/orthogonal to the ideal gap (real - fake).
+    if (h_corrected is not None) and (h_real.shape == h_fake.shape == h_corrected.shape):
+        print(f"\n    [3.5] Correction Diagnostics (delta = corrected - fake, gap = real - fake):")
+        delta = h_corrected - h_fake
+        gap = h_real - h_fake
+
+        delta_norm = np.linalg.norm(delta, axis=1)
+        gap_norm = np.linalg.norm(gap, axis=1)
+        dot = np.sum(delta * gap, axis=1)
+        cos = dot / (delta_norm * gap_norm + 1e-8)
+        # scalar amount along gap direction: how much of the gap is closed (can be >1 overshoot)
+        frac = dot / (gap_norm * gap_norm + 1e-8)
+
+        # orthogonal component magnitude relative to gap
+        # delta_parallel = frac[:,None] * gap
+        # delta_orth = delta - delta_parallel
+        # We compute its norm efficiently.
+        delta_orth_sq = np.clip((delta_norm ** 2) - (frac ** 2) * (gap_norm ** 2), 0.0, None)
+        delta_orth_norm = np.sqrt(delta_orth_sq)
+        rel_orth = delta_orth_norm / (gap_norm + 1e-8)
+
+        moved_toward = float((frac > 0).mean()) * 100.0
+        overshoot = float((frac > 1).mean()) * 100.0
+
+        def _pct(x, p):
+            return float(np.percentile(x, p))
+
+        print(
+            f"      ||gap||: mean={gap_norm.mean():.4f} std={gap_norm.std():.4f} "
+            f"(p50={_pct(gap_norm,50):.4f}, p90={_pct(gap_norm,90):.4f})"
+        )
+        print(
+            f"      ||delta||: mean={delta_norm.mean():.4f} std={delta_norm.std():.4f} "
+            f"(p50={_pct(delta_norm,50):.4f}, p90={_pct(delta_norm,90):.4f})"
+        )
+        print(
+            f"      cos(delta, gap): mean={cos.mean():.4f} std={cos.std():.4f} "
+            f"(p10={_pct(cos,10):.4f}, p50={_pct(cos,50):.4f}, p90={_pct(cos,90):.4f})"
+        )
+        print(
+            f"      frac_along_gap: mean={frac.mean():.4f} std={frac.std():.4f} "
+            f"(p10={_pct(frac,10):.4f}, p50={_pct(frac,50):.4f}, p90={_pct(frac,90):.4f})"
+        )
+        print(f"      Toward real (frac>0): {moved_toward:.1f}%  |  Overshoot (frac>1): {overshoot:.1f}%")
+        print(
+            f"      rel_orth = ||delta_orth||/||gap||: mean={rel_orth.mean():.4f} std={rel_orth.std():.4f} "
+            f"(p50={_pct(rel_orth,50):.4f}, p90={_pct(rel_orth,90):.4f})"
+        )
+
     # ==================== [4] MMD ====================
     print(f"\n    [4] MMD (Maximum Mean Discrepancy - 更敏感的分布距离):")
 
     # 使用子采样计算 MMD（避免内存问题）
-    max_mmd_samples = min(500, n_samples)
-    idx = np.random.choice(n_samples, max_mmd_samples, replace=False)
+    max_mmd_samples = int(min(500, len(h_real), len(h_fake)))
+    idx_real = rng.choice(len(h_real), max_mmd_samples, replace=False)
+    idx_fake = rng.choice(len(h_fake), max_mmd_samples, replace=False)
+    mmd_fake = compute_mmd(h_fake[idx_fake], h_real[idx_real])
 
-    mmd_fake = compute_mmd(h_fake[idx], h_real[idx])
-    mmd_corrected = compute_mmd(h_corrected[idx], h_real[idx]) if h_corrected is not None else 0
+    if h_corrected is not None:
+        max_mmd_samples_c = int(min(500, len(h_real), len(h_corrected)))
+        idx_real_c = rng.choice(len(h_real), max_mmd_samples_c, replace=False)
+        idx_corr = rng.choice(len(h_corrected), max_mmd_samples_c, replace=False)
+        mmd_corrected = compute_mmd(h_corrected[idx_corr], h_real[idx_real_c])
+    else:
+        mmd_corrected = 0
 
     mmd_improvement = (mmd_fake - mmd_corrected) / (mmd_fake + 1e-8) * 100
 
@@ -588,8 +920,12 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     # 子采样用于可视化
-    max_vis_samples = min(1000, n_samples)
-    vis_idx = np.random.choice(n_samples, max_vis_samples, replace=False)
+    n_common = min(len(h_real), len(h_fake), len(h_corrected) if h_corrected is not None else len(h_real))
+    max_vis_samples = int(min(max_vis_tokens, n_common))
+    if max_vis_samples <= 0:
+        print("    Warning: No tokens available for visualization, skipping plots.")
+        return
+    vis_idx = rng.choice(n_common, max_vis_samples, replace=False)
 
     h_real_vis = h_real[vis_idx]
     h_fake_vis = h_fake[vis_idx]
@@ -620,24 +956,32 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     print(f"    Saved to {output_dir}/distribution_shift_layer{layer_idx}_pca.png")
 
     # ----- Per-sample distance plot -----
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    if (
+        per_sample_l2_fake is not None
+        and per_sample_l2_corrected is not None
+        and per_sample_cos_fake is not None
+        and per_sample_cos_corrected is not None
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    axes[0].hist(per_sample_l2_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
-    axes[0].hist(per_sample_l2_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
-    axes[0].legend()
-    axes[0].set_title(f'Layer {layer_idx} - Per-sample L2 Distance')
-    axes[0].set_xlabel('L2 Distance')
+        axes[0].hist(per_sample_l2_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
+        axes[0].hist(per_sample_l2_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
+        axes[0].legend()
+        axes[0].set_title(f'Layer {layer_idx} - Token-wise L2 Distance')
+        axes[0].set_xlabel('L2 Distance')
 
-    axes[1].hist(per_sample_cos_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
-    axes[1].hist(per_sample_cos_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
-    axes[1].legend()
-    axes[1].set_title(f'Layer {layer_idx} - Per-sample Cosine Distance')
-    axes[1].set_xlabel('Cosine Distance')
+        axes[1].hist(per_sample_cos_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
+        axes[1].hist(per_sample_cos_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
+        axes[1].legend()
+        axes[1].set_title(f'Layer {layer_idx} - Token-wise Cosine Distance')
+        axes[1].set_xlabel('Cosine Distance')
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'per_sample_distances_layer{layer_idx}.png'), dpi=150)
-    plt.close()
-    print(f"    Saved per-sample distance plot to {output_dir}/per_sample_distances_layer{layer_idx}.png")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'per_sample_distances_layer{layer_idx}.png'), dpi=150)
+        plt.close()
+        print(f"    Saved token-wise distance plot to {output_dir}/per_sample_distances_layer{layer_idx}.png")
+    else:
+        print("    Skipping token-wise distance plot (requires aligned arrays).")
 
     # ----- 1D Projection (LDA) -----
     # 用 LDA 找到最能区分 h_real 和 h_fake 的方向
@@ -708,21 +1052,26 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
 
     # 左图：分布直方图
     ax = axes[0]
-    ax.hist(proj_real, bins=50, alpha=0.5, label=r'$h_{real}$ (Full Model)', density=True, color='gray')
-    ax.hist(proj_fake, bins=50, alpha=0.5, label=r'$h_{fake}$ (Pruned w/o Adapter)', density=True, color='orange')
+    series = [
+        (r"$h_{real}$ (Full Model)", proj_real, "gray"),
+        (r"$h_{fake}$ (Pruned w/o Adapter)", proj_fake, "orange"),
+    ]
     if proj_corrected is not None:
-        ax.hist(proj_corrected, bins=50, alpha=0.5, label=r'$h_{corrected}$ (ACP Final)', density=True, color='green')
+        series.append((r"$h_{corrected}$ (ACP Final)", proj_corrected, "green"))
 
-    # 添加中心线
-    ax.axvline(proj_real.mean(), color='gray', linestyle='--', linewidth=2, alpha=0.8)
-    ax.axvline(proj_fake.mean(), color='orange', linestyle='--', linewidth=2, alpha=0.8)
+    _plot_1d_density(
+        ax,
+        series,
+        bins=60,
+        title=f"Layer {layer_idx}: 1D Projection (LDA dir) Density",
+        xlabel="Projection value",
+    )
+
+    # 添加中心线（均值）
+    ax.axvline(float(np.mean(proj_real)), color="gray", linestyle="--", linewidth=2, alpha=0.8)
+    ax.axvline(float(np.mean(proj_fake)), color="orange", linestyle="--", linewidth=2, alpha=0.8)
     if proj_corrected is not None:
-        ax.axvline(proj_corrected.mean(), color='green', linestyle='--', linewidth=2, alpha=0.8)
-
-    ax.legend(fontsize=10)
-    ax.set_title(f'Layer {layer_idx}: 1D Projection (Real vs Fake)', fontsize=14)
-    ax.set_xlabel('1D Projection', fontsize=12)
-    ax.set_ylabel('Density', fontsize=12)
+        ax.axvline(float(np.mean(proj_corrected)), color="green", linestyle="--", linewidth=2, alpha=0.8)
 
     # 右图：修正方向分析
     ax2 = axes[1]
@@ -753,10 +1102,34 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     print(f"    Saved to {output_dir}/distribution_shift_layer{layer_idx}_proj1d.png")
 
     # ----- t-SNE -----
-    print("    Running t-SNE...")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    print("    Running t-SNE (note: axis scale has no physical meaning)...")
     all_vis = np.vstack([h_real_vis, h_fake_vis] + ([h_corrected_vis] if h_corrected_vis is not None else []))
-    all_tsne = tsne.fit_transform(all_vis)
+    tsne_data = all_vis
+
+    # Preprocess for stability: standardize then PCA-reduce.
+    # This avoids t-SNE being dominated by raw feature scale and makes runs more comparable.
+    if tsne_standardize:
+        scaler = StandardScaler()
+        tsne_data = scaler.fit_transform(tsne_data)
+
+    if tsne_pca_dim and tsne_pca_dim > 0 and tsne_data.shape[1] > tsne_pca_dim:
+        pca_tsne = PCA(n_components=min(tsne_pca_dim, tsne_data.shape[1]), random_state=seed)
+        tsne_data = pca_tsne.fit_transform(tsne_data)
+
+    # For non-euclidean metrics, sklearn requires method='exact'.
+    tsne_method = "barnes_hut" if tsne_metric == "euclidean" else "exact"
+    perplexity = min(30.0, max(5.0, (len(tsne_data) - 1) / 3.0))
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        max_iter=1000,
+        random_state=seed,
+        metric=tsne_metric,
+        method=tsne_method,
+    )
+    all_tsne = tsne.fit_transform(tsne_data)
 
     n_real = len(h_real_vis)
     n_fake = len(h_fake_vis)
@@ -804,10 +1177,14 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     axes[1, 0].set_title(f'1D LDA Projection (d_fake={d_fake:.2f}, d_corr={d_corrected:.2f})')
 
     # Per-sample L2 distance
-    axes[1, 1].hist(per_sample_l2_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
-    axes[1, 1].hist(per_sample_l2_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
-    axes[1, 1].legend()
-    axes[1, 1].set_title('Per-sample L2 Distance')
+    if per_sample_l2_fake is not None and per_sample_l2_corrected is not None:
+        axes[1, 1].hist(per_sample_l2_fake, bins=50, alpha=0.5, label='h_fake -> h_real', density=True)
+        axes[1, 1].hist(per_sample_l2_corrected, bins=50, alpha=0.5, label='h_corrected -> h_real', density=True)
+        axes[1, 1].legend()
+        axes[1, 1].set_title('Token-wise L2 Distance')
+    else:
+        axes[1, 1].axis("off")
+        axes[1, 1].set_title('Token-wise L2 Distance (skipped)')
 
     plt.suptitle(f'Layer {layer_idx} - Distribution Analysis', fontsize=14)
     plt.tight_layout()
@@ -821,6 +1198,13 @@ def main():
     device = torch.device(args.device)
     print(f"Using device: {device}")
     print(f"Using config: {args.config}")
+    print(f"Using seed: {args.seed}")
+
+    # Avoid overwriting outputs between no_layernorm/layernorm runs.
+    default_tag = "raw" if args.no_layernorm else "ln"
+    run_tag = args.tag.strip() or default_tag
+    out_dir = args.output_dir if args.flat_output else os.path.join(args.output_dir, run_tag)
+    print(f"Output dir: {out_dir} (tag={run_tag}, flat={args.flat_output})")
 
     # 加载模型
     model, processor = load_model_and_processor(args.checkpoint, args.config, device)
@@ -831,14 +1215,47 @@ def main():
     print(f"Loaded {len(samples)} samples")
 
     # 收集 h 向量
-    h_data = collect_h_vectors(model, processor, samples, device)
+    apply_ln = not args.no_layernorm
+    h_data = collect_h_vectors(model, processor, samples, device, apply_next_layernorm=apply_ln)
+
+    # === Training-aligned summary (mean/var/cos/var_ratio) ===
+    # This matches the training log's repair stats more directly than t-SNE.
+    report_rows = []
+    for layer_idx in sorted(h_data.keys()):
+        h_real = h_data[layer_idx].get("h_real")
+        h_fake = h_data[layer_idx].get("h_fake")
+        h_corr = h_data[layer_idx].get("h_corrected")
+
+        if h_fake is not None:
+            s = _mean_var_alignment_stats(h_fake, h_real)
+            if s:
+                report_rows.append({"layer": int(layer_idx), "mode": "fake_vs_real", **s})
+        if h_corr is not None:
+            s = _mean_var_alignment_stats(h_corr, h_real)
+            if s:
+                report_rows.append({"layer": int(layer_idx), "mode": "corrected_vs_real", **s})
+
+    csv_path = _save_layerwise_alignment_report(report_rows, out_dir)
+    _plot_layerwise_alignment_report(report_rows, out_dir)
+    if report_rows:
+        print(f"\nSaved training-aligned layerwise report to {csv_path}")
+        print(f"Saved plot to {out_dir}/layerwise_repair_alignment.png")
 
     # 分析和可视化
     print("\nGenerating visualizations...")
     for layer_idx in sorted(h_data.keys()):
-        analyze_and_visualize(h_data[layer_idx], layer_idx, args.output_dir)
+        analyze_and_visualize(
+            h_data[layer_idx],
+            layer_idx,
+            out_dir,
+            seed=args.seed,
+            max_vis_tokens=args.max_vis_tokens,
+            tsne_pca_dim=args.tsne_pca_dim,
+            tsne_standardize=(not args.no_tsne_standardize),
+            tsne_metric=args.tsne_metric,
+        )
 
-    print(f"\nDone! Visualizations saved to {args.output_dir}")
+    print(f"\nDone! Visualizations saved to {out_dir}")
 
 
 if __name__ == "__main__":

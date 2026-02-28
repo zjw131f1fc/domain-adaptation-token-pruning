@@ -87,6 +87,8 @@ class PrunableLlavaOutput:
     captured: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     # 仅用于 repair loss 的捕获（可选：对 base hidden_states 做 stop-grad，避免 repair loss 回流到 pruner）
     captured_for_repair: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    # repair 前的表征（用于计算 adapter 修复效果指标）
+    captured_before_repair: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
 
 
 class PrunableLlavaForConditionalGeneration(nn.Module):
@@ -476,6 +478,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         capture_layers_set = set(capture_layers or [])
         captured = {}
         captured_for_repair = {}
+        captured_before_repair = {}  # repair 前的表征（用于计算 adapter 效果指标）
 
         # 运行时决定是否应用 repair（默认：仅当启用 repair_adapter 时才应用）
         if apply_repair is None:
@@ -595,6 +598,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 and (gen_mask_full is not None)
                 and (layer_idx in self.repair_layers)
             ):
+                # 保存 repair 前的表征（用于计算 adapter 效果指标）
+                # 注意：只捕获 gen_answer 区间，避免 clone 整个 (b,seq,hidden) 带来的巨大显存/计算开销。
+                if layer_idx in capture_layers_set:
+                    captured_before_repair[layer_idx] = _capture_gen_answer(hidden_states.detach())
+
                 # 选择 repair context 来源：显式指定 or 最近的 pruning layer
                 source_layer = self._repair_source_by_layer.get(layer_idx, None)
                 if source_layer is None:
@@ -657,6 +665,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             adjusted_answer_ends=answer_ends,
             captured=captured if capture_layers_set else None,
             captured_for_repair=captured_for_repair if capture_layers_set else None,
+            captured_before_repair=captured_before_repair if capture_layers_set else None,
         )
 
     def set_temperature(self, temperature: float):

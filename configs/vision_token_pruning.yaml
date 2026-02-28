@@ -55,7 +55,7 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 150000
+    train: 30000
     test: 5000
   fast_load_no_random: false
   category_priority:
@@ -193,15 +193,43 @@ method_settings:
   teacher_pruning_mode: keep_all
 
   # repair loss（分布级对齐，而非点到点对齐）
-  repair_loss_weight: 0.1
-  repair_loss_type: mean_var   # mean_var | mse
-  repair_var_weight: 1.0
+  # NOTE: 之前 repair_loss_weight=0.1 时，adapter 基本只学到“别动”（mag_ratio 很小），
+  # 且容易出现 delta 与 target(teacher-before) 近似正交；这里把 repair 监督显著拉高。
+  repair_loss_weight: 30.0
+  # 为了拟合“小偏差”，优先用更强的点到点监督（teacher-forcing 下 token 对齐成立）。
+  repair_loss_type: mse   # mean_var | mse
+  repair_var_weight: 10.0
+  # 可选：在计算 repair loss 前，先对 student/teacher 的 captured h 应用“下一层的 input_layernorm”
+  # 这会把对齐口径改成“下一层实际看到的分布”，更贴近 visualize_distribution_shift.py 的默认口径。
+  repair_loss_apply_next_layernorm: true
+  # 可选：约束 repair adapter 的 delta，避免“往错误方向修 / 引入大量正交噪声”。
+  # 这些项会基于 (h_before, h_after, h_teacher) 分解 delta，并加到总 loss 里（只影响 adapter）。
+  # 经验上：L13 出现 fake≈real 但 corrected 偏离时，先从增大 orth 开始。
+  # 先保持关闭；如果仍出现“修复后分布更可分 / 引入正交噪声”，再打开 orth 约束。
+  repair_delta_l2_weight: 0.0     # 惩罚 ||delta||^2（防止无谓的大修正）
+  repair_delta_orth_weight: 0.0   # 惩罚 delta 在 target 正交方向的能量（推荐先调这个）
+  repair_delta_frac_weight: 0.0   # 惩罚沿 target 方向的缩放偏差（让 frac≈1）
+
+  # ==================== Two-Stage Training（推荐用于“让 pruner 不依赖 adapter”）====================
+  # Stage 1：只训练 pruner（不启用 repair / teacher forward），让 pruner “真切感知 pruning gap”
+  # Stage 2：冻结 pruner 行为（deterministic, no-noise），只训练 repair adapter 去拟合残余偏差
+  two_stage_enable: true
+  # 默认建议：和 hybrid_phase2_end 对齐（进入 phase3/noise-off 后开始训练 adapter）
+  two_stage_stage1_ratio: 0.8
+  # Stage2：固定 pruner 行为（no gumbel noise + fixed temperature）
+  two_stage_stage2_gumbel_mode: never
+  two_stage_stage2_temperature_min: 0.5
+  # Stage2：只训练 adapter（避免 task/sparsity 继续改 pruner）
+  two_stage_stage2_task_loss_weight: 0.0
+  two_stage_stage2_sparsity_weight: 0.0
+  # Stage2：即便 task_loss_weight>0，也 detach mask，防止 pruner 被 task 牵着走
+  two_stage_stage2_detach_pruner_from_task: true
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 192  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火

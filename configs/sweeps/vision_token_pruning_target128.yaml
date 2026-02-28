@@ -18,6 +18,10 @@ global_settings:
   # 加载 checkpoint 时是否重置 step 计数（用于在新数据集上微调时重新开始退火）
   reset_step_on_load: true
 
+config_settings:
+  # 每次启动都把整份配置打印到 log 里会很长；默认关闭，只保留关键日志。
+  log_config_on_load: false
+
 # 观察到总batch增加后，准确率大幅上升
 trainer_settings:
   dl_settings:

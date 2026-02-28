@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
 
@@ -23,13 +23,83 @@ def _flatten_masked(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return h2[m2]
 
 
+def _apply_two_stage_training_overrides(
+    method_cfg: Dict[str, Any],
+    current_step: int,
+    total_steps: int,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Optionally override method_cfg for two-stage training.
+
+    Stage 1 (pruner): disable repair + teacher forward, train pruner with task+sparsity.
+    Stage 2 (adapter): enable repair + teacher forward, freeze pruner behavior (e.g. no gumbel noise),
+    and (optionally) turn off task/sparsity weights so only adapter is updated.
+
+    Returns:
+        effective_method_cfg, stage_info
+    """
+    enable = bool(method_cfg.get("two_stage_enable", False))
+    if not enable:
+        return method_cfg, {"enabled": False}
+
+    # Stage boundary: by default, start stage2 at "hybrid_phase2_end" (noise-off) if present.
+    default_stage1_ratio = float(method_cfg.get("hybrid_phase2_end", 0.8)) if method_cfg.get("gumbel_mode", "never") == "hybrid" else 0.7
+    stage1_ratio = float(method_cfg.get("two_stage_stage1_ratio", default_stage1_ratio))
+    stage1_ratio = max(0.0, min(1.0, stage1_ratio))
+
+    progress = current_step / total_steps if total_steps > 0 else 0.0
+    in_stage1 = progress < stage1_ratio
+
+    eff = dict(method_cfg)
+    stage = 1 if in_stage1 else 2
+
+    # Common: expose a knob to explicitly override whether to apply repair during forward.
+    # (PrunableLlava forward takes apply_repair and defaults to model setting.)
+    if in_stage1:
+        # Stage 1: pruner should "feel" the pruning-induced gap -> no adapter / no teacher supervision.
+        eff["teacher_forward_enable"] = False
+        eff["repair_loss_weight"] = 0.0
+        eff["apply_repair"] = False
+    else:
+        # Stage 2: train adapter on fixed pruning behavior, and (optionally) stop training pruner entirely.
+        eff["teacher_forward_enable"] = True
+        eff["apply_repair"] = True
+
+        # Freeze pruner behavior (deterministic STE, no noise).
+        eff["gumbel_mode"] = eff.get("two_stage_stage2_gumbel_mode", "never")
+        # For gumbel_mode == "never", temperature = temperature_min.
+        if "two_stage_stage2_temperature_min" in eff:
+            eff["temperature_min"] = float(eff["two_stage_stage2_temperature_min"])
+        else:
+            # Reasonable default: align with the low-temp used at the end of hybrid schedule.
+            if "hybrid_phase1_temp_end" in eff:
+                eff["temperature_min"] = float(eff["hybrid_phase1_temp_end"])
+            elif "eval_temperature" in eff:
+                eff["temperature_min"] = float(eff["eval_temperature"])
+
+        # Stop task/sparsity gradients from touching pruner (and reduce compute in backward).
+        if "two_stage_stage2_task_loss_weight" in eff:
+            eff["task_loss_weight"] = float(eff["two_stage_stage2_task_loss_weight"])
+        if "two_stage_stage2_sparsity_weight" in eff:
+            eff["sparsity_weight"] = float(eff["two_stage_stage2_sparsity_weight"])
+        # Detach mask from attention so even if task_loss_weight>0 it won't update pruner.
+        eff["detach_adv_from_pruner"] = bool(eff.get("two_stage_stage2_detach_pruner_from_task", True))
+
+    return eff, {
+        "enabled": True,
+        "stage": stage,
+        "stage1_ratio": stage1_ratio,
+        "progress": progress,
+    }
+
+
 def compute_distribution_alignment_loss(
     student_h: torch.Tensor,
     teacher_h: torch.Tensor,
     mask: torch.Tensor,
     loss_type: str = "mean_var",
     var_weight: float = 1.0,
-) -> torch.Tensor:
+    return_stats: bool = False,
+):
     """分布级对齐损失（仅用于 gen_answer tokens）。
 
     目标不是逐 token 点到点对齐，而是让 student/teacher 在该区域的表示分布接近。
@@ -39,7 +109,12 @@ def compute_distribution_alignment_loss(
         mask: (batch, Lmax) 0/1，有效位置
         loss_type:
             - "mse": 点到点 MSE（作为对照）
-            - "mean_var": 对齐均值 + 方差（更像“分布接近”）
+            - "mean_var": 对齐均值 + 方差（更像"分布接近"）
+        return_stats: 是否返回详细统计信息
+
+    Returns:
+        loss: 损失值
+        stats (optional): 详细统计信息字典
     """
     Xs = _flatten_masked(student_h, mask).float()
     Xt = _flatten_masked(teacher_h, mask).float()
@@ -47,7 +122,10 @@ def compute_distribution_alignment_loss(
     if loss_type == "mse":
         # 点到点：要求 token 顺序一致（这里 pad 后是对齐的）
         n = min(Xs.shape[0], Xt.shape[0])
-        return F.mse_loss(Xs[:n], Xt[:n])
+        loss = F.mse_loss(Xs[:n], Xt[:n])
+        if return_stats:
+            return loss, {'mse': float(loss.detach().item())}
+        return loss
 
     # mean + diag(var) 对齐
     ms = Xs.mean(dim=0)
@@ -57,7 +135,128 @@ def compute_distribution_alignment_loss(
 
     mean_loss = F.mse_loss(ms, mt)
     var_loss = F.mse_loss(vs, vt)
-    return mean_loss + var_weight * var_loss
+    loss = mean_loss + var_weight * var_loss
+
+    if return_stats:
+        # 计算更多诊断指标
+        stats = {
+            'mean_loss': float(mean_loss.detach().item()),
+            'var_loss': float(var_loss.detach().item()),
+            'student_var_mean': float(vs.mean().detach().item()),  # student 平均方差
+            'teacher_var_mean': float(vt.mean().detach().item()),  # teacher 平均方差
+            'var_ratio': float((vs.mean() / (vt.mean() + 1e-8)).detach().item()),  # 方差比
+            'cosine_sim': float(F.cosine_similarity(ms.unsqueeze(0), mt.unsqueeze(0)).detach().item()),  # 均值余弦相似度
+        }
+        return loss, stats
+
+    return loss
+
+
+def _get_next_input_layernorm(model, layer_idx: int):
+    """Get the LayerNorm/RMSNorm that the next decoder layer applies to its inputs.
+
+    If layer_idx is the last layer, return the final norm.
+    """
+    base_model = model.module if hasattr(model, "module") else model
+    llm = base_model.base_model.model.language_model
+    next_layer_idx = int(layer_idx) + 1
+    if next_layer_idx < len(llm.layers):
+        next_layer = llm.layers[next_layer_idx]
+        # PrunableLlamaDecoderLayer wraps the original layer under .original_layer
+        if hasattr(next_layer, "original_layer"):
+            return next_layer.original_layer.input_layernorm
+        return next_layer.input_layernorm
+    return llm.norm
+
+
+def _compute_adapter_repair_stats(
+    h_before: torch.Tensor,
+    h_after: torch.Tensor,
+    h_teacher: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict:
+    """计算 adapter 修复效果指标
+
+    Args:
+        h_before: (batch, Lmax, hidden) - repair 前的表征
+        h_after: (batch, Lmax, hidden) - repair 后的表征
+        h_teacher: (batch, Lmax, hidden) - teacher 的表征
+        mask: (batch, Lmax) - 有效位置 mask
+
+    Returns:
+        dict: {
+            'direction_cosine': 方向正确性（越接近 1 越好）
+            'magnitude_ratio': 大小比例（越接近 1 越好）
+        }
+    """
+    # 展平有效位置
+    delta = _flatten_masked(h_after - h_before, mask).float()  # adapter 实际修正
+    target = _flatten_masked(h_teacher - h_before, mask).float()  # 理想修正
+
+    # 1. 方向正确性：cosine similarity
+    delta_flat = delta.reshape(-1)
+    target_flat = target.reshape(-1)
+    delta_norm = delta_flat.norm()
+    target_norm = target_flat.norm()
+
+    if delta_norm > 1e-8 and target_norm > 1e-8:
+        direction_cosine = F.cosine_similarity(
+            delta_flat.unsqueeze(0), target_flat.unsqueeze(0)
+        ).item()
+    else:
+        direction_cosine = 0.0
+
+    # 2. 大小比例：|delta| / |target|
+    if target_norm > 1e-8:
+        magnitude_ratio = (delta_norm / target_norm).item()
+    else:
+        magnitude_ratio = 0.0
+
+    return {
+        'direction_cosine': direction_cosine,
+        'magnitude_ratio': magnitude_ratio,
+    }
+
+
+def _compute_delta_decomposition_losses(
+    h_before: torch.Tensor,
+    h_after: torch.Tensor,
+    h_teacher: torch.Tensor,
+    mask: torch.Tensor,
+):
+    """Decompose adapter delta into components parallel/orthogonal to the ideal correction.
+
+    delta  = h_after - h_before
+    target = h_teacher - h_before
+
+    Returns:
+        losses: dict with keys:
+            - delta_l2: mean(||delta||^2)
+            - orth_mse: mean(||delta_orth||^2)
+            - frac_mse: mean((frac-1)^2), where frac is the amount along target direction
+        stats: lightweight diagnostics (means only)
+    """
+    delta = _flatten_masked(h_after - h_before, mask).float()
+    target = _flatten_masked(h_teacher - h_before, mask).float()
+
+    # Per-token dot products
+    dot = (delta * target).sum(dim=1)
+    tgt_norm_sq = (target * target).sum(dim=1).clamp(min=1e-8)
+    frac = dot / tgt_norm_sq  # how much of the ideal correction is applied along target direction
+
+    delta_parallel = frac.unsqueeze(1) * target
+    delta_orth = delta - delta_parallel
+
+    delta_l2 = (delta * delta).mean()
+    orth_mse = (delta_orth * delta_orth).mean()
+    frac_mse = ((frac - 1.0) ** 2).mean()
+
+    stats = {
+        "frac_mean": float(frac.detach().mean().item()),
+        "orth_mse": float(orth_mse.detach().item()),
+        "delta_l2": float(delta_l2.detach().item()),
+    }
+    return {"delta_l2": delta_l2, "orth_mse": orth_mse, "frac_mse": frac_mse}, stats
 
 
 def compute_task_loss(
@@ -133,7 +332,8 @@ def train_step(
     Returns:
         包含 losses, stats, pruning_infos 的字典
     """
-    method_cfg = config.method_settings
+    method_cfg_raw = config.method_settings
+    method_cfg, two_stage_info = _apply_two_stage_training_overrides(method_cfg_raw, current_step, total_steps)
     adversarial_mode = method_cfg.get('adversarial_mode', 'none')  # 'none' | 'discriminator' | 'mse'（旧逻辑）
 
     # === Gumbel Mode 两阶段调度 ===
@@ -218,6 +418,9 @@ def train_step(
     repair_loss_type = method_cfg.get('repair_loss_type', 'mean_var')
     repair_var_weight = method_cfg.get('repair_var_weight', 1.0)
     teacher_forward_enable = method_cfg.get('teacher_forward_enable', False)
+    repair_delta_l2_weight = method_cfg.get('repair_delta_l2_weight', 0.0)
+    repair_delta_orth_weight = method_cfg.get('repair_delta_orth_weight', 0.0)
+    repair_delta_frac_weight = method_cfg.get('repair_delta_frac_weight', 0.0)
 
     capture_layers = repair_layers if (teacher_forward_enable and repair_loss_weight > 0 and repair_layers) else []
 
@@ -235,7 +438,7 @@ def train_step(
         'return_pruning_info': True,  # student 需要 pruning_infos 来算 sparsity
         'detach_h_fake_for_adv': detach_adv_from_pruner,
         'pruning_mode': 'normal',
-        'apply_repair': True,
+        'apply_repair': bool(method_cfg.get("apply_repair", True)),
         'capture_layers': capture_layers,
     }
 
@@ -261,6 +464,8 @@ def train_step(
         'temperature': current_temp,
         'use_gumbel_noise': use_gumbel_noise,
     }
+    if two_stage_info.get("enabled"):
+        stats["two_stage"] = two_stage_info
     if gumbel_mode == 'hybrid':
         stats['hybrid_phase'] = current_phase
 
@@ -281,19 +486,29 @@ def train_step(
         teacher_caps = teacher_output.captured
         layer_losses = []
         per_layer = {}
+        per_layer_stats = {}
+        apply_next_ln = bool(method_cfg.get("repair_loss_apply_next_layernorm", False))
         for layer_idx in capture_layers:
             if layer_idx not in student_caps or layer_idx not in teacher_caps:
                 continue
             s = student_caps[layer_idx]
             t = teacher_caps[layer_idx]
             m = s["mask"] * t["mask"]
-            layer_loss = compute_distribution_alignment_loss(
-                s["h"], t["h"], m,
+            s_h = s["h"]
+            t_h = t["h"]
+            if apply_next_ln:
+                ln = _get_next_input_layernorm(model, layer_idx)
+                s_h = ln(s_h)
+                t_h = ln(t_h)
+            layer_loss, layer_stats = compute_distribution_alignment_loss(
+                s_h, t_h, m,
                 loss_type=repair_loss_type,
                 var_weight=repair_var_weight,
+                return_stats=True,
             )
             layer_losses.append(layer_loss)
             per_layer[layer_idx] = float(layer_loss.detach().item())
+            per_layer_stats[layer_idx] = layer_stats
 
         if layer_losses:
             repair_loss = torch.stack(layer_losses).mean()
@@ -304,6 +519,57 @@ def train_step(
         stats['raw_repair_loss'] = float(repair_loss.detach().item())
         stats['repair_loss_type'] = repair_loss_type
         stats['repair_per_layer'] = per_layer
+        stats['repair_per_layer_stats'] = per_layer_stats  # 详细统计
+
+        # === Adapter 修复效果指标 ===
+        # 计算 adapter 的 delta 与理想 delta 的对比
+        # delta = h_after_repair - h_before_repair（adapter 实际修正）
+        # target = h_teacher - h_before_repair（理想修正）
+        before_caps = output.captured_before_repair
+        if before_caps:
+            adapter_stats_per_layer = {}
+            delta_loss_per_layer = {}
+            delta_diag_per_layer = {}
+            delta_losses_accum = []
+            for layer_idx in capture_layers:
+                if layer_idx not in before_caps or layer_idx not in student_caps or layer_idx not in teacher_caps:
+                    continue
+                h_before = before_caps[layer_idx]["h"]  # (batch, Lmax, hidden)
+                h_after = student_caps[layer_idx]["h"]   # (batch, Lmax, hidden)
+                h_teacher = teacher_caps[layer_idx]["h"] # (batch, Lmax, hidden)
+                m = before_caps[layer_idx]["mask"] * student_caps[layer_idx]["mask"] * teacher_caps[layer_idx]["mask"]
+
+                # 计算 adapter 修复效果指标
+                layer_adapter_stats = _compute_adapter_repair_stats(h_before, h_after, h_teacher, m)
+                adapter_stats_per_layer[layer_idx] = layer_adapter_stats
+
+                # 可选：对 delta 做更强的约束（鼓励沿 target 方向、抑制正交分量）
+                if (repair_delta_l2_weight > 0) or (repair_delta_orth_weight > 0) or (repair_delta_frac_weight > 0):
+                    dl, diag = _compute_delta_decomposition_losses(h_before, h_after, h_teacher, m)
+                    delta_diag_per_layer[layer_idx] = diag
+                    # Weighted per-layer delta regularizers
+                    layer_delta_loss = torch.tensor(0.0, device=h_after.device)
+                    if repair_delta_l2_weight > 0:
+                        layer_delta_loss = layer_delta_loss + repair_delta_l2_weight * dl["delta_l2"]
+                    if repair_delta_orth_weight > 0:
+                        layer_delta_loss = layer_delta_loss + repair_delta_orth_weight * dl["orth_mse"]
+                    if repair_delta_frac_weight > 0:
+                        layer_delta_loss = layer_delta_loss + repair_delta_frac_weight * dl["frac_mse"]
+                    delta_loss_per_layer[layer_idx] = float(layer_delta_loss.detach().item())
+                    delta_losses_accum.append(layer_delta_loss)
+
+            if adapter_stats_per_layer:
+                stats['adapter_stats_per_layer'] = adapter_stats_per_layer
+                # 计算平均值
+                avg_direction = sum(s['direction_cosine'] for s in adapter_stats_per_layer.values()) / len(adapter_stats_per_layer)
+                avg_magnitude = sum(s['magnitude_ratio'] for s in adapter_stats_per_layer.values()) / len(adapter_stats_per_layer)
+                stats['adapter_avg_direction_cosine'] = avg_direction
+                stats['adapter_avg_magnitude_ratio'] = avg_magnitude
+            if delta_losses_accum:
+                losses["repair_delta_reg_loss"] = torch.stack(delta_losses_accum).mean()
+                stats["raw_repair_delta_reg_loss"] = float(losses["repair_delta_reg_loss"].detach().item())
+                stats["repair_delta_reg_per_layer"] = delta_loss_per_layer
+                stats["repair_delta_diag_per_layer"] = delta_diag_per_layer
     else:
         losses['repair_loss'] = torch.tensor(0.0, device=device)
         stats['raw_repair_loss'] = 0.0
@@ -510,6 +776,8 @@ def train_step(
     }
     if 'repair_loss' in losses:
         weighted_losses['repair_loss'] = losses['repair_loss'] * repair_weight
+    if 'repair_delta_reg_loss' in losses:
+        weighted_losses['repair_delta_reg_loss'] = losses['repair_delta_reg_loss']
     if 'sparsity_loss' in losses:
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
     if 'entropy_loss' in losses:
