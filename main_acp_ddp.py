@@ -33,7 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 from tqdm import tqdm
 
 # 添加项目根目录
@@ -536,6 +536,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         stage2_config.method_settings['temperature_min'] = float(stage2_temp)
 
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
+    log_smooth_window = int(method_cfg.get("log_smooth_window", 20))
+    log_smooth_window = max(0, log_smooth_window)
 
     # 设置随机种子（每个进程使用不同的种子以获得不同的数据顺序）
     seed = config.global_settings.get('seed', 42)
@@ -898,6 +900,21 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
+    # 日志滑动平均（按“打印事件”计数，而不是按每一步）
+    smooth_buf: Dict[str, deque] = defaultdict(lambda: deque(maxlen=log_smooth_window if log_smooth_window > 0 else 1))
+
+    def _smooth_update(key: str, value: float) -> None:
+        if log_smooth_window <= 0:
+            return
+        smooth_buf[key].append(float(value))
+
+    def _smooth_mean(key: str) -> Optional[float]:
+        if log_smooth_window <= 0:
+            return None
+        buf = smooth_buf.get(key, None)
+        if not buf:
+            return None
+        return float(sum(buf) / max(1, len(buf)))
 
     for epoch in range(epochs):
         # 设置 epoch 以确保不同 epoch 的 shuffle 不同
@@ -1276,6 +1293,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 # Direct teacher-closeness: token-wise MSE before vs after repair (per-layer + avg improvement%)
                 if 'repair_mse_improve_per_layer' in stats and stats['repair_mse_improve_per_layer']:
+                    _smooth_update("repair_mse_improve_avg", stats.get("repair_mse_improve_avg", 0.0))
                     per_layer_strs = []
                     for layer_idx in sorted(stats['repair_mse_improve_per_layer'].keys()):
                         imp = stats['repair_mse_improve_per_layer'][layer_idx]
@@ -1285,14 +1303,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             per_layer_strs.append(f"L{layer_idx}(imp={imp:+.1f}%)")
                         else:
                             per_layer_strs.append(f"L{layer_idx}(b={mb:.4f},a={ma:.4f},imp={imp:+.1f}%)")
+                    sm = _smooth_mean("repair_mse_improve_avg")
+                    sm_str = f", ma{log_smooth_window}={sm:+.1f}%" if (sm is not None) else ""
                     logger.info(
                         f"  RepairMSE: avg_imp={stats.get('repair_mse_improve_avg', 0.0):+.1f}% "
-                        f"(avg_b={stats.get('repair_mse_before_avg', 0.0):.4f}, avg_a={stats.get('repair_mse_after_avg', 0.0):.4f}) "
+                        f"(avg_b={stats.get('repair_mse_before_avg', 0.0):.4f}, avg_a={stats.get('repair_mse_after_avg', 0.0):.4f}{sm_str}) "
                         f"[{', '.join(per_layer_strs)}]"
                     )
 
                 # Subspace-only teacher-closeness: MSE in coordinates x@B (when a calibrated basis exists).
                 if 'repair_mse_subspace_improve_per_layer' in stats and stats['repair_mse_subspace_improve_per_layer']:
+                    _smooth_update("repair_mse_subspace_improve_avg", stats.get("repair_mse_subspace_improve_avg", 0.0))
                     per_layer_strs = []
                     for layer_idx in sorted(stats['repair_mse_subspace_improve_per_layer'].keys()):
                         imp = stats['repair_mse_subspace_improve_per_layer'][layer_idx]
@@ -1302,9 +1323,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             per_layer_strs.append(f"L{layer_idx}(imp={imp:+.1f}%)")
                         else:
                             per_layer_strs.append(f"L{layer_idx}(b={mb:.4f},a={ma:.4f},imp={imp:+.1f}%)")
+                    sm = _smooth_mean("repair_mse_subspace_improve_avg")
+                    sm_str = f", ma{log_smooth_window}={sm:+.1f}%" if (sm is not None) else ""
                     logger.info(
                         f"  RepairMSE@Sub: avg_imp={stats.get('repair_mse_subspace_improve_avg', 0.0):+.1f}% "
-                        f"(avg_b={stats.get('repair_mse_subspace_before_avg', 0.0):.4f}, avg_a={stats.get('repair_mse_subspace_after_avg', 0.0):.4f}) "
+                        f"(avg_b={stats.get('repair_mse_subspace_before_avg', 0.0):.4f}, avg_a={stats.get('repair_mse_subspace_after_avg', 0.0):.4f}{sm_str}) "
                         f"[{', '.join(per_layer_strs)}]"
                     )
 
