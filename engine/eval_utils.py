@@ -42,6 +42,11 @@ def _extract_kept_stats_from_pruning_infos(
     stats: Dict[str, float] = {}
     weighted_kept = 0.0
 
+    # 第一个剪枝层之前的层是 100% 保留率
+    if pruning_layers:
+        first_pruning_layer = pruning_layers[0]
+        weighted_kept += float(first_pruning_layer) * 1.0
+
     for i, layer_idx in enumerate(pruning_layers):
         info = pruning_infos.get(layer_idx)
         if not info:

@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null
+  checkpoint: outputs/tasks/20260301-0018_vqa-vqav2_llava157b_3476/checkpoints/checkpoint_stage1_pruner_only.pt
   # 加载 checkpoint 时是否重置 step 计数（用于在新数据集上微调时重新开始退火）
   reset_step_on_load: true
 
@@ -215,8 +215,12 @@ method_settings:
   # Stage 2：重新构建带 delayed repair adapter 的模型，加载 Stage 1 的 pruner 权重并冻结 pruner，在稳定环境下 finetune adapter
   # 退火/三阶段（hybrid phases / sparsity anneal）会按 Stage 1 的步数重新缩放，Stage 2 不再退火。
   two_step_enable: true
+  # 从哪个阶段开始训练：
+  # - 1：正常两步训练（先 Stage1 pruner-only，再自动切到 Stage2 adapter finetune）
+  # - 2：直接从 Stage2 开始（需要 global_settings.checkpoint 指向 Stage1 的 pruner-only checkpoint）
+  two_step_start_stage: 2
   # Stage 1 占总 optimizer steps 的比例（例如 0.8 表示前 80% 步数只训 pruner）
-  two_step_stage1_ratio: 0.8
+  two_step_stage1_ratio: 0.6
   # Stage 2：固定 pruning 行为（deterministic, no-noise）
   two_step_stage2_gumbel_mode: never
   two_step_stage2_temperature: 0.5
@@ -276,4 +280,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard_forward"]
+  eval_mode: ["hard_forward"]
