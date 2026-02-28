@@ -229,10 +229,11 @@ method_settings:
   # - calib_max_tokens_per_layer: 每层最多用多少 token 向量做 PCA（防止内存爆）
   # 先开强版本：orth_scale=0 完全压制正交分量，验证是否能让 corrected 更“像 teacher”
   repair_subspace_enable: true
-  repair_subspace_rank: 64
-  repair_subspace_orth_scale: 0.0
-  # 校准开销控制：先用较小样本快速跑；如果波动大，再提高到 128/256
-  repair_subspace_calib_samples: 64
+  # 更强表达能力：先把 rank 提到 128，并允许少量正交残差（避免投影过硬导致欠拟合）
+  repair_subspace_rank: 128
+  repair_subspace_orth_scale: 0.1
+  # 校准先做稳一点（不然 basis 抖动会让 RepairMSE@Sub 很难看懂）
+  repair_subspace_calib_samples: 128
   repair_subspace_calib_max_tokens_per_layer: 4096
   # 子空间口径是否在 next-LN 空间估计（默认 false；因为 delta 是在 pre-LN 空间施加的）
   repair_subspace_apply_next_layernorm: false

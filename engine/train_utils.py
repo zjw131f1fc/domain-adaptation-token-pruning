@@ -39,6 +39,22 @@ def _tokenwise_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(a[:n], b[:n])
 
 
+def _project_flat_to_subspace(x_flat: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """Project flattened token matrix (N,D) to subspace coordinates (N,r) via x @ basis.
+
+    Args:
+        x_flat: (N, D)
+        basis: (D, r)
+    Returns:
+        (N, r) float32
+    """
+    if x_flat.dim() != 2 or basis.dim() != 2:
+        raise ValueError(f"_project_flat_to_subspace expects (N,D) and (D,r), got {tuple(x_flat.shape)} / {tuple(basis.shape)}")
+    if int(x_flat.shape[1]) != int(basis.shape[0]):
+        raise ValueError(f"Dim mismatch: x_flat={tuple(x_flat.shape)} basis={tuple(basis.shape)}")
+    return torch.matmul(x_flat.float(), basis.float())
+
+
 def compute_distribution_alignment_loss(
     student_h: torch.Tensor,
     teacher_h: torch.Tensor,
@@ -498,6 +514,13 @@ def train_step(
             mse_improve_per_layer = {}
             mse_before_accum = []
             mse_after_accum = []
+            # Subspace-only teacher-closeness (if a calibrated subspace basis exists):
+            # compare MSE in coordinates x@B instead of full 4096-D space.
+            mse_sub_before_per_layer = {}
+            mse_sub_after_per_layer = {}
+            mse_sub_improve_per_layer = {}
+            mse_sub_before_accum = []
+            mse_sub_after_accum = []
             for layer_idx in capture_layers:
                 if layer_idx not in before_caps or layer_idx not in student_caps or layer_idx not in teacher_caps:
                     continue
@@ -520,9 +543,9 @@ def train_step(
                 adapter_stats_per_layer[layer_idx] = layer_adapter_stats
 
                 # Token-wise MSE vs teacher (before/after).
-                before_flat = _flatten_masked(h_before_s, m).float()
-                after_flat = _flatten_masked(h_after_s, m).float()
-                teacher_flat = _flatten_masked(h_teacher_s, m).float()
+                before_flat = _flatten_masked(h_before_s, m).detach().float()
+                after_flat = _flatten_masked(h_after_s, m).detach().float()
+                teacher_flat = _flatten_masked(h_teacher_s, m).detach().float()
                 mse_before = _tokenwise_mse(before_flat, teacher_flat)
                 mse_after = _tokenwise_mse(after_flat, teacher_flat)
                 mse_before_per_layer[layer_idx] = float(mse_before.detach().item())
@@ -531,6 +554,41 @@ def train_step(
                 mse_improve_per_layer[layer_idx] = float(improve.detach().item())
                 mse_before_accum.append(mse_before.detach())
                 mse_after_accum.append(mse_after.detach())
+
+                # Optional: subspace MSE diagnostics (only meaningful when repair_subspace is enabled and a basis is present)
+                # Use the same space as the basis calibration, controlled by method_cfg.repair_subspace_apply_next_layernorm.
+                base_model = model.module if hasattr(model, "module") else model
+                basis = None
+                if hasattr(base_model, "get_repair_subspace_basis"):
+                    basis = base_model.get_repair_subspace_basis(layer_idx)
+                if basis is not None:
+                    apply_next_ln_sub = bool(method_cfg.get("repair_subspace_apply_next_layernorm", False))
+                    if apply_next_ln_sub:
+                        ln_sub = _get_next_input_layernorm(model, layer_idx)
+                        b_h = ln_sub(h_before)
+                        a_h = ln_sub(h_after)
+                        t_h = ln_sub(h_teacher)
+                        b_flat = _flatten_masked(b_h, m).detach().float()
+                        a_flat = _flatten_masked(a_h, m).detach().float()
+                        t_flat = _flatten_masked(t_h, m).detach().float()
+                    else:
+                        b_flat, a_flat, t_flat = before_flat, after_flat, teacher_flat
+
+                    try:
+                        b_sub = _project_flat_to_subspace(b_flat, basis)
+                        a_sub = _project_flat_to_subspace(a_flat, basis)
+                        t_sub = _project_flat_to_subspace(t_flat, basis)
+                        mse_sub_before = _tokenwise_mse(b_sub, t_sub)
+                        mse_sub_after = _tokenwise_mse(a_sub, t_sub)
+                        mse_sub_before_per_layer[layer_idx] = float(mse_sub_before.detach().item())
+                        mse_sub_after_per_layer[layer_idx] = float(mse_sub_after.detach().item())
+                        sub_improve = (mse_sub_before - mse_sub_after) / (mse_sub_before.abs() + 1e-12) * 100.0
+                        mse_sub_improve_per_layer[layer_idx] = float(sub_improve.detach().item())
+                        mse_sub_before_accum.append(mse_sub_before.detach())
+                        mse_sub_after_accum.append(mse_sub_after.detach())
+                    except Exception:
+                        # Diagnostics should never crash training.
+                        pass
 
                 # 可选：对 delta 做更强的约束（鼓励沿 target 方向、抑制正交分量）
                 if (repair_delta_l2_weight > 0) or (repair_delta_orth_weight > 0) or (repair_delta_frac_weight > 0):
@@ -562,6 +620,16 @@ def train_step(
                 stats["repair_mse_after_avg"] = float(torch.stack(mse_after_accum).mean().item()) if mse_after_accum else 0.0
                 denom = abs(stats["repair_mse_before_avg"]) + 1e-12
                 stats["repair_mse_improve_avg"] = float((stats["repair_mse_before_avg"] - stats["repair_mse_after_avg"]) / denom * 100.0)
+            if mse_sub_before_per_layer and mse_sub_after_per_layer:
+                stats["repair_mse_subspace_before_per_layer"] = mse_sub_before_per_layer
+                stats["repair_mse_subspace_after_per_layer"] = mse_sub_after_per_layer
+                stats["repair_mse_subspace_improve_per_layer"] = mse_sub_improve_per_layer
+                stats["repair_mse_subspace_before_avg"] = float(torch.stack(mse_sub_before_accum).mean().item()) if mse_sub_before_accum else 0.0
+                stats["repair_mse_subspace_after_avg"] = float(torch.stack(mse_sub_after_accum).mean().item()) if mse_sub_after_accum else 0.0
+                denom = abs(stats["repair_mse_subspace_before_avg"]) + 1e-12
+                stats["repair_mse_subspace_improve_avg"] = float(
+                    (stats["repair_mse_subspace_before_avg"] - stats["repair_mse_subspace_after_avg"]) / denom * 100.0
+                )
             if delta_losses_accum:
                 losses["repair_delta_reg_loss"] = torch.stack(delta_losses_accum).mean()
                 stats["raw_repair_delta_reg_loss"] = float(losses["repair_delta_reg_loss"].detach().item())
