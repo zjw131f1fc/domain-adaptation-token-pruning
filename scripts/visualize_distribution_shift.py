@@ -72,6 +72,7 @@ def load_model_and_processor(checkpoint_path, config_path, device):
     processor.tokenizer.padding_side = "right"
 
     # 创建可剪枝模型（从配置读取参数）
+    # 新版架构：pruning_layers 做剪枝，repair_layers 做修复（Delayed Repair）
     model = PrunableLlavaForConditionalGeneration(
         base_model=base_model,
         pruning_layers=method_cfg.get('pruning_layers', [4, 14, 24]),
@@ -79,19 +80,21 @@ def load_model_and_processor(checkpoint_path, config_path, device):
         pruner_n_heads=method_cfg.get('pruner_n_heads', 4),
         pruner_n_queries=method_cfg.get('pruner_n_queries', 32),
         pruner_query_dropout=0.0,  # 分析时关闭 dropout
-        use_adapter=method_cfg.get('use_adapter', True),
-        adapter_bottleneck=method_cfg.get('adapter_bottleneck', 512),
-        adapter_type=method_cfg.get('adapter_type', 'lightweight'),
-        use_separated_adapters=method_cfg.get('use_separated_adapters', False),
-        vision_adapter_bottleneck=method_cfg.get('vision_adapter_bottleneck', 512),
-        text_adapter_bottleneck=method_cfg.get('text_adapter_bottleneck', 512),
-        mask_encoder_type=method_cfg.get('mask_encoder_type', 'attention'),
+        use_adapter=method_cfg.get('use_adapter', False),  # 旧版 adapter 不再使用
         temperature=method_cfg.get('eval_temperature', 0.1),
         dropout=0.0,  # 分析时关闭 dropout
-        adapter_dropout=0.0,  # 分析时关闭 dropout
         use_gumbel_noise=False,  # 分析时关闭 Gumbel noise
         pruning_threshold=method_cfg.get('eval_pruning_threshold', 0.5),
         use_question_condition=method_cfg.get('use_question_condition', False),
+        # Delayed Repair Adapter 参数
+        use_repair_adapter=method_cfg.get('use_repair_adapter', False),
+        repair_layers=method_cfg.get('repair_layers', None),
+        repair_source_layers=method_cfg.get('repair_source_layers', None),
+        repair_bottleneck_dim=method_cfg.get('repair_bottleneck_dim', 512),
+        repair_dropout=0.0,  # 分析时关闭 dropout
+        repair_mask_encoder_type=method_cfg.get('repair_mask_encoder_type', 'attention'),
+        repair_use_pruned_info=method_cfg.get('repair_use_pruned_info', True),
+        repair_alpha_init=method_cfg.get('repair_alpha_init', 0.1),
     )
 
     model.freeze_base_model()
@@ -104,13 +107,13 @@ def load_model_and_processor(checkpoint_path, config_path, device):
         model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
         print("  Loaded pruner_state_dict")
 
-    # 根据 checkpoint 中的 key 判断 adapter 类型
-    if 'separated_adapter_state_dict' in checkpoint and model.use_adapter:
-        model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
-        print("  Loaded separated_adapter_state_dict")
-    elif 'adapter_state_dict' in checkpoint and model.use_adapter:
-        model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
-        print("  Loaded adapter_state_dict")
+    # 新版：加载 repair adapter
+    if 'repair_context_encoder_state_dict' in checkpoint and model.use_repair_adapter:
+        model.repair_context_encoder.load_state_dict(checkpoint['repair_context_encoder_state_dict'])
+        print("  Loaded repair_context_encoder_state_dict")
+    if 'repair_adapter_state_dict' in checkpoint and model.use_repair_adapter:
+        model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
+        print("  Loaded repair_adapter_state_dict")
 
     model.eval()
     print("Model loaded.")
@@ -122,13 +125,15 @@ def load_samples(num_samples, config_path):
     """加载样本"""
     from engine.configs.loader import load_config
     from engine.datas.loader import load_dataset
+    from itertools import islice
 
     config = load_config(override_file=config_path)
 
     data_bundle = load_dataset(config)
     test_dataset = data_bundle['splits']['train']
 
-    return list(test_dataset)[:num_samples]
+    # 使用 islice 避免加载整个数据集
+    return list(islice(test_dataset, num_samples))
 
 
 def preprocess_sample(sample, processor, device):
@@ -332,12 +337,26 @@ def cohens_d(x, y):
 
 
 def collect_h_vectors(model, processor, samples, device):
-    """收集所有样本的 h_real, h_fake, h_corrected"""
+    """收集所有样本的 h_real, h_fake, h_corrected
+
+    新版架构（Delayed Repair）：
+    - h_real: 不做剪枝时的表征（需要单独跑一次 forward）
+    - h_fake: 剪枝后、repair 前的表征（captured_for_repair）
+    - h_corrected: 剪枝后、repair 后的表征（captured）
+
+    在 repair_layers 捕获这些表征。
+    """
+    # 获取 repair_layers
+    repair_layers = getattr(model, 'repair_layers', [])
+    if not repair_layers:
+        print("Warning: No repair_layers configured, using pruning_layers instead")
+        repair_layers = model.pruning_layers
+
     h_real_all = defaultdict(list)
     h_fake_all = defaultdict(list)
     h_corrected_all = defaultdict(list)
 
-    print("Collecting h vectors...")
+    print(f"Collecting h vectors at layers: {repair_layers}")
     for i, sample in enumerate(samples):
         if (i + 1) % 20 == 0:
             print(f"  Processing {i+1}/{len(samples)}...")
@@ -349,7 +368,8 @@ def collect_h_vectors(model, processor, samples, device):
         inputs = prep['inputs']
 
         with torch.no_grad():
-            output = model(
+            # 1. 跑一次带剪枝和 repair 的 forward，获取 h_fake 和 h_corrected
+            output_pruned = model(
                 input_ids=inputs['input_ids'],
                 pixel_values=inputs['pixel_values'],
                 attention_mask=inputs['attention_mask'],
@@ -360,33 +380,73 @@ def collect_h_vectors(model, processor, samples, device):
                 answer_starts=prep['answer_starts'],
                 answer_ends=prep['answer_ends'],
                 return_pruning_info=True,
+                apply_repair=True,
+                capture_layers=repair_layers,
             )
 
-        pruning_infos = getattr(output, 'pruning_infos', None) or getattr(output, 'pruning_info', None)
-        if pruning_infos:
-            for layer_idx, info in pruning_infos.items():
-                if 'h_real' in info and 'h_fake' in info:
-                    for h_real, h_fake in zip(info['h_real'], info['h_fake']):
-                        # h_real, h_fake: (heads, n_ans, head_dim)
-                        # 展平为 (n_ans, heads * head_dim)
-                        h_real_flat = h_real.permute(1, 0, 2).reshape(h_real.shape[1], -1)
-                        h_fake_flat = h_fake.permute(1, 0, 2).reshape(h_fake.shape[1], -1)
-                        h_real_all[layer_idx].append(h_real_flat.float().cpu().numpy())
-                        h_fake_all[layer_idx].append(h_fake_flat.float().cpu().numpy())
+            # 2. 跑一次不做剪枝的 forward，获取 h_real
+            # 临时禁用剪枝：设置一个极高的阈值使所有 token 都保留
+            # 从第一个 pruner 获取当前阈值
+            first_pruner = list(model.pruner_manager.pruners.values())[0]
+            old_threshold = first_pruner.pruning_threshold
+            model.pruner_manager.set_pruning_threshold(-1e9)  # 所有 token 都保留
 
-                if 'h_corrected' in info:
-                    for h_corr in info['h_corrected']:
-                        h_corr_flat = h_corr.permute(1, 0, 2).reshape(h_corr.shape[1], -1)
-                        h_corrected_all[layer_idx].append(h_corr_flat.float().cpu().numpy())
+            output_full = model(
+                input_ids=inputs['input_ids'],
+                pixel_values=inputs['pixel_values'],
+                attention_mask=inputs['attention_mask'],
+                vision_start=prep['vision_start'],
+                vision_end=prep['vision_end'],
+                question_starts=prep['question_starts'],
+                question_ends=prep['question_ends'],
+                answer_starts=prep['answer_starts'],
+                answer_ends=prep['answer_ends'],
+                return_pruning_info=False,
+                apply_repair=False,
+                capture_layers=repair_layers,
+            )
+
+            # 恢复阈值
+            model.pruner_manager.set_pruning_threshold(old_threshold)
+
+        # 从 captured 和 captured_for_repair 提取表征
+        captured = getattr(output_pruned, 'captured', None) or {}
+        captured_for_repair = getattr(output_pruned, 'captured_for_repair', None) or {}
+        captured_full = getattr(output_full, 'captured', None) or {}
+
+        for layer_idx in repair_layers:
+            # h_real: 不做剪枝时的表征
+            if layer_idx in captured_full:
+                h_real = captured_full[layer_idx]  # (batch, n_ans, hidden_size)
+                for b in range(h_real.shape[0]):
+                    h_real_all[layer_idx].append(h_real[b].float().cpu().numpy())
+
+            # h_fake: 剪枝后、repair 前的表征
+            if layer_idx in captured_for_repair:
+                h_fake = captured_for_repair[layer_idx]
+                for b in range(h_fake.shape[0]):
+                    h_fake_all[layer_idx].append(h_fake[b].float().cpu().numpy())
+
+            # h_corrected: 剪枝后、repair 后的表征
+            if layer_idx in captured:
+                h_corr = captured[layer_idx]
+                for b in range(h_corr.shape[0]):
+                    h_corrected_all[layer_idx].append(h_corr[b].float().cpu().numpy())
 
     # 合并所有样本
     result = {}
-    for layer_idx in h_real_all.keys():
+    for layer_idx in repair_layers:
+        if layer_idx not in h_real_all or not h_real_all[layer_idx]:
+            print(f"  Warning: No data collected for layer {layer_idx}")
+            continue
         result[layer_idx] = {
             'h_real': np.concatenate(h_real_all[layer_idx], axis=0),
-            'h_fake': np.concatenate(h_fake_all[layer_idx], axis=0),
+            'h_fake': np.concatenate(h_fake_all[layer_idx], axis=0) if h_fake_all[layer_idx] else None,
             'h_corrected': np.concatenate(h_corrected_all[layer_idx], axis=0) if h_corrected_all[layer_idx] else None,
         }
+        print(f"  Layer {layer_idx}: h_real={result[layer_idx]['h_real'].shape}, "
+              f"h_fake={result[layer_idx]['h_fake'].shape if result[layer_idx]['h_fake'] is not None else None}, "
+              f"h_corrected={result[layer_idx]['h_corrected'].shape if result[layer_idx]['h_corrected'] is not None else None}")
 
     return result
 
@@ -397,8 +457,21 @@ def analyze_and_visualize(h_data, layer_idx, output_dir):
     h_fake = h_data['h_fake']
     h_corrected = h_data['h_corrected']
 
+    # 检查数据有效性
+    if h_fake is None and h_corrected is None:
+        print(f"  Layer {layer_idx}: No h_fake or h_corrected data, skipping...")
+        return
+
     n_samples = h_real.shape[0]
-    print(f"  Layer {layer_idx}: h_real={n_samples}, h_fake={h_fake.shape[0]}, h_corrected={h_corrected.shape[0] if h_corrected is not None else 0}")
+    n_fake = h_fake.shape[0] if h_fake is not None else 0
+    n_corrected = h_corrected.shape[0] if h_corrected is not None else 0
+    print(f"  Layer {layer_idx}: h_real={n_samples}, h_fake={n_fake}, h_corrected={n_corrected}")
+
+    # 如果 h_fake 为 None，用 h_corrected 作为 h_fake（只分析 corrected vs real）
+    if h_fake is None:
+        print(f"    Warning: h_fake is None, using h_corrected as baseline")
+        h_fake = h_corrected
+        h_corrected = None
 
     # ==================== [1] Global Mean Distance ====================
     print(f"    [1] Global Mean Distance (原有度量 - 可能掩盖样本级差异):")

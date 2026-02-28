@@ -248,4 +248,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard_forward"]
+  eval_mode: ["origin", "hard_forward"]
