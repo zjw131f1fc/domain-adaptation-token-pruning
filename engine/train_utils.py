@@ -484,12 +484,21 @@ def train_step(
                 m = before_caps[layer_idx]["mask"] * student_caps[layer_idx]["mask"] * teacher_caps[layer_idx]["mask"]
 
                 # 计算 adapter 修复效果指标
-                layer_adapter_stats = _compute_adapter_repair_stats(h_before, h_after, h_teacher, m)
+                # Keep diagnostic space consistent with the repair loss space when apply_next_ln is enabled.
+                if apply_next_ln:
+                    ln = _get_next_input_layernorm(model, layer_idx)
+                    h_before_s = ln(h_before)
+                    h_after_s = ln(h_after)
+                    h_teacher_s = ln(h_teacher)
+                else:
+                    h_before_s, h_after_s, h_teacher_s = h_before, h_after, h_teacher
+
+                layer_adapter_stats = _compute_adapter_repair_stats(h_before_s, h_after_s, h_teacher_s, m)
                 adapter_stats_per_layer[layer_idx] = layer_adapter_stats
 
                 # 可选：对 delta 做更强的约束（鼓励沿 target 方向、抑制正交分量）
                 if (repair_delta_l2_weight > 0) or (repair_delta_orth_weight > 0) or (repair_delta_frac_weight > 0):
-                    dl, diag = _compute_delta_decomposition_losses(h_before, h_after, h_teacher, m)
+                    dl, diag = _compute_delta_decomposition_losses(h_before_s, h_after_s, h_teacher_s, m)
                     delta_diag_per_layer[layer_idx] = diag
                     # Weighted per-layer delta regularizers
                     layer_delta_loss = torch.tensor(0.0, device=h_after.device)
