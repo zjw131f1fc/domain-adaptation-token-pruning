@@ -105,6 +105,12 @@ def load_model_and_processor(checkpoint_path, config_path, device):
         repair_mask_encoder_type=method_cfg.get('repair_mask_encoder_type', 'attention'),
         repair_use_pruned_info=method_cfg.get('repair_use_pruned_info', True),
         repair_alpha_init=method_cfg.get('repair_alpha_init', 0.1),
+        # Strong delayed-repair options (backward compatible: defaults keep old behavior)
+        repair_adapter_type=method_cfg.get('repair_adapter_type', 'lightweight'),
+        repair_context_num_tokens=int(method_cfg.get('repair_context_num_tokens', 0)),
+        repair_context_dropout=float(method_cfg.get('repair_context_dropout', 0.0)),
+        repair_context_use_q2v_relevance=bool(method_cfg.get('repair_context_use_q2v_relevance', False)),
+        repair_apply_only_gen_tokens=bool(method_cfg.get('repair_apply_only_gen_tokens', True)),
     )
 
     model.freeze_base_model()
@@ -461,11 +467,18 @@ def _mean_var_alignment_stats(Xs: np.ndarray, Xt: np.ndarray) -> dict:
     var_loss = float(((vs - vt) ** 2).mean())
     var_ratio = float(vs.mean() / (vt.mean() + 1e-8))
     cos = float(np.dot(ms, mt) / (np.linalg.norm(ms) * np.linalg.norm(mt) + 1e-8))
+
+    # Token-wise (training-style) MSE: assumes token order is aligned.
+    n = int(min(Xs.shape[0], Xt.shape[0]))
+    token_mse = float(((Xs[:n] - Xt[:n]) ** 2).mean()) if n > 0 else float("nan")
+    token_rmse = float(np.sqrt(max(token_mse, 0.0))) if np.isfinite(token_mse) else float("nan")
     return {
         "mean_loss": mean_loss,
         "var_loss": var_loss,
         "var_ratio": var_ratio,
         "cosine": cos,
+        "token_mse": token_mse,
+        "token_rmse": token_rmse,
         "student_var_mean": float(vs.mean()),
         "teacher_var_mean": float(vt.mean()),
         "n_student": int(Xs.shape[0]),
@@ -489,6 +502,8 @@ def _save_layerwise_alignment_report(report_rows: list[dict], output_dir: str) -
         "var_ratio",
         "mean_loss",
         "var_loss",
+        "token_mse",
+        "token_rmse",
         "student_var_mean",
         "teacher_var_mean",
         "n_student",
