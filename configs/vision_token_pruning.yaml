@@ -212,8 +212,8 @@ method_settings:
   # 这些项会基于 (h_before, h_after, h_teacher) 分解 delta，并加到总 loss 里（只影响 adapter）。
   # 经验上：L13 出现 fake≈real 但 corrected 偏离时，先从增大 orth 开始。
   # 先保持关闭；如果仍出现“修复后分布更可分 / 引入正交噪声”，再打开 orth 约束。
-  repair_delta_l2_weight: 0.0     # 惩罚 ||delta||^2（防止无谓的大修正）
-  repair_delta_orth_weight: 0.0   # 惩罚 delta 在 target 正交方向的能量（推荐先调这个）
+  repair_delta_l2_weight: 0.01     # 惩罚 ||delta||^2（防止无谓的大修正）
+  repair_delta_orth_weight: 10.0   # 强力抑制正交分量（不要求方向完全一致，但避免“越修越远”）
   repair_delta_frac_weight: 0.0   # 惩罚沿 target 方向的缩放偏差（让 frac≈1）
 
   # ==================== Two-Step Training（真正“两步训练”）====================
