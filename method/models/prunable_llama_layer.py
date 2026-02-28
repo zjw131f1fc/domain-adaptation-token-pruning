@@ -480,9 +480,23 @@ class PrunableLlamaDecoderLayer(nn.Module):
 
             # 为 delayed repair 缓存修复上下文（低维向量）
             if self.repair_context_encoder is not None:
-                mask_emb, pruned_emb = self.repair_context_encoder(vision_hidden, new_cumulative_mask)
-                pruning_info['repair_mask_emb'] = mask_emb
-                pruning_info['repair_pruned_emb'] = pruned_emb
+                use_q2v = bool(getattr(self.repair_context_encoder, "use_q2v_relevance", False))
+                ctx_out = self.repair_context_encoder(
+                    vision_hidden,
+                    new_cumulative_mask,
+                    q2v_attn=q2v_attn_avg,
+                    use_q2v_relevance=use_q2v,
+                )
+                # Backward-compatible: encoder may return (mask_emb, pruned_emb) or (mask_emb, pruned_emb, context_tokens)
+                if isinstance(ctx_out, (tuple, list)) and len(ctx_out) == 3:
+                    mask_emb, pruned_emb, context_tokens = ctx_out
+                    pruning_info['repair_mask_emb'] = mask_emb
+                    pruning_info['repair_pruned_emb'] = pruned_emb
+                    pruning_info['repair_context_tokens'] = context_tokens
+                else:
+                    mask_emb, pruned_emb = ctx_out
+                    pruning_info['repair_mask_emb'] = mask_emb
+                    pruning_info['repair_pruned_emb'] = pruned_emb
 
             return hidden_states, pruning_info
 

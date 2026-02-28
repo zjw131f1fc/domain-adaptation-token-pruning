@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 
 class PrunedTokenAggregator(nn.Module):
@@ -54,6 +54,84 @@ class PrunedTokenAggregator(nn.Module):
 
         # 投影到 bottleneck
         return self.proj(pruned_avg)  # (batch, bottleneck)
+
+
+class PrunedTokenMultiQueryPooler(nn.Module):
+    """用多查询注意力池化聚合（通常聚焦于被剪掉的 tokens）。
+
+    输出 K 个上下文向量，提供比单一均值向量更强的表达能力。
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        bottleneck_dim: int,
+        num_context_tokens: int = 8,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bottleneck_dim = bottleneck_dim
+        self.num_context_tokens = int(num_context_tokens)
+
+        self.key_proj = nn.Linear(hidden_size, bottleneck_dim)
+        self.value_proj = nn.Linear(hidden_size, bottleneck_dim)
+        self.queries = nn.Parameter(torch.randn(self.num_context_tokens, bottleneck_dim) * 0.02)
+        self.dropout = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.key_proj.weight, gain=0.1)
+        nn.init.zeros_(self.key_proj.bias)
+        nn.init.xavier_uniform_(self.value_proj.weight, gain=0.1)
+        nn.init.zeros_(self.value_proj.bias)
+
+    def forward(
+        self,
+        vision_hidden: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        relevance: Optional[torch.Tensor] = None,
+        focus_pruned: bool = True,
+    ) -> torch.Tensor:
+        """
+        Args:
+            vision_hidden: (batch, n_vision, hidden)
+            mask: (batch, n_vision), 1=keep, 0=prune
+            relevance: (batch, n_vision), optional; larger means more relevant
+            focus_pruned: if True, pool over pruned tokens only; else pool over all tokens
+
+        Returns:
+            context_tokens: (batch, K, bottleneck_dim)
+        """
+        b, n, _ = vision_hidden.shape
+        dtype = vision_hidden.dtype
+
+        key = self.key_proj(vision_hidden)    # (b, n, d)
+        value = self.value_proj(vision_hidden)  # (b, n, d)
+
+        # (K, d) -> (1, K, d) -> (b, K, d)
+        q = self.queries.unsqueeze(0).expand(b, -1, -1).to(dtype=dtype)
+
+        # scores: (b, K, n)
+        scale = 1.0 / math.sqrt(self.bottleneck_dim)
+        scores = torch.einsum("bkd,bnd->bkn", q, key) * scale
+
+        # Masking: focus on pruned tokens by default
+        if focus_pruned:
+            pruned_mask = (1.0 - mask.to(dtype=dtype)).clamp(min=0.0, max=1.0)  # (b, n)
+            scores = scores.masked_fill(pruned_mask.unsqueeze(1) < 0.5, torch.finfo(scores.dtype).min)
+
+        # Optional relevance bias: add log(relevance) to scores (stable for tiny relevance)
+        if relevance is not None:
+            rel = relevance.to(dtype=scores.dtype).clamp(min=1e-6)
+            scores = scores + rel.log().unsqueeze(1)
+
+        attn = F.softmax(scores, dim=-1)  # (b, K, n)
+        attn = self.dropout(attn)
+        ctx = torch.einsum("bkn,bnd->bkd", attn, value)  # (b, K, d)
+        return ctx
 
 
 class MaskAttentionEncoder(nn.Module):
@@ -132,6 +210,7 @@ class RepairContextEncoder(nn.Module):
     输出：
     - mask_emb: (batch, bottleneck_dim)
     - pruned_emb: (batch, bottleneck_dim) 或 None（取决于 use_pruned_info）
+    - context_tokens: (batch, K, bottleneck_dim) 或 None（取决于 num_context_tokens）
     """
 
     def __init__(
@@ -141,9 +220,14 @@ class RepairContextEncoder(nn.Module):
         n_vision: int = 576,
         mask_encoder_type: str = "attention",
         use_pruned_info: bool = True,
+        num_context_tokens: int = 0,
+        context_dropout: float = 0.0,
+        use_q2v_relevance: bool = False,
     ):
         super().__init__()
         self.use_pruned_info = use_pruned_info
+        self.num_context_tokens = int(num_context_tokens)
+        self.use_q2v_relevance = bool(use_q2v_relevance)
 
         if mask_encoder_type == "attention":
             self.mask_encoder = MaskAttentionEncoder(
@@ -160,14 +244,36 @@ class RepairContextEncoder(nn.Module):
             )
 
         self.pruned_aggregator = PrunedTokenAggregator(hidden_size, bottleneck_dim)
+        self.context_pooler = None
+        if self.num_context_tokens > 0:
+            self.context_pooler = PrunedTokenMultiQueryPooler(
+                hidden_size=hidden_size,
+                bottleneck_dim=bottleneck_dim,
+                num_context_tokens=self.num_context_tokens,
+                dropout=context_dropout,
+            )
 
-    def forward(self, vision_hidden: torch.Tensor, mask: torch.Tensor):
+    def forward(
+        self,
+        vision_hidden: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        q2v_attn: Optional[torch.Tensor] = None,
+        use_q2v_relevance: bool = False,
+    ) -> Union[Tuple[torch.Tensor, Optional[torch.Tensor]], Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
         mask_input = mask.to(dtype=vision_hidden.dtype)
         mask_emb = self.mask_encoder(mask_input)
         pruned_emb = None
         if self.use_pruned_info:
             pruned_emb = self.pruned_aggregator(vision_hidden, mask)
-        return mask_emb, pruned_emb
+        if self.context_pooler is None:
+            return mask_emb, pruned_emb
+
+        relevance = None
+        if use_q2v_relevance and self.use_q2v_relevance and (q2v_attn is not None):
+            relevance = q2v_attn
+        context_tokens = self.context_pooler(vision_hidden, mask, relevance=relevance, focus_pruned=True)
+        return mask_emb, pruned_emb, context_tokens
 
 
 class LightweightAdapter(nn.Module):
@@ -317,6 +423,122 @@ class LightweightAdapter(nn.Module):
         return loss
 
 
+class CrossAttentionRepairAdapter(nn.Module):
+    """更强的 delayed-repair adapter：对 K 个 context tokens 做 cross-attention，再生成残差。
+
+    设计目标：
+    - 仍然只作用于 gen_answer tokens（由上层调用保证）
+    - 每个 answer token 可以对不同的 context token 关注，实现 token-wise 条件化修复
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        bottleneck_dim: int = 512,
+        num_context_tokens: int = 8,
+        dropout: float = 0.15,
+        alpha_init: float = 0.1,
+        track_delta_loss: bool = False,
+        **kwargs
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.bottleneck_dim = bottleneck_dim
+        self.num_context_tokens = int(num_context_tokens)
+        self.track_delta_loss = bool(track_delta_loss)
+        self.alpha = nn.Parameter(torch.tensor(alpha_init))
+        self._last_delta_loss = None
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Project to bottleneck for attention
+        self.q_proj = nn.Linear(hidden_size, bottleneck_dim)
+        self.k_proj = nn.Linear(bottleneck_dim, bottleneck_dim)
+        self.v_proj = nn.Linear(bottleneck_dim, bottleneck_dim)
+
+        # Main residual path
+        self.down = nn.Linear(hidden_size, bottleneck_dim)
+        self.up = nn.Linear(bottleneck_dim, hidden_size)
+        self.act = nn.GELU()
+
+        # Fusion FiLM (condition = cross_attn_out + query_emb + optional cached mask/pruned embs)
+        self.film_gamma = nn.Linear(bottleneck_dim, bottleneck_dim)
+        self.film_beta = nn.Linear(bottleneck_dim, bottleneck_dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.zeros_(self.q_proj.bias)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+        nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
+        nn.init.zeros_(self.v_proj.bias)
+
+        nn.init.zeros_(self.film_gamma.weight)
+        nn.init.zeros_(self.film_gamma.bias)
+        nn.init.zeros_(self.film_beta.weight)
+        nn.init.zeros_(self.film_beta.bias)
+
+        nn.init.xavier_uniform_(self.up.weight, gain=0.1)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq, hidden_size) - (通常是 padded 的 gen_answer hidden)
+        Kwargs:
+            context_tokens: (batch, K, bottleneck_dim)
+            mask_emb: (batch, bottleneck_dim) optional
+            pruned_emb: (batch, bottleneck_dim) optional
+        """
+        context_tokens = kwargs.get("context_tokens", None)
+        if context_tokens is None:
+            # For this adapter type, context tokens are required.
+            if self.training:
+                raise ValueError("CrossAttentionRepairAdapter requires `context_tokens` during training.")
+            return x
+
+        # Project queries
+        q = self.q_proj(x)  # (b, L, d)
+        k = self.k_proj(context_tokens)  # (b, K, d)
+        v = self.v_proj(context_tokens)  # (b, K, d)
+
+        # Attention: (b, L, K)
+        scale = 1.0 / math.sqrt(self.bottleneck_dim)
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        attn = F.softmax(attn_scores, dim=-1)
+        attn = self.dropout(attn)
+        ctx = torch.matmul(attn, v)  # (b, L, d)
+
+        # Build condition (token-wise)
+        cond = ctx + q
+
+        mask_emb = kwargs.get("mask_emb", None)
+        if mask_emb is not None:
+            cond = cond + mask_emb.to(dtype=cond.dtype).unsqueeze(1)
+        pruned_emb = kwargs.get("pruned_emb", None)
+        if pruned_emb is not None:
+            cond = cond + pruned_emb.to(dtype=cond.dtype).unsqueeze(1)
+
+        h = self.dropout(self.act(self.down(x)))  # (b, L, d)
+        gamma = 1 + self.film_gamma(cond)
+        beta = self.film_beta(cond)
+        h = gamma * h + beta
+        h = self.dropout(h)
+
+        delta = self.up(h)
+        delta_scaled = self.alpha * delta
+        if self.training and self.track_delta_loss:
+            self._last_delta_loss = (delta_scaled.float() ** 2).mean()
+        return x + delta_scaled
+
+    def pop_delta_loss(self) -> Optional[torch.Tensor]:
+        loss = self._last_delta_loss
+        self._last_delta_loss = None
+        return loss
+
+
 class AdapterManager(nn.Module):
     """多层 Adapter 管理器"""
 
@@ -340,12 +562,14 @@ class AdapterManager(nn.Module):
 
         adapter_cls = {
             'lightweight': LightweightAdapter,
+            'crossattn_repair': CrossAttentionRepairAdapter,
         }.get(adapter_type, LightweightAdapter)
 
         self.adapters = nn.ModuleDict({
             str(idx): adapter_cls(
                 hidden_size=hidden_size,
                 bottleneck_dim=bottleneck_dim,
+                num_context_tokens=int(kwargs.get("num_context_tokens", 8)),
                 n_vision=n_vision,
                 dropout=dropout,
                 mask_encoder_type=mask_encoder_type,

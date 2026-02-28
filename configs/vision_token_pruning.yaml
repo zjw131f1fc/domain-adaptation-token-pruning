@@ -185,6 +185,12 @@ method_settings:
   repair_mask_encoder_type: attention
   repair_use_pruned_info: true
   repair_alpha_init: 0.1
+  # 强方案：缓存 K 个上下文 token（从 pruning 层聚合 pruned vision tokens），在 repair 层对答案 token 做 cross-attn
+  repair_adapter_type: crossattn_repair
+  repair_context_num_tokens: 8
+  repair_context_dropout: 0.0
+  repair_context_use_q2v_relevance: true
+  repair_apply_only_gen_tokens: true
   # 默认 detach 输入：repair 的梯度不回流到 pruner（更稳定）
   repair_detach_input: true
 

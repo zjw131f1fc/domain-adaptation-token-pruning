@@ -132,6 +132,11 @@ def load_model(config, device: torch.device, local_rank: int):
     repair_use_pruned_info = method_cfg.get('repair_use_pruned_info', True)
     repair_alpha_init = method_cfg.get('repair_alpha_init', adapter_alpha_init)
     repair_detach_input = method_cfg.get('repair_detach_input', True)
+    repair_adapter_type = method_cfg.get('repair_adapter_type', 'lightweight')
+    repair_context_num_tokens = int(method_cfg.get('repair_context_num_tokens', 0))
+    repair_context_dropout = float(method_cfg.get('repair_context_dropout', 0.0))
+    repair_context_use_q2v_relevance = bool(method_cfg.get('repair_context_use_q2v_relevance', False))
+    repair_apply_only_gen_tokens = bool(method_cfg.get('repair_apply_only_gen_tokens', True))
 
     # Pruner query dropout
     pruner_query_dropout = method_cfg.get('pruner_query_dropout', 0.0)
@@ -245,6 +250,11 @@ def load_model(config, device: torch.device, local_rank: int):
             repair_mask_encoder_type=repair_mask_encoder_type,
             repair_use_pruned_info=repair_use_pruned_info,
             repair_alpha_init=repair_alpha_init,
+            repair_adapter_type=repair_adapter_type,
+            repair_context_num_tokens=repair_context_num_tokens,
+            repair_context_dropout=repair_context_dropout,
+            repair_context_use_q2v_relevance=repair_context_use_q2v_relevance,
+            repair_apply_only_gen_tokens=repair_apply_only_gen_tokens,
             repair_detach_input=repair_detach_input,
         )
 

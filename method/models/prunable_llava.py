@@ -141,6 +141,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         repair_mask_encoder_type: str = 'attention',
         repair_use_pruned_info: bool = True,
         repair_alpha_init: float = 0.1,
+        repair_adapter_type: str = 'lightweight',  # 'lightweight' | 'crossattn_repair'
+        repair_context_num_tokens: int = 0,  # 0 = 不输出 context tokens；>0 输出 (b,K,d) 供 cross-attn adapter 使用
+        repair_context_dropout: float = 0.0,
+        repair_context_use_q2v_relevance: bool = False,  # 是否用 question→vision attn 作为 relevance bias
+        repair_apply_only_gen_tokens: bool = True,  # 只对 gen_answer tokens 计算/应用 repair（更省算力）
         # 训练稳定性：adapter 的输入是否 stop-grad（避免 repair loss/adapter 路径把梯度回流到 pruner）
         repair_detach_input: bool = True,
     ):
@@ -155,6 +160,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.use_repair_adapter = use_repair_adapter
         self.repair_layers = list(repair_layers) if repair_layers is not None else []
         self.repair_detach_input = repair_detach_input
+        self.repair_apply_only_gen_tokens = bool(repair_apply_only_gen_tokens)
+        self.repair_context_use_q2v_relevance = bool(repair_context_use_q2v_relevance)
 
         # 获取 LLM 配置
         llm_config = self.config.text_config
@@ -246,17 +253,21 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 n_vision=576,
                 mask_encoder_type=repair_mask_encoder_type,
                 use_pruned_info=repair_use_pruned_info,
+                num_context_tokens=int(repair_context_num_tokens),
+                context_dropout=float(repair_context_dropout),
+                use_q2v_relevance=bool(repair_context_use_q2v_relevance),
             )
             self.repair_adapter_manager = AdapterManager(
                 layer_indices=self.repair_layers,
                 hidden_size=self.hidden_size,
                 bottleneck_dim=repair_bottleneck_dim,
-                adapter_type='lightweight',
+                adapter_type=str(repair_adapter_type),
                 n_vision=576,
                 dropout=repair_dropout,
                 mask_encoder_type=repair_mask_encoder_type,
                 use_pruned_info=repair_use_pruned_info,
                 adapter_alpha_init=repair_alpha_init,
+                num_context_tokens=int(repair_context_num_tokens),
             )
 
         # 替换所有层为 PrunableLlamaDecoderLayer（剪枝层有 pruner，非剪枝层没有）
@@ -485,7 +496,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             apply_repair = bool(self.use_repair_adapter and self.repair_adapter_manager is not None)
 
         # 缓存来自 pruning layers 的修复上下文（低维向量）
-        # {prune_layer_idx: {"mask_emb": (b,d), "pruned_emb": (b,d) or None}}
+        # {prune_layer_idx: {"mask_emb": (b,d), "pruned_emb": (b,d) or None, "context_tokens": (b,K,d) or None}}
         repair_context_cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
         # 构建 causal mask（所有层共用，不包含 vision pruning）
@@ -531,6 +542,27 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 out[i, :L] = h[i, gen_starts[i]:gen_ends[i], :]
                 m[i, :L] = 1
             return {"h": out, "mask": m}
+
+        def _extract_gen_answer_padded(h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+            """提取 gen_answer hidden_states 并 pad 成 batch tensor（用于 repair adapter 前向）。"""
+            if gen_starts is None or gen_ends is None:
+                raise ValueError("extract_gen_answer requires answer_starts/answer_ends.")
+            lens = [max(ge - gs, 0) for gs, ge in zip(gen_starts, gen_ends)]
+            max_len = max(lens) if lens else 0
+            if max_len <= 0:
+                # 兜底：返回一个空的占位 tensor，避免下游崩溃
+                out = torch.zeros(batch_size, 1, self.hidden_size, device=h.device, dtype=h.dtype)
+                m = torch.zeros(batch_size, 1, device=h.device, dtype=h.dtype)
+                return out, m, lens
+            out = torch.zeros(batch_size, max_len, self.hidden_size, device=h.device, dtype=h.dtype)
+            m = torch.zeros(batch_size, max_len, device=h.device, dtype=h.dtype)
+            for i in range(batch_size):
+                L = lens[i]
+                if L <= 0:
+                    continue
+                out[i, :L] = h[i, gen_starts[i]:gen_ends[i], :]
+                m[i, :L] = 1
+            return out, m, lens
 
         for layer_idx, decoder_layer in enumerate(llm.layers):
             # position_ids 保持不变（不做物理删除）
@@ -584,6 +616,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         repair_context_cache[layer_idx] = {
                             "mask_emb": pruning_info.get('repair_mask_emb'),
                             "pruned_emb": pruning_info.get('repair_pruned_emb'),
+                            "context_tokens": pruning_info.get('repair_context_tokens', None),
                         }
 
                 if return_pruning_info and (layer_idx in self.pruning_layers):
@@ -614,19 +647,54 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 if ctx is not None:
                     adapter = self.repair_adapter_manager.get_adapter(layer_idx)
                     base = hidden_states
-                    adapter_in = base.detach() if self.repair_detach_input else base
-                    adapted = adapter(
-                        adapter_in,
-                        mask=None,
-                        query=adapter_in,
-                        mask_emb=ctx.get("mask_emb"),
-                        pruned_emb=ctx.get("pruned_emb"),
-                    )
-                    delta = adapted - adapter_in
-                    # task forward：允许梯度通过 base（用于训练 pruner），delta 梯度只回到 adapter（若 detach_input=True）
-                    hidden_states = base + gen_mask_full.unsqueeze(-1) * delta
-                    # repair loss：stop-grad base，避免 repair 目标回流到 pruner
-                    hidden_states_for_repair = base.detach() + gen_mask_full.unsqueeze(-1) * delta
+                    adapter_in_full = base.detach() if self.repair_detach_input else base
+
+                    # 仅对 gen_answer tokens 做 repair（计算量更低，也更贴合设计目标）
+                    if self.repair_apply_only_gen_tokens:
+                        ans_in, ans_mask, lens = _extract_gen_answer_padded(adapter_in_full)
+                        adapted_ans = adapter(
+                            ans_in,
+                            mask=None,
+                            query=ans_in,
+                            mask_emb=ctx.get("mask_emb"),
+                            pruned_emb=ctx.get("pruned_emb"),
+                            context_tokens=ctx.get("context_tokens"),
+                        )
+                        delta_ans = adapted_ans - ans_in
+
+                        # Apply to task forward (base keeps its graph if detach_input=False)
+                        hidden_states = base.clone()
+                        for i in range(batch_size):
+                            L = lens[i]
+                            if L <= 0:
+                                continue
+                            hidden_states[i, gen_starts[i]:gen_ends[i], :] = (
+                                base[i, gen_starts[i]:gen_ends[i], :] + delta_ans[i, :L, :]
+                            )
+
+                        # For repair loss: stop-grad base
+                        hidden_states_for_repair = base.detach().clone()
+                        for i in range(batch_size):
+                            L = lens[i]
+                            if L <= 0:
+                                continue
+                            hidden_states_for_repair[i, gen_starts[i]:gen_ends[i], :] = (
+                                base.detach()[i, gen_starts[i]:gen_ends[i], :] + delta_ans[i, :L, :]
+                            )
+                    else:
+                        adapted = adapter(
+                            adapter_in_full,
+                            mask=None,
+                            query=adapter_in_full,
+                            mask_emb=ctx.get("mask_emb"),
+                            pruned_emb=ctx.get("pruned_emb"),
+                            context_tokens=ctx.get("context_tokens"),
+                        )
+                        delta = adapted - adapter_in_full
+                        # task forward：允许梯度通过 base（用于训练 pruner），delta 梯度只回到 adapter（若 detach_input=True）
+                        hidden_states = base + gen_mask_full.unsqueeze(-1) * delta
+                        # repair loss：stop-grad base，避免 repair 目标回流到 pruner
+                        hidden_states_for_repair = base.detach() + gen_mask_full.unsqueeze(-1) * delta
 
             # === Capture ===
             if layer_idx in capture_layers_set:
