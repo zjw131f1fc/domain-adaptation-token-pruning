@@ -68,6 +68,24 @@ def load_model_and_processor(checkpoint_path, config_path, device):
     config = load_config(override_file=config_path)
     method_cfg = config['method_settings']
 
+    # 先在 CPU 上读取 checkpoint，避免因为 config 打开 use_repair_adapter 但 ckpt 里没有权重，
+    # 导致随机初始化的 adapter 参与 forward，污染 “h_corrected”。
+    print(f"Inspecting checkpoint keys (CPU) from {checkpoint_path}...")
+    checkpoint_cpu = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    has_repair_adapter = isinstance(checkpoint_cpu, dict) and ("repair_adapter_state_dict" in checkpoint_cpu)
+    has_repair_ctx = isinstance(checkpoint_cpu, dict) and ("repair_context_encoder_state_dict" in checkpoint_cpu)
+    if method_cfg.get("use_repair_adapter", False) and (not has_repair_adapter):
+        print(
+            "[Auto] Checkpoint has no repair_adapter_state_dict; disabling use_repair_adapter for visualization "
+            "to avoid random adapter affecting h_corrected."
+        )
+        method_cfg["use_repair_adapter"] = False
+    if method_cfg.get("use_repair_adapter", False) and has_repair_adapter and (not has_repair_ctx):
+        print(
+            "[Warning] Checkpoint has repair_adapter_state_dict but no repair_context_encoder_state_dict; "
+            "context encoder will stay randomly initialized and may hurt h_corrected."
+        )
+
     model_path = "llava-hf/llava-1.5-7b-hf"
     print(f"Loading base model from {model_path}...")
 
@@ -115,9 +133,9 @@ def load_model_and_processor(checkpoint_path, config_path, device):
 
     model.freeze_base_model()
 
-    # 加载 checkpoint
+    # 加载 checkpoint（直接复用 CPU 读取的内容；state_dict 会在 load_state_dict 时搬到对应 device）
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = checkpoint_cpu
 
     if 'pruner_state_dict' in checkpoint:
         model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
