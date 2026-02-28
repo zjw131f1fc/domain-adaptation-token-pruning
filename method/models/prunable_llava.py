@@ -11,6 +11,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import warnings
 from typing import Optional, List, Dict, Tuple, Union, Any
 from dataclasses import dataclass
 
@@ -246,6 +247,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 self._repair_source_by_layer = {
                     int(r_layer): int(s_layer) for r_layer, s_layer in zip(self.repair_layers, repair_source_layers)
                 }
+                # NOTE: repair context is only produced/cached at pruning layers (where repair_context_encoder is attached).
+                # If a user config points repair_source_layers to non-pruning layers, ctx will be missing and repair becomes a no-op.
+                # We warn once here and fall back to "nearest cached pruning layer" at runtime.
+                invalid = sorted({s for s in self._repair_source_by_layer.values() if int(s) not in set(self.pruning_layers)})
+                if invalid:
+                    warnings.warn(
+                        f"[repair_source_layers] {invalid} are not in pruning_layers={self.pruning_layers}. "
+                        "Repair context is only cached at pruning layers; will fall back to nearest cached layer.",
+                        stacklevel=2,
+                    )
 
             self.repair_context_encoder = RepairContextEncoder(
                 hidden_size=self.hidden_size,
@@ -644,6 +655,23 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     source_layer = max(eligible) if eligible else None
 
                 ctx = repair_context_cache.get(source_layer, None) if source_layer is not None else None
+                if ctx is None:
+                    # If the configured source layer does not have cached context (common misconfig),
+                    # fall back to the nearest cached pruning layer so repair still functions.
+                    eligible = [k for k in repair_context_cache.keys() if k <= layer_idx]
+                    fallback_layer = max(eligible) if eligible else None
+                    if fallback_layer is not None:
+                        if not hasattr(self, "_warned_missing_repair_ctx"):
+                            self._warned_missing_repair_ctx = set()
+                        key = (int(layer_idx), int(source_layer) if source_layer is not None else -1)
+                        if key not in self._warned_missing_repair_ctx:
+                            self._warned_missing_repair_ctx.add(key)
+                            warnings.warn(
+                                f"[delayed_repair] Missing ctx for repair_layer={layer_idx} "
+                                f"source_layer={source_layer}; falling back to cached_layer={fallback_layer}.",
+                                stacklevel=2,
+                            )
+                        ctx = repair_context_cache.get(fallback_layer, None)
                 if ctx is not None:
                     adapter = self.repair_adapter_manager.get_adapter(layer_idx)
                     base = hidden_states
