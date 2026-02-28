@@ -1048,6 +1048,23 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         )
                     logger.info(f"  RepairDeltaDiag: [{', '.join(per_layer_strs)}]")
 
+                # Direct teacher-closeness: token-wise MSE before vs after repair (per-layer + avg improvement%)
+                if 'repair_mse_improve_per_layer' in stats and stats['repair_mse_improve_per_layer']:
+                    per_layer_strs = []
+                    for layer_idx in sorted(stats['repair_mse_improve_per_layer'].keys()):
+                        imp = stats['repair_mse_improve_per_layer'][layer_idx]
+                        mb = stats.get('repair_mse_before_per_layer', {}).get(layer_idx, None)
+                        ma = stats.get('repair_mse_after_per_layer', {}).get(layer_idx, None)
+                        if mb is None or ma is None:
+                            per_layer_strs.append(f"L{layer_idx}(imp={imp:+.1f}%)")
+                        else:
+                            per_layer_strs.append(f"L{layer_idx}(b={mb:.4f},a={ma:.4f},imp={imp:+.1f}%)")
+                    logger.info(
+                        f"  RepairMSE: avg_imp={stats.get('repair_mse_improve_avg', 0.0):+.1f}% "
+                        f"(avg_b={stats.get('repair_mse_before_avg', 0.0):.4f}, avg_a={stats.get('repair_mse_after_avg', 0.0):.4f}) "
+                        f"[{', '.join(per_layer_strs)}]"
+                    )
+
             # 计算 eval loss（用于检测过拟合，按 batch 数判断）
             if eval_loss_loader is not None and global_batch % eval_loss_every == 0:
                 # 获取一个 eval batch

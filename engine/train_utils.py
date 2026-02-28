@@ -23,6 +23,22 @@ def _flatten_masked(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return h2[m2]
 
 
+def _tokenwise_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Token-wise MSE between two flattened token matrices (N, D).
+
+    Uses the first min(Na, Nb) rows to be robust to minor length mismatches.
+    """
+    if a is None or b is None:
+        raise ValueError("_tokenwise_mse requires non-None inputs.")
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError(f"Expected (N,D) matrices, got {tuple(a.shape)} and {tuple(b.shape)}")
+    n = min(int(a.shape[0]), int(b.shape[0]))
+    if n <= 0:
+        # Return a safe scalar tensor (on a's device) to avoid NaNs.
+        return torch.zeros((), device=a.device, dtype=a.dtype)
+    return F.mse_loss(a[:n], b[:n])
+
+
 def compute_distribution_alignment_loss(
     student_h: torch.Tensor,
     teacher_h: torch.Tensor,
@@ -475,6 +491,13 @@ def train_step(
             delta_loss_per_layer = {}
             delta_diag_per_layer = {}
             delta_losses_accum = []
+            # Additional diagnostics: token-wise MSE(before, teacher) vs MSE(after, teacher).
+            # This directly answers "did repair move closer to teacher" under the same capture/LN space.
+            mse_before_per_layer = {}
+            mse_after_per_layer = {}
+            mse_improve_per_layer = {}
+            mse_before_accum = []
+            mse_after_accum = []
             for layer_idx in capture_layers:
                 if layer_idx not in before_caps or layer_idx not in student_caps or layer_idx not in teacher_caps:
                     continue
@@ -495,6 +518,19 @@ def train_step(
 
                 layer_adapter_stats = _compute_adapter_repair_stats(h_before_s, h_after_s, h_teacher_s, m)
                 adapter_stats_per_layer[layer_idx] = layer_adapter_stats
+
+                # Token-wise MSE vs teacher (before/after).
+                before_flat = _flatten_masked(h_before_s, m).float()
+                after_flat = _flatten_masked(h_after_s, m).float()
+                teacher_flat = _flatten_masked(h_teacher_s, m).float()
+                mse_before = _tokenwise_mse(before_flat, teacher_flat)
+                mse_after = _tokenwise_mse(after_flat, teacher_flat)
+                mse_before_per_layer[layer_idx] = float(mse_before.detach().item())
+                mse_after_per_layer[layer_idx] = float(mse_after.detach().item())
+                improve = (mse_before - mse_after) / (mse_before.abs() + 1e-12) * 100.0
+                mse_improve_per_layer[layer_idx] = float(improve.detach().item())
+                mse_before_accum.append(mse_before.detach())
+                mse_after_accum.append(mse_after.detach())
 
                 # 可选：对 delta 做更强的约束（鼓励沿 target 方向、抑制正交分量）
                 if (repair_delta_l2_weight > 0) or (repair_delta_orth_weight > 0) or (repair_delta_frac_weight > 0):
@@ -518,6 +554,14 @@ def train_step(
                 avg_magnitude = sum(s['magnitude_ratio'] for s in adapter_stats_per_layer.values()) / len(adapter_stats_per_layer)
                 stats['adapter_avg_direction_cosine'] = avg_direction
                 stats['adapter_avg_magnitude_ratio'] = avg_magnitude
+            if mse_before_per_layer and mse_after_per_layer:
+                stats["repair_mse_before_per_layer"] = mse_before_per_layer
+                stats["repair_mse_after_per_layer"] = mse_after_per_layer
+                stats["repair_mse_improve_per_layer"] = mse_improve_per_layer
+                stats["repair_mse_before_avg"] = float(torch.stack(mse_before_accum).mean().item()) if mse_before_accum else 0.0
+                stats["repair_mse_after_avg"] = float(torch.stack(mse_after_accum).mean().item()) if mse_after_accum else 0.0
+                denom = abs(stats["repair_mse_before_avg"]) + 1e-12
+                stats["repair_mse_improve_avg"] = float((stats["repair_mse_before_avg"] - stats["repair_mse_after_avg"]) / denom * 100.0)
             if delta_losses_accum:
                 losses["repair_delta_reg_loss"] = torch.stack(delta_losses_accum).mean()
                 stats["raw_repair_delta_reg_loss"] = float(losses["repair_delta_reg_loss"].detach().item())
