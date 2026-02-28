@@ -174,9 +174,9 @@ method_settings:
   # - repair layer（可配置）仅对 gen_answer token 做修复
   use_repair_adapter: true
   # repair 插入点（你要的“三段修复”默认设置）
-  # L4 之后：修复点放在 13
-  # L14 之后：修复点放在 22
-  # L24 之后：修复点放在 29
+  # L4 之后：修复点放在 7
+  # L14 之后：修复点放在 17
+  # L24 之后：修复点放在 27
   repair_layers: [7, 17, 27]
   # repair 上下文来源（与 repair_layers 一一对应）
   repair_source_layers: [4, 14, 24]
@@ -212,8 +212,10 @@ method_settings:
   # 这些项会基于 (h_before, h_after, h_teacher) 分解 delta，并加到总 loss 里（只影响 adapter）。
   # 经验上：L13 出现 fake≈real 但 corrected 偏离时，先从增大 orth 开始。
   # 先保持关闭；如果仍出现“修复后分布更可分 / 引入正交噪声”，再打开 orth 约束。
+  # NOTE: 如果开启了 Subspace Repair（低秩投影），建议先把 orth 正则关掉做干净对照；
+  # 因为投影本身已经是“硬约束”的正交压制。
   repair_delta_l2_weight: 0.01     # 惩罚 ||delta||^2（防止无谓的大修正）
-  repair_delta_orth_weight: 10.0   # 强力抑制正交分量（不要求方向完全一致，但避免“越修越远”）
+  repair_delta_orth_weight: 0.0    # 子空间投影已压正交；默认关掉
   repair_delta_frac_weight: 0.0   # 惩罚沿 target 方向的缩放偏差（让 frac≈1）
 
   # ==================== Subspace Repair（低秩/子空间修复）====================
@@ -225,11 +227,13 @@ method_settings:
   # - orth_scale: 正交残差保留比例（0=完全丢弃正交分量；1=等价于不投影）
   # - calib_samples: 用多少训练样本估计子空间（只在 rank0 跑一遍，然后广播到各 rank）
   # - calib_max_tokens_per_layer: 每层最多用多少 token 向量做 PCA（防止内存爆）
-  repair_subspace_enable: false
+  # 先开强版本：orth_scale=0 完全压制正交分量，验证是否能让 corrected 更“像 teacher”
+  repair_subspace_enable: true
   repair_subspace_rank: 64
   repair_subspace_orth_scale: 0.0
-  repair_subspace_calib_samples: 128
-  repair_subspace_calib_max_tokens_per_layer: 8192
+  # 校准开销控制：先用较小样本快速跑；如果波动大，再提高到 128/256
+  repair_subspace_calib_samples: 64
+  repair_subspace_calib_max_tokens_per_layer: 4096
   # 子空间口径是否在 next-LN 空间估计（默认 false；因为 delta 是在 pre-LN 空间施加的）
   repair_subspace_apply_next_layernorm: false
   # 如果 checkpoint 已经包含 basis，默认不重算；置 true 强制重算
