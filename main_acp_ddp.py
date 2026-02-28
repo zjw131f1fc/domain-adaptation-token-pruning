@@ -993,7 +993,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     eval_loss_iter = iter(eval_loss_loader)
                     eval_batch = next(eval_loss_iter)
 
-                # 计算 eval loss（不做 backward，保持 train 模式以公平比较）
+                    # 计算 eval loss（不做 backward，保持 train 模式以公平比较）
+                    eval_result = None
                     with torch.no_grad():
                         eval_result = train_step(
                             batch=eval_batch,
@@ -1004,6 +1005,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                             total_steps=stage_total,
                             device=device,
                         )
+                    if eval_result is None:
+                        raise RuntimeError("eval_result is None: eval loss computation did not run as expected.")
 
                 # 汇总 eval loss（分布式平均）
                 eval_losses = eval_result['losses']
