@@ -16,7 +16,9 @@
 import os
 import sys
 import math
+import gc
 from contextlib import nullcontext
+from copy import deepcopy
 
 # 不要硬编码 CUDA_VISIBLE_DEVICES，让 torchrun 自动处理
 os.environ["HF_HOME"] = "/data/users/zjw/huggingface_cache"
@@ -267,6 +269,44 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     """主训练函数（分布式版本）"""
     logger = config.logger if is_main_process() else None
     method_cfg = config.method_settings
+    backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
+
+    # ============================================================
+    # Two-step training (LLaVA only):
+    #   Stage 1: train pruner-only model (no repair adapter), save checkpoint
+    #   Stage 2: instantiate model with repair adapter, load pruner weights, freeze pruner, finetune adapter
+    # Scheduling/annealing (hybrid phases, sparsity anneal) should be computed within Stage 1 only.
+    # ============================================================
+    two_step_enable = bool(method_cfg.get("two_step_enable", False))
+    if 'qwen2-vl' in backbone_name.lower():
+        # 用户要求：qwen2-vl 先不动
+        two_step_enable = False
+
+    two_step_stage1_ratio = float(
+        method_cfg.get("two_step_stage1_ratio", method_cfg.get("hybrid_phase2_end", 0.8))
+    )
+    two_step_stage1_ratio = max(0.0, min(1.0, two_step_stage1_ratio))
+
+    stage1_config = config
+    stage2_config = config
+    if two_step_enable:
+        stage1_config = deepcopy(config)
+        # Stage 1: build a pruner-only model (no delayed repair adapter modules)
+        stage1_config.method_settings['use_repair_adapter'] = False
+        stage1_config.method_settings['teacher_forward_enable'] = False
+        stage1_config.method_settings['repair_loss_weight'] = 0.0
+
+        stage2_config = deepcopy(config)
+        # Stage 2: make pruning deterministic and stop sparsity anneal from drifting targets
+        stage2_config.method_settings['gumbel_mode'] = stage2_config.method_settings.get("two_step_stage2_gumbel_mode", "never")
+        stage2_config.method_settings['skip_phase1'] = True
+        stage2_config.method_settings['sparsity_anneal_ratio'] = 0.0
+        stage2_config.method_settings['sparsity_weight'] = float(stage2_config.method_settings.get("two_step_stage2_sparsity_weight", 0.0))
+        # Stage 2 temperature: use explicit value if provided, else default to eval_temperature / hybrid low-temp.
+        stage2_temp = stage2_config.method_settings.get("two_step_stage2_temperature", None)
+        if stage2_temp is None:
+            stage2_temp = stage2_config.method_settings.get("eval_temperature", stage2_config.method_settings.get("hybrid_phase1_temp_end", stage2_config.method_settings.get("temperature_min", 0.5)))
+        stage2_config.method_settings['temperature_min'] = float(stage2_temp)
 
     pruning_layers = method_cfg.get('pruning_layers', [4, 14, 24])
 
@@ -275,7 +315,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     torch.manual_seed(seed + rank)
 
     # 加载模型
-    model, processor = load_model(config, device, local_rank)
+    active_config = stage1_config if two_step_enable else config
+    model, processor = load_model(active_config, device, local_rank)
 
     # 广播模型参数，确保所有进程的初始参数一致
     broadcast_model_params(model, src=0)
@@ -321,6 +362,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     trainer_cfg = config.trainer_settings.get('dl_settings', {})
     batch_size = trainer_cfg.get('batch_size', 4)
+    grad_accum_steps = trainer_cfg.get('gradient_accumulation_steps', 1)  # 梯度累积步数
+    epochs = trainer_cfg.get('epochs', 1)
 
     train_loader = DataLoader(
         train_wrapper,
@@ -330,6 +373,25 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         num_workers=0,  # 图像处理需要在主进程
         pin_memory=True,
     )
+
+    # 计算总步数（按优化器更新次数计算，不是 batch 数）
+    total_batches_per_epoch = len(train_loader)
+    total_steps = epochs * (total_batches_per_epoch // grad_accum_steps)
+    total_steps = max(1, int(total_steps))
+
+    # two-step 切分步数：Stage1 负责所有退火/三阶段调度；Stage2 固定 pruning 行为训 adapter
+    stage1_steps = total_steps
+    stage2_steps = 0
+    if two_step_enable:
+        stage1_steps = int(round(total_steps * two_step_stage1_ratio))
+        stage1_steps = max(1, min(stage1_steps, total_steps))
+        if stage1_steps >= total_steps:
+            # 没有 Stage 2
+            two_step_enable = False
+            active_config = config
+            stage2_steps = 0
+        else:
+            stage2_steps = total_steps - stage1_steps
 
     # 创建 eval DataLoader 用于计算 eval loss（与 train 使用相同的 batch_size）
     eval_loss_loader = None
@@ -359,9 +421,15 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     pruner_weight_decay = opt_cfg.get('layer_pruners', {}).get('weight_decay', 0.0)
     disc_lr = opt_cfg.get('discriminator', {}).get('lr', 1.5e-4)
 
-    from itertools import chain
-    pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
-    pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
+    # Stage 1 optimizer:
+    # - normal: pruner + adapters together (legacy)
+    # - two-step: pruner only
+    if two_step_enable:
+        pruner_optimizer = torch.optim.Adam(model.get_pruner_parameters(), lr=pruner_lr, weight_decay=pruner_weight_decay)
+    else:
+        from itertools import chain
+        pruner_adapter_params = chain(model.get_pruner_parameters(), model.get_adapter_parameters())
+        pruner_optimizer = torch.optim.Adam(pruner_adapter_params, lr=pruner_lr, weight_decay=pruner_weight_decay)
 
     # 判别器优化器（仅在 discriminator 模式下创建）
     adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
@@ -371,10 +439,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         disc_optimizer = None
 
     # 创建学习率调度器（余弦退火）
-    # 计算总步数用于调度器
-    epochs = trainer_cfg.get('epochs', 1)  # 提前获取 epochs
-    total_batches_per_epoch = len(train_dataset) // batch_size
-    total_steps_for_scheduler = epochs * total_batches_per_epoch
 
     lr_scheduler_cfg = opt_cfg.get('lr_scheduler', {})
     lr_scheduler_type = lr_scheduler_cfg.get('type', 'none')  # 'none', 'cosine', 'linear'
@@ -387,40 +451,52 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     if lr_scheduler_type == 'cosine':
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-        warmup_steps = int(total_steps_for_scheduler * warmup_ratio)
-        cosine_steps = total_steps_for_scheduler - warmup_steps
+        # 重要：two-step 时，所有退火/调度统一按 Stage 1 的步数缩放（Stage 2 不再退火）
+        steps_for_sched = stage1_steps if two_step_enable else total_steps
+        steps_for_sched = max(1, int(steps_for_sched))
+        warmup_steps = int(steps_for_sched * warmup_ratio)
+        warmup_steps = max(0, min(warmup_steps, steps_for_sched - 1)) if steps_for_sched > 1 else 0
+        cosine_steps = steps_for_sched - warmup_steps
 
         # Pruner scheduler: warmup + cosine
-        if warmup_steps > 0:
+        if warmup_steps > 0 and cosine_steps > 0:
             pruner_warmup = LinearLR(pruner_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
             pruner_cosine = CosineAnnealingLR(pruner_optimizer, T_max=cosine_steps, eta_min=pruner_lr * min_lr_ratio)
             pruner_scheduler = SequentialLR(pruner_optimizer, schedulers=[pruner_warmup, pruner_cosine], milestones=[warmup_steps])
+        elif warmup_steps > 0:
+            pruner_scheduler = LinearLR(pruner_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
         else:
-            pruner_scheduler = CosineAnnealingLR(pruner_optimizer, T_max=total_steps_for_scheduler, eta_min=pruner_lr * min_lr_ratio)
+            pruner_scheduler = CosineAnnealingLR(pruner_optimizer, T_max=steps_for_sched, eta_min=pruner_lr * min_lr_ratio)
 
         # Disc scheduler: warmup + cosine (仅在 discriminator 模式下创建)
         if disc_optimizer is not None:
-            if warmup_steps > 0:
+            if warmup_steps > 0 and cosine_steps > 0:
                 disc_warmup = LinearLR(disc_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
                 disc_cosine = CosineAnnealingLR(disc_optimizer, T_max=cosine_steps, eta_min=disc_lr * min_lr_ratio)
                 disc_scheduler = SequentialLR(disc_optimizer, schedulers=[disc_warmup, disc_cosine], milestones=[warmup_steps])
+            elif warmup_steps > 0:
+                disc_scheduler = LinearLR(disc_optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
             else:
-                disc_scheduler = CosineAnnealingLR(disc_optimizer, T_max=total_steps_for_scheduler, eta_min=disc_lr * min_lr_ratio)
+                disc_scheduler = CosineAnnealingLR(disc_optimizer, T_max=steps_for_sched, eta_min=disc_lr * min_lr_ratio)
 
         if is_main_process():
             logger.info(f"LR Scheduler: Cosine Annealing with warmup")
             logger.info(f"  Warmup steps: {warmup_steps} ({warmup_ratio:.0%})")
+            logger.info(f"  Scheduler steps: {steps_for_sched} (two_step={'ON' if two_step_enable else 'OFF'})")
             logger.info(f"  Min LR ratio: {min_lr_ratio}")
 
     elif lr_scheduler_type == 'linear':
         from torch.optim.lr_scheduler import LinearLR
 
-        pruner_scheduler = LinearLR(pruner_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
+        steps_for_sched = stage1_steps if two_step_enable else total_steps
+        steps_for_sched = max(1, int(steps_for_sched))
+        pruner_scheduler = LinearLR(pruner_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=steps_for_sched)
         if disc_optimizer is not None:
-            disc_scheduler = LinearLR(disc_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=total_steps_for_scheduler)
+            disc_scheduler = LinearLR(disc_optimizer, start_factor=1.0, end_factor=min_lr_ratio, total_iters=steps_for_sched)
 
         if is_main_process():
             logger.info(f"LR Scheduler: Linear Decay")
+            logger.info(f"  Scheduler steps: {steps_for_sched} (two_step={'ON' if two_step_enable else 'OFF'})")
             logger.info(f"  Min LR ratio: {min_lr_ratio}")
 
     # 检查是否有 checkpoint 需要加载（用于恢复训练）
@@ -517,11 +593,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     eval_max_samples = trainer_cfg.get('eval_max_samples', 500)
     save_every = trainer_cfg.get('save_every_batches', 3000)
     grad_clip = trainer_cfg.get('grad_clip_max_norm', None)
-    grad_accum_steps = trainer_cfg.get('gradient_accumulation_steps', 1)  # 梯度累积步数
-
-    # 计算总步数（按优化器更新次数计算，不是 batch 数）
-    total_batches_per_epoch = len(train_loader)
-    total_steps = epochs * (total_batches_per_epoch // grad_accum_steps)
 
     if is_main_process():
         logger.info(f"Training config: epochs={epochs}, batch_size={batch_size}, "
@@ -530,9 +601,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                    f"Effective batch size: {batch_size * world_size * grad_accum_steps}")
         logger.info(f"Total optimizer steps: {total_steps}, Pruner LR: {pruner_lr}, Disc LR: {disc_lr}")
         # 显示 skip_phase1 状态
-        skip_phase1 = method_cfg.get('skip_phase1', False)
+        skip_phase1 = active_config.method_settings.get('skip_phase1', False)
         if skip_phase1:
             logger.info(f"[skip_phase1=True] Starting from Phase 2, skipping temperature and sparsity annealing")
+        if two_step_enable:
+            logger.info(f"[two_step_enable] Stage1 steps={stage1_steps} ({two_step_stage1_ratio:.0%}), Stage2 steps={stage2_steps}.")
 
     # 保存目录
     save_dir = Path(config.global_settings.get('save_dir', './outputs/checkpoints'))
@@ -543,6 +616,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     global_step = start_step  # 优化器更新次数
     global_batch = start_step * grad_accum_steps  # 全局 batch 计数（用于 print/eval/save 判断）
     cached_origin_result = None
+    training_stage = 1
+    stage2_switched = False
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
@@ -574,13 +649,23 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             is_accum_step = (accum_step % grad_accum_steps != 0)  # 是否是累积中间步
 
             # 训练步骤
+            if two_step_enable and training_stage == 1:
+                stage_step = global_step
+                stage_total = stage1_steps
+            elif two_step_enable and training_stage == 2:
+                stage_step = max(0, global_step - stage1_steps)
+                stage_total = max(1, stage2_steps)
+            else:
+                stage_step = global_step
+                stage_total = total_steps
+
             result = train_step(
                 batch=batch,
                 model=model,
                 processor=processor,
-                config=config,
-                current_step=global_step,
-                total_steps=total_steps,
+                config=active_config,
+                current_step=stage_step,
+                total_steps=stage_total,
                 device=device,
             )
 
@@ -616,12 +701,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 if pruner_has_grad:
                     if grad_clip:
-                        # pruner_optimizer 同时包含 pruner + (delayed) adapters 参数；这里一起 clip 更安全
-                        from itertools import chain
-                        torch.nn.utils.clip_grad_norm_(
-                            chain(model.get_pruner_parameters(), model.get_adapter_parameters()),
-                            grad_clip,
-                        )
+                        # Clip the parameters that the active optimizer is updating (stage-aware).
+                        clip_params = []
+                        for group in pruner_optimizer.param_groups:
+                            clip_params.extend(group.get('params', []))
+                        torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     pruner_optimizer.step()
 
                 # 清零梯度，准备下一轮累积
@@ -637,6 +721,87 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                 # 更新 global_step（按优化器更新次数）
                 global_step += 1
+
+                # === Two-step transition: Stage 1 -> Stage 2 (adapter fine-tune) ===
+                if (
+                    two_step_enable
+                    and (not stage2_switched)
+                    and training_stage == 1
+                    and global_step >= stage1_steps
+                ):
+                    # Sync all ranks before switching models/optimizers.
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                    if is_main_process():
+                        logger.info("=" * 60)
+                        logger.info(f"[two_step_enable] Switching to Stage 2 at global_step={global_step} (batch={global_batch})")
+                        logger.info("=" * 60)
+
+                    # Save pruner-only checkpoint (Stage 1 output)
+                    if is_main_process():
+                        stage1_path = save_dir / "checkpoint_stage1_pruner_only.pt"
+                        stage1_ckpt = {
+                            'train_stage': 1,
+                            'step': global_step,
+                            'batch': global_batch,
+                            'pruner_state_dict': model.pruner_manager.state_dict(),
+                            'disc_state_dict': model.disc_manager.state_dict(),
+                            'pruner_optimizer': pruner_optimizer.state_dict(),
+                        }
+                        if pruner_scheduler is not None:
+                            stage1_ckpt['pruner_scheduler'] = pruner_scheduler.state_dict()
+                        if disc_optimizer is not None:
+                            stage1_ckpt['disc_optimizer'] = disc_optimizer.state_dict()
+                        if disc_scheduler is not None:
+                            stage1_ckpt['disc_scheduler'] = disc_scheduler.state_dict()
+                        torch.save(stage1_ckpt, stage1_path)
+                        logger.info(f"[two_step_enable] Saved Stage 1 (pruner-only) checkpoint to {stage1_path}")
+
+                    # Keep pruner weights for Stage 2
+                    pruner_state = model.pruner_manager.state_dict()
+                    disc_state = model.disc_manager.state_dict()
+
+                    # Release Stage 1 model/optimizer memory before loading Stage 2 model.
+                    del model
+                    pruner_optimizer = None
+                    pruner_scheduler = None
+                    disc_optimizer = None
+                    disc_scheduler = None
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    # Instantiate Stage 2 model (with repair adapter), load pruner weights, freeze pruner.
+                    active_config = stage2_config
+                    model, processor = load_model(active_config, device, local_rank)
+                    model.pruner_manager.load_state_dict(pruner_state)
+                    model.disc_manager.load_state_dict(disc_state)
+                    for p in model.get_pruner_parameters():
+                        p.requires_grad = False
+
+                    # Stage 2 optimizer: repair adapter only (LLaVA).
+                    adapter_lr = float(method_cfg.get("two_step_stage2_lr", pruner_lr))
+                    if hasattr(model, "get_repair_adapter_parameters"):
+                        adapter_params = list(model.get_repair_adapter_parameters())
+                    else:
+                        adapter_params = list(model.get_adapter_parameters())
+                    if len(adapter_params) == 0:
+                        raise RuntimeError(
+                            "[two_step_enable] Stage 2 requested, but no adapter parameters found. "
+                            "Check `use_repair_adapter: true` and that repair modules are constructed."
+                        )
+                    pruner_optimizer = torch.optim.Adam(adapter_params, lr=adapter_lr, weight_decay=0.0)
+                    pruner_optimizer.zero_grad()
+
+                    # Re-broadcast to ensure consistent params across ranks.
+                    broadcast_model_params(model, src=0)
+
+                    training_stage = 2
+                    stage2_switched = True
+                    # Restart gradient accumulation cycle for Stage 2.
+                    accum_step = 0
+                    if dist.is_initialized():
+                        dist.barrier()
 
             # 判别器重新初始化（只在累积结束时，且仅在 discriminator 模式下）
             # 注意：需要在所有进程间同步决策，避免死锁
@@ -724,10 +889,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 phase_str = ""
                 if 'hybrid_phase' in stats:
                     phase_str = f" [Phase {stats['hybrid_phase']}]"
-                if 'two_stage' in stats and isinstance(stats['two_stage'], dict) and stats['two_stage'].get('enabled'):
-                    phase_str = f"{phase_str} [Stage {stats['two_stage'].get('stage', '?')}]"
+                stage_str = f" [TrainStage {training_stage}]"
+                if two_step_enable:
+                    stage_str = f"{stage_str}({stage_step}/{stage_total})"
                 noise_str = "noise=ON" if stats.get('use_gumbel_noise', False) else "noise=OFF"
-                logger.info(f"Step {global_step}{phase_str}: {loss_str} (temp={stats['temperature']:.2f}, {noise_str})")
+                logger.info(f"Step {global_step}{stage_str}{phase_str}: {loss_str} (temp={stats['temperature']:.2f}, {noise_str})")
 
                 if 'avg_kept_ratio' in stats:
                     layer_ratios = []
@@ -828,16 +994,16 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     eval_batch = next(eval_loss_iter)
 
                 # 计算 eval loss（不做 backward，保持 train 模式以公平比较）
-                with torch.no_grad():
-                    eval_result = train_step(
-                        batch=eval_batch,
-                        model=model,
-                        processor=processor,
-                        config=config,
-                        current_step=global_step,
-                        total_steps=total_steps,
-                        device=device,
-                    )
+                    with torch.no_grad():
+                        eval_result = train_step(
+                            batch=eval_batch,
+                            model=model,
+                            processor=processor,
+                            config=active_config,
+                            current_step=stage_step,
+                            total_steps=stage_total,
+                            device=device,
+                        )
 
                 # 汇总 eval loss（分布式平均）
                 eval_losses = eval_result['losses']
@@ -865,7 +1031,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     if eval_mode == 'origin':
                         if cached_origin_result is None:
                             eval_result = evaluate(
-                                model, processor, test_dataset, judge, config, device,
+                                model, processor, test_dataset, judge, active_config, device,
                                 max_samples=eval_max_samples,
                                 mode=eval_mode,
                                 distributed=True
@@ -879,7 +1045,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                                 logger.info(f"  [{eval_mode}] Accuracy: {eval_result['accuracy']:.2%} (cached)")
                     else:
                         eval_result = evaluate(
-                            model, processor, test_dataset, judge, config, device,
+                            model, processor, test_dataset, judge, active_config, device,
                             max_samples=eval_max_samples,
                             mode=eval_mode,
                             distributed=True
@@ -900,8 +1066,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                                         else:
                                             layer_ratios.append(f"L{layer_idx}={eval_result[kept_key]:.2%}")
                                 layer_str = ", ".join(layer_ratios)
-                                logger.info(f"  [{eval_mode}] Avg kept ratio: "
-                                           f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
+                                logger.info(
+                                    f"  [{eval_mode}] Avg kept ratio: "
+                                    f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]"
+                                )
 
                 model.train()
 
@@ -1009,13 +1177,13 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 eval_result = cached_origin_result
                 if is_main_process():
                     logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%} (cached)")
-            else:
-                eval_result = evaluate(
-                    model, processor, test_dataset, judge, config, device,
-                    max_samples=eval_max_samples,
-                    mode=eval_mode,
-                    distributed=True
-                )
+                else:
+                    eval_result = evaluate(
+                        model, processor, test_dataset, judge, active_config, device,
+                        max_samples=eval_max_samples,
+                        mode=eval_mode,
+                        distributed=True
+                    )
                 if is_main_process():
                     logger.info(f"[{eval_mode}] Final accuracy: {eval_result['accuracy']:.2%}")
                     if 'avg_kept_ratio' in eval_result:

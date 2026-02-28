@@ -714,6 +714,23 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             return param_iters[0]
         return chain(*param_iters)
 
+    def get_repair_adapter_parameters(self):
+        """获取 delayed repair adapter 的参数（不包含旧版 attention-output adapter）。"""
+        from itertools import chain
+
+        param_iters = []
+        if getattr(self, 'use_repair_adapter', False):
+            if getattr(self, 'repair_context_encoder', None) is not None:
+                param_iters.append(self.repair_context_encoder.parameters())
+            if getattr(self, 'repair_adapter_manager', None) is not None:
+                param_iters.append(self.repair_adapter_manager.parameters())
+
+        if not param_iters:
+            return []
+        if len(param_iters) == 1:
+            return param_iters[0]
+        return chain(*param_iters)
+
     def freeze_base_model(self):
         """冻结基础模型参数（但保持 pruner, discriminator, adapter 可训练）"""
         for param in self.base_model.parameters():

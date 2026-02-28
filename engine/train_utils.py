@@ -3,7 +3,7 @@
 import math
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
 
@@ -21,75 +21,6 @@ def _flatten_masked(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # 兜底：返回一个 1xD 的零向量，避免下游 NaN
         return torch.zeros(1, d, device=h.device, dtype=h.dtype)
     return h2[m2]
-
-
-def _apply_two_stage_training_overrides(
-    method_cfg: Dict[str, Any],
-    current_step: int,
-    total_steps: int,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Optionally override method_cfg for two-stage training.
-
-    Stage 1 (pruner): disable repair + teacher forward, train pruner with task+sparsity.
-    Stage 2 (adapter): enable repair + teacher forward, freeze pruner behavior (e.g. no gumbel noise),
-    and (optionally) turn off task/sparsity weights so only adapter is updated.
-
-    Returns:
-        effective_method_cfg, stage_info
-    """
-    enable = bool(method_cfg.get("two_stage_enable", False))
-    if not enable:
-        return method_cfg, {"enabled": False}
-
-    # Stage boundary: by default, start stage2 at "hybrid_phase2_end" (noise-off) if present.
-    default_stage1_ratio = float(method_cfg.get("hybrid_phase2_end", 0.8)) if method_cfg.get("gumbel_mode", "never") == "hybrid" else 0.7
-    stage1_ratio = float(method_cfg.get("two_stage_stage1_ratio", default_stage1_ratio))
-    stage1_ratio = max(0.0, min(1.0, stage1_ratio))
-
-    progress = current_step / total_steps if total_steps > 0 else 0.0
-    in_stage1 = progress < stage1_ratio
-
-    eff = dict(method_cfg)
-    stage = 1 if in_stage1 else 2
-
-    # Common: expose a knob to explicitly override whether to apply repair during forward.
-    # (PrunableLlava forward takes apply_repair and defaults to model setting.)
-    if in_stage1:
-        # Stage 1: pruner should "feel" the pruning-induced gap -> no adapter / no teacher supervision.
-        eff["teacher_forward_enable"] = False
-        eff["repair_loss_weight"] = 0.0
-        eff["apply_repair"] = False
-    else:
-        # Stage 2: train adapter on fixed pruning behavior, and (optionally) stop training pruner entirely.
-        eff["teacher_forward_enable"] = True
-        eff["apply_repair"] = True
-
-        # Freeze pruner behavior (deterministic STE, no noise).
-        eff["gumbel_mode"] = eff.get("two_stage_stage2_gumbel_mode", "never")
-        # For gumbel_mode == "never", temperature = temperature_min.
-        if "two_stage_stage2_temperature_min" in eff:
-            eff["temperature_min"] = float(eff["two_stage_stage2_temperature_min"])
-        else:
-            # Reasonable default: align with the low-temp used at the end of hybrid schedule.
-            if "hybrid_phase1_temp_end" in eff:
-                eff["temperature_min"] = float(eff["hybrid_phase1_temp_end"])
-            elif "eval_temperature" in eff:
-                eff["temperature_min"] = float(eff["eval_temperature"])
-
-        # Stop task/sparsity gradients from touching pruner (and reduce compute in backward).
-        if "two_stage_stage2_task_loss_weight" in eff:
-            eff["task_loss_weight"] = float(eff["two_stage_stage2_task_loss_weight"])
-        if "two_stage_stage2_sparsity_weight" in eff:
-            eff["sparsity_weight"] = float(eff["two_stage_stage2_sparsity_weight"])
-        # Detach mask from attention so even if task_loss_weight>0 it won't update pruner.
-        eff["detach_adv_from_pruner"] = bool(eff.get("two_stage_stage2_detach_pruner_from_task", True))
-
-    return eff, {
-        "enabled": True,
-        "stage": stage,
-        "stage1_ratio": stage1_ratio,
-        "progress": progress,
-    }
 
 
 def compute_distribution_alignment_loss(
@@ -332,8 +263,7 @@ def train_step(
     Returns:
         包含 losses, stats, pruning_infos 的字典
     """
-    method_cfg_raw = config.method_settings
-    method_cfg, two_stage_info = _apply_two_stage_training_overrides(method_cfg_raw, current_step, total_steps)
+    method_cfg = config.method_settings
     adversarial_mode = method_cfg.get('adversarial_mode', 'none')  # 'none' | 'discriminator' | 'mse'（旧逻辑）
 
     # === Gumbel Mode 两阶段调度 ===
@@ -438,7 +368,7 @@ def train_step(
         'return_pruning_info': True,  # student 需要 pruning_infos 来算 sparsity
         'detach_h_fake_for_adv': detach_adv_from_pruner,
         'pruning_mode': 'normal',
-        'apply_repair': bool(method_cfg.get("apply_repair", True)),
+        'apply_repair': True,
         'capture_layers': capture_layers,
     }
 
@@ -464,8 +394,6 @@ def train_step(
         'temperature': current_temp,
         'use_gumbel_noise': use_gumbel_noise,
     }
-    if two_stage_info.get("enabled"):
-        stats["two_stage"] = two_stage_info
     if gumbel_mode == 'hybrid':
         stats['hybrid_phase'] = current_phase
 

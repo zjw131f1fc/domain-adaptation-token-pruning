@@ -210,20 +210,20 @@ method_settings:
   repair_delta_orth_weight: 0.0   # 惩罚 delta 在 target 正交方向的能量（推荐先调这个）
   repair_delta_frac_weight: 0.0   # 惩罚沿 target 方向的缩放偏差（让 frac≈1）
 
-  # ==================== Two-Stage Training（推荐用于“让 pruner 不依赖 adapter”）====================
-  # Stage 1：只训练 pruner（不启用 repair / teacher forward），让 pruner “真切感知 pruning gap”
-  # Stage 2：冻结 pruner 行为（deterministic, no-noise），只训练 repair adapter 去拟合残余偏差
-  two_stage_enable: true
-  # 默认建议：和 hybrid_phase2_end 对齐（进入 phase3/noise-off 后开始训练 adapter）
-  two_stage_stage1_ratio: 0.8
-  # Stage2：固定 pruner 行为（no gumbel noise + fixed temperature）
-  two_stage_stage2_gumbel_mode: never
-  two_stage_stage2_temperature_min: 0.5
-  # Stage2：只训练 adapter（避免 task/sparsity 继续改 pruner）
-  two_stage_stage2_task_loss_weight: 0.0
-  two_stage_stage2_sparsity_weight: 0.0
-  # Stage2：即便 task_loss_weight>0，也 detach mask，防止 pruner 被 task 牵着走
-  two_stage_stage2_detach_pruner_from_task: true
+  # ==================== Two-Step Training（真正“两步训练”）====================
+  # Stage 1：训练一个“只有 pruner”的模型（不插入 delayed repair adapter），并保存 pruner-only checkpoint
+  # Stage 2：重新构建带 delayed repair adapter 的模型，加载 Stage 1 的 pruner 权重并冻结 pruner，在稳定环境下 finetune adapter
+  # 退火/三阶段（hybrid phases / sparsity anneal）会按 Stage 1 的步数重新缩放，Stage 2 不再退火。
+  two_step_enable: true
+  # Stage 1 占总 optimizer steps 的比例（例如 0.8 表示前 80% 步数只训 pruner）
+  two_step_stage1_ratio: 0.8
+  # Stage 2：固定 pruning 行为（deterministic, no-noise）
+  two_step_stage2_gumbel_mode: never
+  two_step_stage2_temperature: 0.5
+  # Stage 2：不再对 sparsity 做优化（pruner 冻结），避免 target_kept_ratio 漂移干扰观察
+  two_step_stage2_sparsity_weight: 0.0
+  # Stage 2：adapter 学习率（默认不填则使用 pruner_lr）
+  two_step_stage2_lr: 1.0e-04
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
