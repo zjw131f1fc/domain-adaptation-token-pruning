@@ -282,10 +282,16 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         # 用户要求：qwen2-vl 先不动
         two_step_enable = False
 
+    two_step_start_stage = int(method_cfg.get("two_step_start_stage", 1))
+    if two_step_start_stage not in (1, 2):
+        two_step_start_stage = 1
+
     two_step_stage1_ratio = float(
         method_cfg.get("two_step_stage1_ratio", method_cfg.get("hybrid_phase2_end", 0.8))
     )
     two_step_stage1_ratio = max(0.0, min(1.0, two_step_stage1_ratio))
+    if two_step_enable and two_step_start_stage == 2 and two_step_stage1_ratio >= 1.0:
+        raise ValueError("[two_step_start_stage=2] requires two_step_stage1_ratio < 1.0 (otherwise stage2 has 0 steps).")
 
     stage1_config = config
     stage2_config = config
@@ -315,8 +321,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     torch.manual_seed(seed + rank)
 
     # 加载模型
-    active_config = stage1_config if two_step_enable else config
+    two_step_stage2_only = bool(two_step_enable and two_step_start_stage == 2)
+    if two_step_stage2_only and config.global_settings.get('checkpoint', None) is None:
+        raise ValueError(
+            "[two_step_start_stage=2] requires `global_settings.checkpoint` to point to a Stage 1 (pruner-only) checkpoint."
+        )
+    active_config = stage2_config if two_step_stage2_only else (stage1_config if two_step_enable else config)
     model, processor = load_model(active_config, device, local_rank)
+    if two_step_stage2_only:
+        # Stage 2 only: freeze pruner immediately; we'll train adapter on a fixed pruner.
+        for p in model.get_pruner_parameters():
+            p.requires_grad = False
 
     # 广播模型参数，确保所有进程的初始参数一致
     broadcast_model_params(model, src=0)
@@ -392,6 +407,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             stage2_steps = 0
         else:
             stage2_steps = total_steps - stage1_steps
+    if two_step_enable and two_step_start_stage == 2:
+        # Stage 2 only: run for the remaining budget (stage2_steps) only.
+        if stage2_steps <= 0:
+            raise ValueError("[two_step_start_stage=2] stage2_steps computed as 0; check stage1_ratio / total_steps.")
 
     # 创建 eval DataLoader 用于计算 eval loss（与 train 使用相同的 batch_size）
     eval_loss_loader = None
@@ -424,7 +443,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     # Stage 1 optimizer:
     # - normal: pruner + adapters together (legacy)
     # - two-step: pruner only
-    if two_step_enable:
+    if two_step_enable and two_step_start_stage == 2:
+        # Stage 2 only: adapter fine-tune optimizer (pruner is frozen).
+        adapter_lr = float(method_cfg.get("two_step_stage2_lr", pruner_lr))
+        adapter_params = list(model.get_repair_adapter_parameters()) if hasattr(model, "get_repair_adapter_parameters") else list(model.get_adapter_parameters())
+        if len(adapter_params) == 0:
+            raise RuntimeError(
+                "[two_step_enable] Stage 2 start requested, but no adapter parameters found. "
+                "Check `use_repair_adapter: true` and that repair modules are constructed."
+            )
+        pruner_optimizer = torch.optim.Adam(adapter_params, lr=adapter_lr, weight_decay=0.0)
+    elif two_step_enable:
         pruner_optimizer = torch.optim.Adam(model.get_pruner_parameters(), lr=pruner_lr, weight_decay=pruner_weight_decay)
     else:
         from itertools import chain
@@ -433,7 +462,7 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     # 判别器优化器（仅在 discriminator 模式下创建）
     adversarial_mode = method_cfg.get('adversarial_mode', 'discriminator')
-    if adversarial_mode == 'discriminator':
+    if adversarial_mode == 'discriminator' and not (two_step_enable and two_step_start_stage == 2):
         disc_optimizer = torch.optim.Adam(model.get_discriminator_parameters(), lr=disc_lr)
     else:
         disc_optimizer = None
@@ -447,6 +476,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
     pruner_scheduler = None
     disc_scheduler = None
+
+    # Stage 2 only: keep constant LR (no scheduler) for a stable adapter environment.
+    if (two_step_enable and two_step_start_stage == 2):
+        lr_scheduler_type = 'none'
 
     if lr_scheduler_type == 'cosine':
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -545,37 +578,45 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 if is_main_process():
                     logger.info("  Loaded disc_manager state")
 
-            # 加载优化器状态
-            if 'pruner_optimizer' in checkpoint:
-                pruner_optimizer.load_state_dict(checkpoint['pruner_optimizer'])
+            # Stage 2 only: treat checkpoint as Stage 1 pruner-only (or a base checkpoint),
+            # do not restore optimizer/scheduler/step state.
+            stage2_only = bool(two_step_enable and two_step_start_stage == 2)
+            if stage2_only:
+                start_step = 0
                 if is_main_process():
-                    logger.info("  Loaded pruner_optimizer state")
-
-            if 'disc_optimizer' in checkpoint and disc_optimizer is not None:
-                disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
-                if is_main_process():
-                    logger.info("  Loaded disc_optimizer state")
-
-            # 加载学习率调度器状态
-            reset_step = config.global_settings.get('reset_step_on_load', False)
-            if not reset_step:
-                if 'pruner_scheduler' in checkpoint and pruner_scheduler is not None:
-                    pruner_scheduler.load_state_dict(checkpoint['pruner_scheduler'])
+                    logger.info("  [two_step_start_stage=2] Skipped optimizer/scheduler/step restore; starting Stage 2 from step 0")
+            else:
+                # 加载优化器状态
+                if 'pruner_optimizer' in checkpoint:
+                    pruner_optimizer.load_state_dict(checkpoint['pruner_optimizer'])
                     if is_main_process():
-                        logger.info("  Loaded pruner_scheduler state")
+                        logger.info("  Loaded pruner_optimizer state")
 
-                if 'disc_scheduler' in checkpoint and disc_scheduler is not None:
-                    disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
+                if 'disc_optimizer' in checkpoint and disc_optimizer is not None:
+                    disc_optimizer.load_state_dict(checkpoint['disc_optimizer'])
                     if is_main_process():
-                        logger.info("  Loaded disc_scheduler state")
+                        logger.info("  Loaded disc_optimizer state")
 
-            # 恢复训练步数（如果 reset_step_on_load=True 则跳过）
-            if 'step' in checkpoint and not reset_step:
-                start_step = checkpoint['step']
-                if is_main_process():
-                    logger.info(f"  Resuming from step {start_step}")
-            elif reset_step and is_main_process():
-                logger.info("  Step counter reset to 0 (reset_step_on_load=True)")
+                # 加载学习率调度器状态
+                reset_step = config.global_settings.get('reset_step_on_load', False)
+                if not reset_step:
+                    if 'pruner_scheduler' in checkpoint and pruner_scheduler is not None:
+                        pruner_scheduler.load_state_dict(checkpoint['pruner_scheduler'])
+                        if is_main_process():
+                            logger.info("  Loaded pruner_scheduler state")
+
+                    if 'disc_scheduler' in checkpoint and disc_scheduler is not None:
+                        disc_scheduler.load_state_dict(checkpoint['disc_scheduler'])
+                        if is_main_process():
+                            logger.info("  Loaded disc_scheduler state")
+
+                # 恢复训练步数（如果 reset_step_on_load=True 则跳过）
+                if 'step' in checkpoint and not reset_step:
+                    start_step = checkpoint['step']
+                    if is_main_process():
+                        logger.info(f"  Resuming from step {start_step}")
+                elif reset_step and is_main_process():
+                    logger.info("  Step counter reset to 0 (reset_step_on_load=True)")
 
             # 重新广播模型参数确保一致性
             broadcast_model_params(model, src=0)
@@ -616,8 +657,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     global_step = start_step  # 优化器更新次数
     global_batch = start_step * grad_accum_steps  # 全局 batch 计数（用于 print/eval/save 判断）
     cached_origin_result = None
-    training_stage = 1
+    training_stage = 2 if (two_step_enable and two_step_start_stage == 2) else 1
     stage2_switched = False
+    if two_step_enable and two_step_start_stage == 2:
+        stage2_switched = True
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
@@ -644,12 +687,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
         if disc_optimizer is not None:
             disc_optimizer.zero_grad()
 
+        should_stop_training = False
         for batch in pbar:
             accum_step += 1
             is_accum_step = (accum_step % grad_accum_steps != 0)  # 是否是累积中间步
 
             # 训练步骤
-            if two_step_enable and training_stage == 1:
+            if two_step_enable and two_step_start_stage == 2:
+                # Stage 2 only: progress is simply global_step within Stage 2 budget.
+                stage_step = global_step
+                stage_total = max(1, stage2_steps)
+            elif two_step_enable and training_stage == 1:
                 stage_step = global_step
                 stage_total = stage1_steps
             elif two_step_enable and training_stage == 2:
@@ -802,6 +850,14 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     accum_step = 0
                     if dist.is_initialized():
                         dist.barrier()
+
+                # Stage 2 only: stop after running the allocated stage2_steps.
+                if two_step_enable and two_step_start_stage == 2 and global_step >= int(stage2_steps):
+                    if dist.is_initialized():
+                        dist.barrier()
+                    if is_main_process():
+                        logger.info(f"[two_step_start_stage=2] Reached Stage 2 budget: steps={global_step}/{stage2_steps}. Stopping training loop.")
+                    should_stop_training = True
 
             # 判别器重新初始化（只在累积结束时，且仅在 discriminator 模式下）
             # 注意：需要在所有进程间同步决策，避免死锁
@@ -1110,6 +1166,12 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             # 同步所有进程
             if dist.is_initialized():
                 dist.barrier()
+
+            if should_stop_training:
+                break
+
+        if should_stop_training:
+            break
 
         if is_main_process():
             logger.info(f"Epoch {epoch + 1} completed.")
