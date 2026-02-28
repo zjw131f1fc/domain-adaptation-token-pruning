@@ -55,7 +55,23 @@ def compute_distribution_alignment_loss(
         n = min(Xs.shape[0], Xt.shape[0])
         loss = F.mse_loss(Xs[:n], Xt[:n])
         if return_stats:
-            return loss, {'mse': float(loss.detach().item())}
+            # 为了和 mean_var 口径的日志对齐，这里也返回均值/方差的诊断信息（但不参与 loss）。
+            ms = Xs.mean(dim=0)
+            mt = Xt.mean(dim=0)
+            vs = Xs.var(dim=0, unbiased=False)
+            vt = Xt.var(dim=0, unbiased=False)
+            mean_loss = F.mse_loss(ms, mt)
+            var_loss = F.mse_loss(vs, vt)
+            stats = {
+                'mse': float(loss.detach().item()),
+                'mean_loss': float(mean_loss.detach().item()),
+                'var_loss': float(var_loss.detach().item()),
+                'student_var_mean': float(vs.mean().detach().item()),
+                'teacher_var_mean': float(vt.mean().detach().item()),
+                'var_ratio': float((vs.mean() / (vt.mean() + 1e-8)).detach().item()),
+                'cosine_sim': float(F.cosine_similarity(ms.unsqueeze(0), mt.unsqueeze(0)).detach().item()),
+            }
+            return loss, stats
         return loss
 
     # mean + diag(var) 对齐
