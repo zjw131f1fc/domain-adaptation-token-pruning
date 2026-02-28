@@ -216,6 +216,26 @@ method_settings:
   repair_delta_orth_weight: 10.0   # 强力抑制正交分量（不要求方向完全一致，但避免“越修越远”）
   repair_delta_frac_weight: 0.0   # 惩罚沿 target 方向的缩放偏差（让 frac≈1）
 
+  # ==================== Subspace Repair（低秩/子空间修复）====================
+  # 直觉：任务有效信息往往集中在少数关键子空间（例如你看到的 LDA 1D 方向），
+  # 全 4096 维对齐会允许 adapter 在大量“无关正交子空间”里引入漂移，从而让全局指标变差。
+  # 这里通过“gap-PCA”在 Stage2 开始时估计一个低秩基 B，并把 repair delta 投影到 span(B)。
+  # - enable: 是否开启子空间修复（Stage2 才会做校准）
+  # - rank: 子空间维度（越大越接近全空间，越小越强约束）
+  # - orth_scale: 正交残差保留比例（0=完全丢弃正交分量；1=等价于不投影）
+  # - calib_samples: 用多少训练样本估计子空间（只在 rank0 跑一遍，然后广播到各 rank）
+  # - calib_max_tokens_per_layer: 每层最多用多少 token 向量做 PCA（防止内存爆）
+  repair_subspace_enable: false
+  repair_subspace_rank: 64
+  repair_subspace_orth_scale: 0.0
+  repair_subspace_calib_samples: 128
+  repair_subspace_calib_max_tokens_per_layer: 8192
+  # 子空间口径是否在 next-LN 空间估计（默认 false；因为 delta 是在 pre-LN 空间施加的）
+  repair_subspace_apply_next_layernorm: false
+  # 如果 checkpoint 已经包含 basis，默认不重算；置 true 强制重算
+  repair_subspace_recompute: false
+  repair_subspace_seed: 42
+
   # ==================== Two-Step Training（真正“两步训练”）====================
   # Stage 1：训练一个“只有 pruner”的模型（不插入 delayed repair adapter），并保存 pruner-only checkpoint
   # Stage 2：重新构建带 delayed repair adapter 的模型，加载 Stage 1 的 pruner 权重并冻结 pruner，在稳定环境下 finetune adapter

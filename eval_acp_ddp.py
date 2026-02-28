@@ -99,6 +99,15 @@ def load_checkpoint(
             model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
             if logger:
                 logger.info("  Loaded repair_adapter_manager state")
+        if 'repair_subspace_basis_state' in checkpoint and hasattr(model, "set_repair_subspace_basis"):
+            try:
+                model.set_repair_subspace_basis(checkpoint['repair_subspace_basis_state'])
+                if logger:
+                    shapes = {k: tuple(v.shape) for k, v in checkpoint['repair_subspace_basis_state'].items()}
+                    logger.info(f"  Loaded repair_subspace_basis_state: {shapes}")
+            except Exception as e:
+                if logger:
+                    logger.warning(f"  Failed to load repair_subspace_basis_state: {e}")
 
     if logger:
         if 'step' in checkpoint:
@@ -377,6 +386,15 @@ def main():
                 model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
                 if logger:
                     logger.info("  Loaded repair_adapter_manager state")
+            if 'repair_subspace_basis_state' in checkpoint and hasattr(model, "set_repair_subspace_basis"):
+                try:
+                    model.set_repair_subspace_basis(checkpoint['repair_subspace_basis_state'])
+                    if logger:
+                        shapes = {k: tuple(v.shape) for k, v in checkpoint['repair_subspace_basis_state'].items()}
+                        logger.info(f"  Loaded repair_subspace_basis_state: {shapes}")
+                except Exception as e:
+                    if logger:
+                        logger.warning(f"  Failed to load repair_subspace_basis_state: {e}")
         if 'disc_state_dict' in checkpoint:
             model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
             if logger:

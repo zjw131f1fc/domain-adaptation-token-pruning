@@ -23,6 +23,7 @@ from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer
 from .adapter import AdapterManager, SeparatedAdapterManager, RepairContextEncoder
+from .subspace import project_onto_basis
 
 
 def build_vision_pruning_attention_mask(
@@ -149,6 +150,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         repair_apply_only_gen_tokens: bool = True,  # 只对 gen_answer tokens 计算/应用 repair（更省算力）
         # 训练稳定性：adapter 的输入是否 stop-grad（避免 repair loss/adapter 路径把梯度回流到 pruner）
         repair_detach_input: bool = True,
+        # ==================== Subspace Repair (low-rank) ====================
+        # 目标：只在“有效子空间”里修复 gap，抑制在大量无关正交维度里的漂移。
+        repair_subspace_enable: bool = False,
+        repair_subspace_rank: int = 64,
+        repair_subspace_orth_scale: float = 0.0,  # 0=完全丢弃正交分量；1=不做投影
     ):
         super().__init__()
 
@@ -163,6 +169,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.repair_detach_input = repair_detach_input
         self.repair_apply_only_gen_tokens = bool(repair_apply_only_gen_tokens)
         self.repair_context_use_q2v_relevance = bool(repair_context_use_q2v_relevance)
+        self.repair_subspace_enable = bool(repair_subspace_enable)
+        self.repair_subspace_rank = int(repair_subspace_rank)
+        self.repair_subspace_orth_scale = float(repair_subspace_orth_scale)
+        # layer_idx -> buffer name (registered via set_repair_subspace_basis)
+        self._repair_subspace_basis_names: Dict[int, str] = {}
 
         # 获取 LLM 配置
         llm_config = self.config.text_config
@@ -283,6 +294,53 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
         # 替换所有层为 PrunableLlamaDecoderLayer（剪枝层有 pruner，非剪枝层没有）
         self._replace_all_layers()
+
+    def set_repair_subspace_basis(self, basis_by_layer: Dict[int, torch.Tensor]):
+        """Attach per-layer subspace bases used to project repair deltas.
+
+        Args:
+            basis_by_layer: {layer_idx: (hidden_size, r)}. basis columns should be (approx) orthonormal.
+        """
+        if not isinstance(basis_by_layer, dict):
+            raise TypeError(f"basis_by_layer must be a dict, got {type(basis_by_layer)}")
+
+        for layer_idx, basis in basis_by_layer.items():
+            layer_idx = int(layer_idx)
+            if basis is None:
+                continue
+            if basis.dim() != 2:
+                raise ValueError(f"basis for layer {layer_idx} must be 2D (D,r), got {tuple(basis.shape)}")
+            if int(basis.shape[0]) != int(self.hidden_size):
+                raise ValueError(
+                    f"basis D mismatch at layer {layer_idx}: basis.shape[0]={int(basis.shape[0])} "
+                    f"!= hidden_size={int(self.hidden_size)}"
+                )
+            buf_name = f"repair_subspace_basis_layer{layer_idx}"
+            basis_t = basis.to(device=self.device, dtype=torch.float32).contiguous()
+            if hasattr(self, buf_name):
+                getattr(self, buf_name).data.copy_(basis_t)
+            else:
+                self.register_buffer(buf_name, basis_t, persistent=True)
+            self._repair_subspace_basis_names[layer_idx] = buf_name
+        # If a basis is provided, it is almost always intended to be used.
+        if basis_by_layer:
+            self.repair_subspace_enable = True
+
+    def get_repair_subspace_basis(self, layer_idx: int) -> Optional[torch.Tensor]:
+        name = self._repair_subspace_basis_names.get(int(layer_idx), None)
+        if name is None:
+            return None
+        return getattr(self, name, None)
+
+    def get_repair_subspace_state(self) -> Dict[int, torch.Tensor]:
+        """Return a CPU float32 copy for checkpoint serialization."""
+        out: Dict[int, torch.Tensor] = {}
+        for layer_idx, name in self._repair_subspace_basis_names.items():
+            basis = getattr(self, name, None)
+            if basis is None:
+                continue
+            out[int(layer_idx)] = basis.detach().float().cpu()
+        return out
 
     def _replace_all_layers(self):
         """替换所有层为 PrunableLlamaDecoderLayer
@@ -689,6 +747,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             context_tokens=ctx.get("context_tokens"),
                         )
                         delta_ans = adapted_ans - ans_in
+                        if self.repair_subspace_enable:
+                            basis = self.get_repair_subspace_basis(layer_idx)
+                            if basis is not None:
+                                delta_ans = project_onto_basis(
+                                    delta_ans,
+                                    basis,
+                                    orth_scale=self.repair_subspace_orth_scale,
+                                )
 
                         # Apply to task forward (base keeps its graph if detach_input=False)
                         hidden_states = base.clone()
@@ -719,6 +785,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                             context_tokens=ctx.get("context_tokens"),
                         )
                         delta = adapted - adapter_in_full
+                        if self.repair_subspace_enable:
+                            basis = self.get_repair_subspace_basis(layer_idx)
+                            if basis is not None:
+                                delta = project_onto_basis(
+                                    delta,
+                                    basis,
+                                    orth_scale=self.repair_subspace_orth_scale,
+                                )
                         # task forward：允许梯度通过 base（用于训练 pruner），delta 梯度只回到 adapter（若 detach_input=True）
                         hidden_states = base + gen_mask_full.unsqueeze(-1) * delta
                         # repair loss：stop-grad base，避免 repair 目标回流到 pruner
@@ -937,6 +1011,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         """移动到指定设备"""
         super().to(device)
         self.base_model.to(device)
+        # Ensure subspace bases follow device moves.
+        for layer_idx, name in list(getattr(self, "_repair_subspace_basis_names", {}).items()):
+            basis = getattr(self, name, None)
+            if basis is not None and basis.device != device:
+                setattr(self, name, basis.to(device=device))
         return self
 
     @property

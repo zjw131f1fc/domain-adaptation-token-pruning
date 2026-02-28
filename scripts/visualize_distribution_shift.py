@@ -129,6 +129,10 @@ def load_model_and_processor(checkpoint_path, config_path, device):
         repair_context_dropout=float(method_cfg.get('repair_context_dropout', 0.0)),
         repair_context_use_q2v_relevance=bool(method_cfg.get('repair_context_use_q2v_relevance', False)),
         repair_apply_only_gen_tokens=bool(method_cfg.get('repair_apply_only_gen_tokens', True)),
+        # Subspace repair (optional)
+        repair_subspace_enable=bool(method_cfg.get('repair_subspace_enable', False)),
+        repair_subspace_rank=int(method_cfg.get('repair_subspace_rank', 64)),
+        repair_subspace_orth_scale=float(method_cfg.get('repair_subspace_orth_scale', 0.0)),
     )
 
     model.freeze_base_model()
@@ -148,6 +152,13 @@ def load_model_and_processor(checkpoint_path, config_path, device):
     if 'repair_adapter_state_dict' in checkpoint and model.use_repair_adapter:
         model.repair_adapter_manager.load_state_dict(checkpoint['repair_adapter_state_dict'])
         print("  Loaded repair_adapter_state_dict")
+
+    if 'repair_subspace_basis_state' in checkpoint and hasattr(model, "set_repair_subspace_basis"):
+        try:
+            model.set_repair_subspace_basis(checkpoint['repair_subspace_basis_state'])
+            print("  Loaded repair_subspace_basis_state")
+        except Exception as e:
+            print(f"  [Warning] Failed to load repair_subspace_basis_state: {e}")
 
     model.eval()
     print("Model loaded.")

@@ -49,7 +49,7 @@ from engine.distributed import (
     reduce_mean, sync_gradients, broadcast_model_params
 )
 from engine.data_utils import preprocess_batch, SimpleDataset, collate_fn
-from engine.train_utils import compute_task_loss, train_step
+from engine.train_utils import compute_task_loss, train_step, _flatten_masked, _get_next_input_layernorm
 from engine.eval_utils import evaluate
 
 
@@ -137,6 +137,11 @@ def load_model(config, device: torch.device, local_rank: int):
     repair_context_dropout = float(method_cfg.get('repair_context_dropout', 0.0))
     repair_context_use_q2v_relevance = bool(method_cfg.get('repair_context_use_q2v_relevance', False))
     repair_apply_only_gen_tokens = bool(method_cfg.get('repair_apply_only_gen_tokens', True))
+
+    # Subspace repair (low-rank): constrain repair deltas to a calibrated subspace.
+    repair_subspace_enable = bool(method_cfg.get('repair_subspace_enable', False))
+    repair_subspace_rank = int(method_cfg.get('repair_subspace_rank', 64))
+    repair_subspace_orth_scale = float(method_cfg.get('repair_subspace_orth_scale', 0.0))
 
     # Pruner query dropout
     pruner_query_dropout = method_cfg.get('pruner_query_dropout', 0.0)
@@ -256,6 +261,9 @@ def load_model(config, device: torch.device, local_rank: int):
             repair_context_use_q2v_relevance=repair_context_use_q2v_relevance,
             repair_apply_only_gen_tokens=repair_apply_only_gen_tokens,
             repair_detach_input=repair_detach_input,
+            repair_subspace_enable=repair_subspace_enable,
+            repair_subspace_rank=repair_subspace_rank,
+            repair_subspace_orth_scale=repair_subspace_orth_scale,
         )
 
     # 冻结基础模型
@@ -268,6 +276,209 @@ def load_model(config, device: torch.device, local_rank: int):
                    f"Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
 
     return model, processor
+
+
+def _build_calib_loader(
+    train_wrapper: torch.utils.data.Dataset,
+    *,
+    num_samples: int,
+    batch_size: int,
+    seed: int,
+):
+    """Build a small deterministic calibration DataLoader on rank0."""
+    import random
+    from torch.utils.data import DataLoader, Subset
+
+    n = len(train_wrapper)
+    if n <= 0:
+        return None
+    num_samples = max(1, min(int(num_samples), n))
+
+    indices = list(range(n))
+    rng = random.Random(int(seed))
+    rng.shuffle(indices)
+    indices = indices[:num_samples]
+
+    subset = Subset(train_wrapper, indices)
+    return DataLoader(
+        subset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+
+def maybe_calibrate_repair_subspace(model, processor, train_wrapper, config, device: torch.device):
+    """Calibrate per-layer gap-PCA subspace bases and broadcast to all ranks.
+
+    Runs only when `method_settings.repair_subspace_enable: true`.
+    Intended for Stage 2 (adapter fine-tune) when the pruner is frozen and deterministic.
+    """
+    logger = config.logger if is_main_process() else None
+    method_cfg = config.method_settings
+    backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
+    if 'qwen2-vl' in backbone_name.lower():
+        return
+
+    if not bool(method_cfg.get("repair_subspace_enable", False)):
+        return
+    if not getattr(model, "use_repair_adapter", False):
+        if logger:
+            logger.warning("[repair_subspace_enable] is ON but use_repair_adapter is OFF; skipping subspace calibration.")
+        return
+    if not hasattr(model, "set_repair_subspace_basis"):
+        if logger:
+            logger.warning("[repair_subspace_enable] Model has no set_repair_subspace_basis(); skipping.")
+        return
+
+    repair_layers = list(method_cfg.get("repair_layers", []) or [])
+    if not repair_layers:
+        return
+
+    # If already loaded from checkpoint, only recompute when explicitly requested.
+    recompute = bool(method_cfg.get("repair_subspace_recompute", False))
+    has_existing = bool(getattr(model, "_repair_subspace_basis_names", {}))
+    if has_existing and (not recompute):
+        if logger:
+            logger.info("[repair_subspace] Basis already exists (likely loaded from checkpoint); skip calibration.")
+        return
+
+    # Calibration config
+    calib_samples = int(method_cfg.get("repair_subspace_calib_samples", 128))
+    calib_max_tokens = int(method_cfg.get("repair_subspace_calib_max_tokens_per_layer", 8192))
+    subspace_rank = int(method_cfg.get("repair_subspace_rank", 64))
+    calib_seed = int(method_cfg.get("repair_subspace_seed", config.global_settings.get("seed", 42)))
+    apply_next_ln = bool(method_cfg.get("repair_subspace_apply_next_layernorm", method_cfg.get("repair_loss_apply_next_layernorm", False)))
+
+    trainer_cfg = config.trainer_settings.get('dl_settings', {})
+    batch_size = int(trainer_cfg.get('batch_size', 1))
+    max_length = int(trainer_cfg.get('max_length', 1024))
+
+    calib_loader = None
+    if is_main_process():
+        calib_loader = _build_calib_loader(
+            train_wrapper,
+            num_samples=calib_samples,
+            batch_size=batch_size,
+            seed=calib_seed,
+        )
+        if calib_loader is None:
+            if logger:
+                logger.warning("[repair_subspace] Calibration loader is None; skipping.")
+            return
+
+    basis_by_layer_cpu = None
+    if is_main_process():
+        from method.models.subspace import compute_gap_pca_basis
+
+        gap_buf = {int(l): None for l in repair_layers}  # layer -> (N,D) CPU float32
+
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                for batch in calib_loader:
+                    prep = preprocess_batch(batch, processor, device, max_length=max_length)
+                    inputs = prep["inputs"]
+
+                    common = {
+                        "input_ids": inputs["input_ids"],
+                        "pixel_values": inputs["pixel_values"],
+                        "attention_mask": inputs["attention_mask"],
+                        "vision_start": prep["vision_start"],
+                        "vision_end": prep["vision_end"],
+                        "question_starts": prep["question_starts"],
+                        "question_ends": prep["question_ends"],
+                        "answer_starts": prep.get("answer_starts", None),
+                        "answer_ends": prep.get("answer_ends", None),
+                        "return_pruning_info": False,
+                        "detach_h_fake_for_adv": False,
+                        "capture_layers": repair_layers,
+                        # critical: pre-repair gap
+                        "apply_repair": False,
+                    }
+
+                    student_out = model(pruning_mode="normal", **common)
+                    teacher_out = model(pruning_mode=method_cfg.get("teacher_pruning_mode", "keep_all"), **common)
+
+                    s_caps = student_out.captured or {}
+                    t_caps = teacher_out.captured or {}
+                    for layer_idx in repair_layers:
+                        if layer_idx not in s_caps or layer_idx not in t_caps:
+                            continue
+                        s = s_caps[layer_idx]
+                        t = t_caps[layer_idx]
+                        m = (s["mask"] * t["mask"]).to(dtype=torch.bool)
+                        s_h = s["h"]
+                        t_h = t["h"]
+                        if apply_next_ln:
+                            ln = _get_next_input_layernorm(model, layer_idx)
+                            s_h = ln(s_h)
+                            t_h = ln(t_h)
+                        gap = _flatten_masked(t_h - s_h, m).float().cpu()
+                        if gap.numel() == 0:
+                            continue
+                        prev = gap_buf[int(layer_idx)]
+                        cur = gap if prev is None else torch.cat([prev, gap], dim=0)
+                        if int(cur.shape[0]) > calib_max_tokens:
+                            perm = torch.randperm(int(cur.shape[0]))[:calib_max_tokens]
+                            cur = cur[perm]
+                        gap_buf[int(layer_idx)] = cur
+
+            basis_by_layer_cpu = {}
+            for layer_idx in repair_layers:
+                X = gap_buf.get(int(layer_idx), None)
+                if X is None or int(X.shape[0]) < 8:
+                    continue
+                try:
+                    B = compute_gap_pca_basis(X, rank=subspace_rank, center=True, niter=2)  # (D,q)
+                except Exception as e:
+                    if logger:
+                        logger.warning(f"[repair_subspace] PCA failed at layer {layer_idx}: {e}")
+                    continue
+                basis_by_layer_cpu[int(layer_idx)] = B  # CPU float32
+
+            if logger:
+                shapes = {k: tuple(v.shape) for k, v in basis_by_layer_cpu.items()}
+                logger.info(f"[repair_subspace] Calibrated gap-PCA bases: {shapes} (apply_next_ln={apply_next_ln})")
+        finally:
+            if was_training:
+                model.train()
+
+    # Broadcast to all ranks: first broadcast effective rank q per layer, then basis values.
+    basis_out = {}
+    for layer_idx in repair_layers:
+        layer_idx = int(layer_idx)
+        q = 0
+        if is_main_process() and basis_by_layer_cpu is not None and layer_idx in basis_by_layer_cpu:
+            q = int(basis_by_layer_cpu[layer_idx].shape[1])
+        q_t = torch.tensor([q], device=device, dtype=torch.int64)
+        if dist.is_initialized():
+            dist.broadcast(q_t, src=0)
+        q = int(q_t.item())
+        if q <= 0:
+            continue
+
+        if is_main_process() and basis_by_layer_cpu is not None and layer_idx in basis_by_layer_cpu:
+            B = basis_by_layer_cpu[layer_idx].to(device=device, dtype=torch.float32)
+        else:
+            hidden = int(getattr(model, "hidden_size", 4096))
+            B = torch.zeros(hidden, q, device=device, dtype=torch.float32)
+        if dist.is_initialized():
+            dist.broadcast(B, src=0)
+        basis_out[layer_idx] = B
+
+    if basis_out:
+        model.set_repair_subspace_basis(basis_out)
+        if dist.is_initialized():
+            dist.barrier()
+        if logger:
+            logger.info(
+                f"[repair_subspace] Enabled. rank={subspace_rank}, orth_scale={float(method_cfg.get('repair_subspace_orth_scale', 0.0))} "
+                f"layers={sorted(list(basis_out.keys()))}"
+            )
 
 
 
@@ -583,6 +794,17 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     if is_main_process():
                         logger.info("  Loaded repair_adapter_manager state")
 
+            # Subspace repair basis (optional)
+            if 'repair_subspace_basis_state' in checkpoint and hasattr(model, "set_repair_subspace_basis"):
+                try:
+                    model.set_repair_subspace_basis(checkpoint['repair_subspace_basis_state'])
+                    if is_main_process():
+                        shapes = {k: tuple(v.shape) for k, v in checkpoint['repair_subspace_basis_state'].items()}
+                        logger.info(f"  Loaded repair_subspace_basis_state: {shapes}")
+                except Exception as e:
+                    if is_main_process():
+                        logger.warning(f"  Failed to load repair_subspace_basis_state: {e}")
+
             if 'disc_state_dict' in checkpoint:
                 model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
                 if is_main_process():
@@ -671,6 +893,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
     stage2_switched = False
     if two_step_enable and two_step_start_stage == 2:
         stage2_switched = True
+        # Stage 2 only: optionally calibrate low-rank subspace bases before training starts.
+        maybe_calibrate_repair_subspace(model, processor, train_wrapper, active_config, device)
 
     # 统计每层的保留数量（用于推荐 topk_ks）
     layer_kept_counts = {idx: [] for idx in pruning_layers}  # {layer_idx: [n_kept_per_batch, ...]}
@@ -853,6 +1077,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
 
                     # Re-broadcast to ensure consistent params across ranks.
                     broadcast_model_params(model, src=0)
+                    # Optional: calibrate subspace bases for low-rank repair (rank0 computes + broadcast).
+                    maybe_calibrate_repair_subspace(model, processor, train_wrapper, active_config, device)
 
                     training_stage = 2
                     stage2_switched = True
@@ -1183,6 +1409,11 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         ckpt_data['repair_context_encoder_state_dict'] = model.repair_context_encoder.state_dict()
                     if getattr(model, 'repair_adapter_manager', None) is not None:
                         ckpt_data['repair_adapter_state_dict'] = model.repair_adapter_manager.state_dict()
+                    # Optional: calibrated low-rank subspace basis
+                    if hasattr(model, "get_repair_subspace_state"):
+                        subspace_state = model.get_repair_subspace_state()
+                        if subspace_state:
+                            ckpt_data["repair_subspace_basis_state"] = subspace_state
                 if pruner_scheduler is not None:
                     ckpt_data['pruner_scheduler'] = pruner_scheduler.state_dict()
                 if disc_scheduler is not None:
@@ -1221,6 +1452,10 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 final_ckpt['repair_context_encoder_state_dict'] = model.repair_context_encoder.state_dict()
             if getattr(model, 'repair_adapter_manager', None) is not None:
                 final_ckpt['repair_adapter_state_dict'] = model.repair_adapter_manager.state_dict()
+            if hasattr(model, "get_repair_subspace_state"):
+                subspace_state = model.get_repair_subspace_state()
+                if subspace_state:
+                    final_ckpt["repair_subspace_basis_state"] = subspace_state
         torch.save(final_ckpt, final_path)
         logger.info(f"Training completed. Final checkpoint saved to {final_path}")
 
