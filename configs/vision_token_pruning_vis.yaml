@@ -112,35 +112,9 @@ method_settings:
   disc_reinit_threshold: 0.97     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
-  # ==================== 旧版 Adapter（注意：当前实验禁用） ====================
-  # 旧版 adapter 是“同层、attn output 立即修复”；我们现在做的是 delayed repair（只修复 gen_answer tokens）
-  use_adapter: false
-
-  # Adapter 补偿剪枝后的信息损失
-  # - simple: 简单 MLP adapter
-  # - lightweight: Mask-Aware FiLM adapter（轻量级，根据剪枝 pattern 动态调整）
-  adapter_type: lightweight
-  adapter_bottleneck: 512         # 保留字段（旧版 adapter 不启用时无效）
-
-  # Mask encoder 类型
-  # - attention: Attention 池化（更轻量，保留空间信息）
-  # - linear: 原始 Linear encoder（向后兼容）
-  mask_encoder_type: attention
-  adapter_dropout: 0  # Adapter 的 dropout 比例
-
-  # 被剪枝信息：是否使用被剪枝 token 的信息来补偿
-  use_pruned_info: true  # 启用后，Adapter 会接收被剪枝 tokens 的聚合表示
-
-  # 分离式 Adapter：为 vision/text tokens 使用独立的 Adapter
-  # text_adapter 同时处理 question 和 answer tokens
-  use_separated_adapters: false   # 旧版字段（当前实验无效）
-  vision_adapter_bottleneck: 512  # vision tokens adapter 瓶颈维度
-  text_adapter_bottleneck: 512    # text tokens adapter 瓶颈维度（包含 question 和 answer）
-
-  # Adversarial Loss 梯度控制
-  # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
-  # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
-  detach_adv_from_pruner: false  # legacy（当前无对抗训练）
+  # ==================== 梯度控制（可选） ====================
+  # 如果为 true，会把用于 masking 的 cumulative vision mask 在 attention 里 detach。
+  detach_adv_from_pruner: false  # 当前默认关闭
 
   # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
   use_repair_adapter: true

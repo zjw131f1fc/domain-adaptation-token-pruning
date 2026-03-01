@@ -104,22 +104,8 @@ method_settings:
   disc_reinit_threshold: 0.97     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
-  # ==================== Adapter 配置 ====================
-  # Adapter 补偿剪枝后的信息损失
-  # - simple: 简单 MLP adapter
-  # - lightweight: Mask-Aware FiLM adapter（轻量级，根据剪枝 pattern 动态调整）
-  adapter_type: lightweight
-  adapter_bottleneck: 512         # adapter 瓶颈维度（统一 adapter 模式）
-
-  # 分离式 Adapter：为 vision/text/generator tokens 使用独立的 Adapter
-  use_separated_adapters: true   # 是否启用分离式 Adapter
-  vision_adapter_bottleneck: 512  # vision tokens adapter 瓶颈维度
-  text_adapter_bottleneck: 512    # text tokens adapter 瓶颈维度
-  generator_adapter_bottleneck: 512  # generator tokens adapter 瓶颈维度（生成 answer 的 token）
-
-  # Adversarial Loss 梯度控制
-  # 如果为 true，adv_loss 只传导到 adapter，不传导到 pruner
-  # 这样 pruner 只受 task_loss 和 sparsity_loss 监督
+  # ==================== 梯度控制（可选） ====================
+  # 如果为 true，会把用于 masking 的 cumulative vision mask 在 attention 里 detach。
   detach_adv_from_pruner: true
 
   # ==================== Pruner Warmup ====================

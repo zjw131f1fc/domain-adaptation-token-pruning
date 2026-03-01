@@ -94,13 +94,6 @@ method_settings:
   disc_reinit_threshold: 0.95     # threshold 模式：准确率超过此阈值时重新初始化
   disc_reinit_prob: 0.001          # random 模式：每步重初始化的概率
 
-  # ==================== Adapter 配置 ====================
-  # Adapter 补偿剪枝后的信息损失
-  # - simple: 简单 MLP adapter
-  # - lightweight: Mask-Aware FiLM adapter（轻量级，根据剪枝 pattern 动态调整）
-  adapter_type: lightweight
-  adapter_bottleneck: 512         # adapter 瓶颈维度
-
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0.05  # 前 10% 步数不做对抗训练
 
