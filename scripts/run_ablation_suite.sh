@@ -24,6 +24,11 @@ if [[ -z "$GPU_IDS" ]]; then
   echo "Error: GPU_IDS is required (use your 2 GPUs), e.g. '4,5'." >&2
   exit 1
 fi
+NUM_GPUS="$(echo "$GPU_IDS" | tr ',' '\n' | wc -l | tr -d ' ')"
+if [[ "$NUM_GPUS" != "2" ]]; then
+  echo "Error: this suite expects exactly 2 GPUs (got '$GPU_IDS' => $NUM_GPUS GPUs)." >&2
+  exit 1
+fi
 
 # Base configs (user-provided)
 BASE_TRAIN_CFG="configs/vision_token_pruning.yaml"
