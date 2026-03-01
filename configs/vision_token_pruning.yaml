@@ -201,7 +201,7 @@ method_settings:
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 192  # 目标保留的 vision token 数量
+  target_token_num: 128  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
@@ -230,7 +230,7 @@ method_settings:
 
   task_loss_weight: 1.5
   adv_loss_weight: 1.0
-  sparsity_weight: 40.0   # 提高到 5.0，让 sparsity loss 有足够影响力
+  sparsity_weight: 80.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens
   # 可以是单个值（所有层相同）或 list（对应 pruning_layers 的每一层）

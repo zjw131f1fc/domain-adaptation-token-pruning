@@ -70,8 +70,8 @@ backbone_settings:
 method_settings:
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  # pruning_layers: [1,13,25]
-  pruning_layers: [4,14,24]
+  pruning_layers: [1,13,25]
+  # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -179,7 +179,7 @@ method_settings:
   # L24 之后：修复点放在 29
   repair_layers: [12, 22, 29]
   # repair 上下文来源（与 repair_layers 一一对应）
-  repair_source_layers: [4, 14, 24]
+  repair_source_layers: [1,13,25]
   repair_bottleneck_dim: 512
   repair_dropout: 0.0
   repair_mask_encoder_type: attention
@@ -230,7 +230,7 @@ method_settings:
 
   task_loss_weight: 1.5
   adv_loss_weight: 1.0
-  sparsity_weight: 40.0   # 提高到 5.0，让 sparsity loss 有足够影响力
+  sparsity_weight: 80.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens
   # 可以是单个值（所有层相同）或 list（对应 pruning_layers 的每一层）
