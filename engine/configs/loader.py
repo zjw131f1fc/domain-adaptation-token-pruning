@@ -150,8 +150,6 @@ AUTO_NAME_FIELDS = [
 # ==================== 模型维度映射 ====================
 # 根据 backbone 名称自动设置 hidden_dim 和 vision_dim
 BACKBONE_DIM_MAP = {
-    "qwen2-vl-2b": {"hidden_dim": 1536, "vision_dim": 1536, "model_type": "qwen2_vl"},
-    "qwen2-vl-7b": {"hidden_dim": 3584, "vision_dim": 3584, "model_type": "qwen2_vl"},
     "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 1024, "model_type": "llava"},
     "llava-1.5-13b": {"hidden_dim": 5120, "vision_dim": 1024, "model_type": "llava"},
 }
@@ -254,8 +252,8 @@ def _auto_normalize_types(config: Dict[str, Any], default_config: Dict[str, Any]
 def _generate_experiment_tag(config: Dict[str, Any]) -> str:
     """生成实验标签，格式：[study_name_]timestamp_dataset_backbone_random
     
-    示例: 20251126-1941_vqa-mme_qwen253b_a7f2
-    或: baseline_20251126-1941_vqa-mme_qwen253b_a7f2
+    示例: 20251126-1941_vqa-mme_llava7b_a7f2
+    或: baseline_20251126-1941_vqa-mme_llava7b_a7f2
     """
     # 1. 时间戳（年月日-时分）- 放在最前方便排序
     timestamp = datetime.now().strftime('%Y%m%d-%H%M')

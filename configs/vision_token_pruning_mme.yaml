@@ -68,6 +68,12 @@ backbone_settings:
   name: "llava-1.5-7b"
 
 method_settings:
+  # ==================== Ablation（论文消融开关，默认全关）====================
+  ablation_w_o_pruner_topk_attn: false
+  ablation_w_o_adapter: false
+  ablation_w_o_repair_loss: false
+  ablation_repair_mean_only: false
+
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
   # pruning_layers: [1,13,25]

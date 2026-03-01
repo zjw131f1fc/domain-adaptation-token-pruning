@@ -21,7 +21,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaDecoderLay
 from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer
-from .adapter import AdapterManager, SeparatedAdapterManager, RepairContextEncoder
+from .adapter import AdapterManager, RepairContextEncoder
 
 
 def build_vision_pruning_attention_mask(
@@ -114,19 +114,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         pruner_n_queries: int = 4,
         pruner_query_dropout: float = 0.0,  # Query-wise dropout
         disc_d_hidden: int = 256,
-        use_adapter: bool = True,  # 是否使用 Adapter
-        adapter_bottleneck: int = None,  # adapter 瓶颈维度，None 则为 hidden_size // 4
-        adapter_type: str = 'lightweight',    # adapter 类型: 'simple' 或 'lightweight'
-        use_separated_adapters: bool = False,  # 是否使用分离式 Adapter
-        vision_adapter_bottleneck: int = 256,  # vision adapter 瓶颈维度
-        text_adapter_bottleneck: int = 256,    # text adapter 瓶颈维度
-        generator_adapter_bottleneck: int = 512,  # generator adapter 瓶颈维度
-        adapter_alpha_init: float = 0.1,  # adapter 输出缩放初始化
-        adapter_delta_weight: float = 0.0,  # adapter 修正幅度正则权重
-        mask_encoder_type: str = 'attention',  # mask encoder 类型: 'attention' 或 'linear'
         temperature: float = 1.0,
         dropout: float = 0.1,
-        adapter_dropout: float = 0.15,  # Adapter 专用 dropout
         disc_use_spectral_norm: bool = False,
         use_gumbel_noise: bool = True,  # 是否使用 Gumbel noise
         pruning_threshold: float = 0.5,  # sigmoid 后的剪枝阈值
@@ -143,6 +132,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         repair_alpha_init: float = 0.1,
         # 训练稳定性：adapter 的输入是否 stop-grad（避免 repair loss/adapter 路径把梯度回流到 pruner）
         repair_detach_input: bool = True,
+        **kwargs,
     ):
         super().__init__()
 
@@ -151,7 +141,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.config = base_model.config
         self.pruning_layers = pruning_layers
         self.use_question_condition = use_question_condition
-        self.use_adapter = use_adapter
         self.use_repair_adapter = use_repair_adapter
         self.repair_layers = list(repair_layers) if repair_layers is not None else []
         self.repair_detach_input = repair_detach_input
@@ -186,41 +175,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             dropout=dropout,
             use_spectral_norm=disc_use_spectral_norm
         )
-
-        # 创建 Adapters
-        self.use_separated_adapters = use_separated_adapters
-        if use_adapter:
-            if use_separated_adapters:
-                self.separated_adapter_manager = SeparatedAdapterManager(
-                    layer_indices=pruning_layers,
-                    hidden_size=self.hidden_size,
-                    vision_bottleneck_dim=vision_adapter_bottleneck,
-                    text_bottleneck_dim=text_adapter_bottleneck,
-                    answer_bottleneck_dim=generator_adapter_bottleneck,
-                    n_vision=576,
-                    dropout=adapter_dropout,
-                    mask_encoder_type=mask_encoder_type,
-                    adapter_alpha_init=adapter_alpha_init,
-                    track_delta_loss=adapter_delta_weight > 0,
-                )
-                self.adapter_manager = None
-            else:
-                self.adapter_manager = AdapterManager(
-                    layer_indices=pruning_layers,
-                    hidden_size=self.hidden_size,
-                    bottleneck_dim=adapter_bottleneck,
-                    adapter_type=adapter_type,
-                    n_vision=576,  # LLaVA 1.5 的 vision token 数量
-                    mask_encoder_type=mask_encoder_type,
-                    dropout=adapter_dropout,
-                    adapter_alpha_init=adapter_alpha_init,
-                    track_delta_loss=adapter_delta_weight > 0,
-                )
-                self.separated_adapter_manager = None
-        else:
-            # 不使用 Adapter
-            self.adapter_manager = None
-            self.separated_adapter_manager = None
 
         # ==================== Delayed Repair Adapter（语言侧，仅 gen_answer tokens）====================
         # - pruning layer: 缓存修复上下文 (mask_emb, pruned_emb)
@@ -297,27 +251,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 pruner.to(device=layer_device, dtype=layer_dtype)
                 discriminator.to(device=layer_device, dtype=layer_dtype)
 
-                if self.use_adapter:
-                    if self.use_separated_adapters:
-                        separated_adapters = self.separated_adapter_manager.get_adapters(layer_idx)
-                        for adapter in separated_adapters:
-                            adapter.to(device=layer_device, dtype=layer_dtype)
-                        adapter = None
-                    else:
-                        adapter = self.adapter_manager.get_adapter(layer_idx)
-                        adapter.to(device=layer_device, dtype=layer_dtype)
-                        separated_adapters = None
-                else:
-                    adapter = None
-                    separated_adapters = None
-
                 llm.layers[layer_idx] = PrunableLlamaDecoderLayer(
                     original_layer=original_layer,
                     layer_idx=layer_idx,
                     pruner=pruner,
                     discriminator=discriminator,
-                    adapter=adapter,
-                    separated_adapters=separated_adapters,
                     repair_context_encoder=self.repair_context_encoder,
                 )
             else:
@@ -327,8 +265,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     layer_idx=layer_idx,
                     pruner=None,
                     discriminator=None,
-                    adapter=None,
-                    separated_adapters=None,
                     repair_context_encoder=None,
                 )
 
@@ -395,7 +331,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         answer_ends: Optional[list] = None,
         return_pruning_info: bool = True,
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
-        pruning_mode: str = "normal",  # 'normal' | 'keep_all'（teacher baseline）
+        pruning_mode: str = "normal",  # 'normal' | 'keep_all' | 'topk_attn'
+        target_token_num: Optional[int] = None,  # topk_attn 模式需要
         apply_repair: Optional[bool] = None,  # None=根据 self.use_repair_adapter 自动决定
         capture_layers: Optional[List[int]] = None,  # 需要返回哪些层的 gen_answer 表征
         **kwargs
@@ -469,6 +406,33 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             )
         else:
             cumulative_mask = None
+
+        # === w/o pruner baseline：top-k attention schedule（逐 pruning layer 逐步收缩到 target_token_num）===
+        topk_schedule = None
+        if pruning_mode == "topk_attn":
+            if target_token_num is None:
+                raise ValueError("topk_attn mode requires `target_token_num`.")
+            K = int(target_token_num)
+            N = int(n_vision_orig)
+            if N <= 0:
+                raise ValueError("topk_attn mode requires valid vision_start/vision_end (N>0).")
+            pruning_layers_sorted = sorted([int(x) for x in (self.pruning_layers or [])])
+            if not pruning_layers_sorted:
+                raise ValueError("topk_attn mode requires non-empty pruning_layers.")
+            n_pruners = len(pruning_layers_sorted)
+            r_final = max(min(K / float(N), 1.0), 0.0)
+            topk_schedule = {}
+            prev_k = N
+            for i, layer_idx in enumerate(pruning_layers_sorted, start=1):
+                if i == n_pruners:
+                    k_i = K
+                else:
+                    ratio_i = r_final ** (float(i) / float(n_pruners))
+                    k_i = int(round(N * ratio_i))
+                    k_i = max(k_i, K)
+                k_i = min(k_i, prev_k)
+                topk_schedule[int(layer_idx)] = int(k_i)
+                prev_k = int(k_i)
 
         # === 当前状态（不做物理删除，位置保持不变）===
         hidden_states = inputs_embeds
@@ -571,6 +535,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 cumulative_vision_mask=cumulative_mask,
                 detach_h_fake_for_adv=detach_h_fake_for_adv,
                 pruning_mode=pruning_mode,
+                topk_k=(topk_schedule.get(layer_idx) if topk_schedule is not None else None),
             )
 
             if pruning_info is not None:
@@ -701,13 +666,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         from itertools import chain
 
         param_iters = []
-
-        # 旧版 attention-output adapter（如果仍启用）
-        if getattr(self, 'use_adapter', False):
-            if self.use_separated_adapters and self.separated_adapter_manager is not None:
-                param_iters.append(self.separated_adapter_manager.parameters())
-            elif self.adapter_manager is not None:
-                param_iters.append(self.adapter_manager.parameters())
 
         # 新版 delayed repair adapter（语言侧）
         if getattr(self, 'use_repair_adapter', False):
@@ -1231,53 +1189,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             # hard_mask_padded 在已剪掉的位置是 0，在当前决策位置是 0/1
             scattered_mask = hard_mask_padded
 
-            # Step 5: 应用 Adapter（使用 scatter 后的 mask，与训练一致）
-            if self.use_adapter:
-                if self.use_separated_adapters:
-                    # 分离式 Adapter：对 vision/text 分别处理（text 包含 question 和 generator）
-                    vision_adapter, text_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
-                    adapted_output = attn_output.clone()
-
-                    # Vision tokens: [current_vision_start, current_vision_end)
-                    vision_slice = attn_output[:, current_vision_start:current_vision_end, :]
-                    vision_query = query_states_flat[:, current_vision_start:current_vision_end, :]
-                    adapted_vision = vision_adapter(
-                        vision_slice, mask=scattered_mask, query=vision_query,
-                        vision_hidden=vision_hidden_padded
-                    )
-                    adapted_output[:, current_vision_start:current_vision_end, :] = adapted_vision
-
-                    # Text tokens (除最后一个): [current_vision_end, current_seq_len-1)
-                    if current_vision_end < current_seq_len - 1:
-                        text_slice = attn_output[:, current_vision_end:current_seq_len-1, :]
-                        text_query = query_states_flat[:, current_vision_end:current_seq_len-1, :]
-                        adapted_text = text_adapter(
-                            text_slice, mask=scattered_mask, query=text_query,
-                            vision_hidden=vision_hidden_padded
-                        )
-                        adapted_output[:, current_vision_end:current_seq_len-1, :] = adapted_text
-
-                    # Generator token (最后一个，用于生成第一个 answer token): 使用 text_adapter
-                    gen_slice = attn_output[:, current_seq_len-1:current_seq_len, :]
-                    gen_query = query_states_flat[:, current_seq_len-1:current_seq_len, :]
-                    adapted_gen = text_adapter(
-                        gen_slice, mask=scattered_mask, query=gen_query,
-                        vision_hidden=vision_hidden_padded
-                    )
-                    adapted_output[:, current_seq_len-1:current_seq_len, :] = adapted_gen
-
-                    attn_output = adapted_output
-                else:
-                    adapter = self.adapter_manager.get_adapter(layer_idx)
-                    if adapter is not None:
-                        attn_output = adapter(
-                            attn_output,
-                            mask=scattered_mask,
-                            query=query_states_flat,
-                            vision_hidden=vision_hidden_padded
-                        )
-
-            # Step 6: 更新累积 vision mask（用于后续层的物理删除）
+            # Step 5: 更新累积 vision mask（用于后续层的物理删除）
             # 直接使用 scattered_mask 作为新的累积 mask
             cumulative_vision_mask = scattered_mask.clone()
 
@@ -1473,9 +1385,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 key_states_gen = attn.k_proj(hidden_normed)
                 value_states_gen = attn.v_proj(hidden_normed)
 
-                # 保存 query_states_flat 用于 adapter
-                query_states_flat_gen = query_states_gen
-
                 # Reshape
                 query_states_gen = query_states_gen.view(batch_size, 1, num_heads, head_dim).transpose(1, 2)
                 key_states_gen = key_states_gen.view(batch_size, 1, num_kv_heads, head_dim).transpose(1, 2)
@@ -1502,29 +1411,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 # 计算 attention output
                 attn_output_gen = torch.matmul(attn_weights_gen, value_states_gen)
                 attn_output_gen = attn_output_gen.transpose(1, 2).contiguous().reshape(batch_size, 1, hidden_size)
-
-                # 在剪枝层应用 Adapter（使用 Prefill 阶段保存的 padded_mask）
-                if layer_idx in self.pruning_layers and self.use_adapter:
-                    # 从 masks 中获取 scattered_mask 和 vision_hidden_padded（与训练时一致）
-                    _, _, scattered_mask, vision_hidden_padded = masks[layer_idx]
-                    if self.use_separated_adapters:
-                        # 分离式 Adapter：Generate 阶段使用 text_adapter
-                        _, text_adapter = self.separated_adapter_manager.get_adapters(layer_idx)
-                        attn_output_gen = text_adapter(
-                            attn_output_gen,
-                            mask=scattered_mask,
-                            query=query_states_flat_gen,
-                            vision_hidden=vision_hidden_padded
-                        )
-                    else:
-                        adapter = self.adapter_manager.get_adapter(layer_idx)
-                        if adapter is not None:
-                            attn_output_gen = adapter(
-                                attn_output_gen,
-                                mask=scattered_mask,
-                                query=query_states_flat_gen,
-                                vision_hidden=vision_hidden_padded
-                            )
 
                 attn_output_gen = attn.o_proj(attn_output_gen)
 

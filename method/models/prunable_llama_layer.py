@@ -33,8 +33,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         layer_idx: 层索引
         pruner: LayerPruner 实例（None 表示非剪枝层）
         discriminator: LayerDiscriminator 实例（None 表示非剪枝层）
-        adapter: PruningAdapter 实例（None 表示非剪枝层）
-        separated_adapters: (vision_adapter, text_adapter, answer_adapter) 元组
     """
 
     def __init__(
@@ -43,8 +41,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         layer_idx: int,
         pruner: Optional[nn.Module] = None,
         discriminator: Optional[nn.Module] = None,
-        adapter: Optional[nn.Module] = None,
-        separated_adapters: Optional[Tuple[nn.Module, nn.Module, nn.Module]] = None,
         repair_context_encoder: Optional[nn.Module] = None,
     ):
         super().__init__()
@@ -52,8 +48,6 @@ class PrunableLlamaDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.pruner = pruner
         self.discriminator = discriminator
-        self.adapter = adapter
-        self.separated_adapters = separated_adapters  # (vision, text, answer)
         self.repair_context_encoder = repair_context_encoder
         self.is_pruning_layer = pruner is not None
 
@@ -300,7 +294,7 @@ class PrunableLlamaDecoderLayer(nn.Module):
         return_pruning_info: bool,
         cumulative_mask: Optional[torch.Tensor] = None,  # 之前层的累积 mask
         detach_h_fake_for_adv: bool = False,  # 是否 detach h_fake（阻止 adv_loss 梯度流向 pruner）
-        pruning_mode: str = "normal",  # 'normal' or 'keep_all'
+        pruning_mode: str = "normal",  # 'normal' | 'keep_all' | 'topk_attn'
         **kwargs
     ):
         """剪枝层的前向传播
@@ -412,10 +406,34 @@ class PrunableLlamaDecoderLayer(nn.Module):
                 question_hidden[i, :qh.shape[0], :] = qh
             question_lengths = torch.tensor(question_lengths_list, device=device, dtype=torch.long)
 
-        # Pruner 生成当前层的 mask
+        # === 生成当前层的 mask ===
         if pruning_mode == "keep_all":
             current_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
             pruner_info = {}
+        elif pruning_mode == "topk_attn":
+            # w/o pruner baseline：根据 q2v_attn 做 top-k 保留（与 cumulative_mask 兼容，不允许“复活”）
+            topk_k = kwargs.get("topk_k", None)
+            if topk_k is None:
+                raise ValueError("topk_attn mode requires `topk_k`.")
+            topk_k = int(topk_k)
+            current_mask = torch.zeros(batch_size, n_vision, device=device, dtype=dtype)
+            for i in range(batch_size):
+                if cumulative_mask is not None:
+                    valid_idx = (cumulative_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+                else:
+                    valid_idx = torch.arange(n_vision, device=device)
+                n_valid = int(valid_idx.numel())
+                if n_valid <= 0:
+                    continue
+                k_i = min(topk_k, n_valid)
+                if k_i >= n_valid:
+                    current_mask[i, valid_idx] = 1
+                    continue
+                scores_i = q2v_attn_avg[i, valid_idx]
+                keep_rel = torch.topk(scores_i, k=k_i, dim=-1, largest=True).indices
+                keep_idx = valid_idx[keep_rel]
+                current_mask[i, keep_idx] = 1
+            pruner_info = {"mode": "topk_attn"}
         else:
             current_mask, pruner_info = self.pruner.forward_full(
                 vision_hidden, q2v_attn_avg,

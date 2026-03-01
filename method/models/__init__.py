@@ -7,8 +7,6 @@ from .layer_pruner_acp import LayerPruner, LayerPrunerManager
 from .layer_discriminator import LayerDiscriminator, LayerDiscriminatorManager
 from .prunable_llama_layer import PrunableLlamaDecoderLayer, PrunableLlamaLayerWrapper
 from .prunable_llava import PrunableLlavaForConditionalGeneration, PrunableLlavaOutput
-from .prunable_qwen2vl_layer import PrunableQwen2VLDecoderLayer
-from .prunable_qwen2vl import PrunableQwen2VLForConditionalGeneration, PrunableQwen2VLOutput
 
 __all__ = [
     'LayerPruner',
@@ -19,7 +17,4 @@ __all__ = [
     'PrunableLlamaLayerWrapper',
     'PrunableLlavaForConditionalGeneration',
     'PrunableLlavaOutput',
-    'PrunableQwen2VLDecoderLayer',
-    'PrunableQwen2VLForConditionalGeneration',
-    'PrunableQwen2VLOutput',
 ]

@@ -69,20 +69,6 @@ def load_checkpoint(
         if logger:
             logger.info("  Loaded pruner_manager state")
 
-    # 支持分离式 Adapter（仅当模型启用 Adapter 时加载）
-    if hasattr(model, 'use_adapter') and model.use_adapter:
-        if 'separated_adapter_state_dict' in checkpoint and model.use_separated_adapters:
-            model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
-            if logger:
-                logger.info("  Loaded separated_adapter_manager state")
-        elif 'adapter_state_dict' in checkpoint and not model.use_separated_adapters:
-            model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
-            if logger:
-                logger.info("  Loaded adapter_manager state")
-    else:
-        if logger and ('adapter_state_dict' in checkpoint or 'separated_adapter_state_dict' in checkpoint):
-            logger.info("  Skipped adapter state (use_adapter=False)")
-
     if 'disc_state_dict' in checkpoint:
         model.disc_manager.load_state_dict(checkpoint['disc_state_dict'])
         if logger:

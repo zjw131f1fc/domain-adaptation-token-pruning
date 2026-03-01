@@ -68,6 +68,18 @@ backbone_settings:
   name: "llava-1.5-7b"
 
 method_settings:
+  # ==================== Ablation（论文消融开关，默认全关）====================
+  # 说明：
+  # - 这些开关只影响训练/评估时的路由，不改变默认方法本身。
+  # - ablation_w_o_pruner_topk_attn: 用 top-k attention 作为剪枝基线（不走可学习 pruner）
+  # - ablation_w_o_adapter: 关闭 delayed repair（不注入修复结构）
+  # - ablation_w_o_repair_loss: λ_repair=0（保留 delayed repair 结构，但不做 repair 对齐监督）
+  # - ablation_repair_mean_only: α=0（repair 只对齐均值，不对齐方差）
+  ablation_w_o_pruner_topk_attn: false
+  ablation_w_o_adapter: false
+  ablation_w_o_repair_loss: false
+  ablation_repair_mean_only: false
+
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
   # pruning_layers: [1,13,25]

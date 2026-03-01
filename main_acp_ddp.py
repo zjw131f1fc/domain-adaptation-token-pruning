@@ -58,14 +58,9 @@ from engine.eval_utils import evaluate
 def load_model(config, device: torch.device, local_rank: int):
     """加载可剪枝的 MLLM 模型（DDP 兼容版本）
 
-    支持的模型类型：
-    - llava: LLaVA 1.5 7B/13B
-    - qwen2_vl: Qwen2-VL 2B/7B
-
     关键改动：
     1. 不使用 device_map='auto'，手动放置到指定 device
-    2. 返回可训练模块列表用于 DDP 包装
-    3. 根据 backbone_settings.model_type 自动路由到对应模型
+    2. 仅支持 LLaVA 路径（本仓库当前实验只做 llava）
     """
     from transformers import AutoProcessor
 
@@ -108,27 +103,15 @@ def load_model(config, device: torch.device, local_rank: int):
     else:
         use_gumbel_noise = False
 
-    # Adapter 配置
-    use_adapter = method_cfg.get('use_adapter', True)
-    adapter_type = method_cfg.get('adapter_type', 'lightweight')
-    adapter_bottleneck = method_cfg.get('adapter_bottleneck', None)
-    adapter_dropout = method_cfg.get('adapter_dropout', 0.15)  # Adapter dropout
-    use_separated_adapters = method_cfg.get('use_separated_adapters', False)
-    vision_adapter_bottleneck = method_cfg.get('vision_adapter_bottleneck', 256)
-    text_adapter_bottleneck = method_cfg.get('text_adapter_bottleneck', 256)
-    generator_adapter_bottleneck = method_cfg.get('generator_adapter_bottleneck', 512)
-    adapter_alpha_init = method_cfg.get('adapter_alpha_init', 0.1)
-    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
-
     # Delayed repair adapter（语言侧，仅 gen_answer tokens）
     use_repair_adapter = method_cfg.get('use_repair_adapter', False)
     repair_layers = method_cfg.get('repair_layers', None)
     repair_source_layers = method_cfg.get('repair_source_layers', None)
     repair_bottleneck_dim = method_cfg.get('repair_bottleneck_dim', 512)
-    repair_dropout = method_cfg.get('repair_dropout', adapter_dropout)
+    repair_dropout = method_cfg.get('repair_dropout', 0.15)
     repair_mask_encoder_type = method_cfg.get('repair_mask_encoder_type', method_cfg.get('mask_encoder_type', 'attention'))
     repair_use_pruned_info = method_cfg.get('repair_use_pruned_info', True)
-    repair_alpha_init = method_cfg.get('repair_alpha_init', adapter_alpha_init)
+    repair_alpha_init = method_cfg.get('repair_alpha_init', 0.1)
     repair_detach_input = method_cfg.get('repair_detach_input', True)
 
     # Pruner query dropout
@@ -141,37 +124,25 @@ def load_model(config, device: torch.device, local_rank: int):
     # 剪枝阈值（sigmoid 后的阈值，用于训练第三阶段和推理）
     pruning_threshold = method_cfg.get('pruning_threshold', 0.5)
 
-    # 模型路径和类型
+    # 模型路径
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
-    model_type = backbone_cfg.get('model_type', 'llava')  # 从配置加载器自动设置
 
     model_mapping = {
         'llava-1.5-7b': 'llava-hf/llava-1.5-7b-hf',
         'llava-1.5-13b': 'llava-hf/llava-1.5-13b-hf',
-        'qwen2-vl-2b': 'Qwen/Qwen2-VL-2B-Instruct',
-        'qwen2-vl-7b': 'Qwen/Qwen2-VL-7B-Instruct',
     }
     model_path = model_mapping.get(model_name, model_name)
 
     if logger:
-        logger.info(f"Loading base model from {model_path} (type: {model_type})...")
+        logger.info(f"Loading base model from {model_path} (type: llava)...")
 
-    if model_type == 'qwen2_vl':
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-        base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            device_map=None,
-            low_cpu_mem_usage=True,
-        )
-    else:  # llava
-        from transformers import LlavaForConditionalGeneration, AutoProcessor
-        base_model = LlavaForConditionalGeneration.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            device_map=None,
-            low_cpu_mem_usage=True,
-        )
+    from transformers import LlavaForConditionalGeneration
+    base_model = LlavaForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch_dtype,
+        device_map=None,
+        low_cpu_mem_usage=True,
+    )
 
     # 手动移动到指定设备
     base_model = base_model.to(device)
@@ -184,67 +155,31 @@ def load_model(config, device: torch.device, local_rank: int):
     # 将 processor 附加到模型
     base_model.processor = processor
 
-    # 创建可剪枝模型（根据模型类型选择）
-    if model_type == 'qwen2_vl':
-        from method.models.prunable_qwen2vl import PrunableQwen2VLForConditionalGeneration
-        model = PrunableQwen2VLForConditionalGeneration(
-            base_model=base_model,
-            pruning_layers=pruning_layers,
-            pruner_d_internal=pruner_d_internal,
-            pruner_n_heads=pruner_n_heads,
-            pruner_query_dropout=pruner_query_dropout,
-            disc_d_hidden=disc_d_hidden,
-            adapter_bottleneck=adapter_bottleneck,
-            adapter_type=adapter_type,
-            use_separated_adapters=use_separated_adapters,
-            vision_adapter_bottleneck=vision_adapter_bottleneck,
-            text_adapter_bottleneck=text_adapter_bottleneck,
-            generator_adapter_bottleneck=generator_adapter_bottleneck,
-            adapter_alpha_init=adapter_alpha_init,
-            adapter_delta_weight=adapter_delta_weight,
-            temperature=temperature,
-            dropout=dropout,
-            adapter_dropout=adapter_dropout,
-            disc_use_spectral_norm=disc_spectral_norm,
-            use_gumbel_noise=use_gumbel_noise,
-            pruning_threshold=pruning_threshold,
-        )
-    else:  # llava
-        from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
-        model = PrunableLlavaForConditionalGeneration(
-            base_model=base_model,
-            pruning_layers=pruning_layers,
-            pruner_d_internal=pruner_d_internal,
-            pruner_n_heads=pruner_n_heads,
-            pruner_n_queries=pruner_n_queries,
-            pruner_query_dropout=pruner_query_dropout,
-            use_question_condition=use_question_condition,
-            disc_d_hidden=disc_d_hidden,
-            use_adapter=use_adapter,
-            adapter_bottleneck=adapter_bottleneck,
-            adapter_type=adapter_type,
-            use_separated_adapters=use_separated_adapters,
-            vision_adapter_bottleneck=vision_adapter_bottleneck,
-            text_adapter_bottleneck=text_adapter_bottleneck,
-            generator_adapter_bottleneck=generator_adapter_bottleneck,
-            adapter_alpha_init=adapter_alpha_init,
-            adapter_delta_weight=adapter_delta_weight,
-            temperature=temperature,
-            dropout=dropout,
-            adapter_dropout=adapter_dropout,
-            disc_use_spectral_norm=disc_spectral_norm,
-            use_gumbel_noise=use_gumbel_noise,
-            pruning_threshold=pruning_threshold,
-            use_repair_adapter=use_repair_adapter,
-            repair_layers=repair_layers,
-            repair_source_layers=repair_source_layers,
-            repair_bottleneck_dim=repair_bottleneck_dim,
-            repair_dropout=repair_dropout,
-            repair_mask_encoder_type=repair_mask_encoder_type,
-            repair_use_pruned_info=repair_use_pruned_info,
-            repair_alpha_init=repair_alpha_init,
-            repair_detach_input=repair_detach_input,
-        )
+    from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
+    model = PrunableLlavaForConditionalGeneration(
+        base_model=base_model,
+        pruning_layers=pruning_layers,
+        pruner_d_internal=pruner_d_internal,
+        pruner_n_heads=pruner_n_heads,
+        pruner_n_queries=pruner_n_queries,
+        pruner_query_dropout=pruner_query_dropout,
+        use_question_condition=use_question_condition,
+        disc_d_hidden=disc_d_hidden,
+        temperature=temperature,
+        dropout=dropout,
+        disc_use_spectral_norm=disc_spectral_norm,
+        use_gumbel_noise=use_gumbel_noise,
+        pruning_threshold=pruning_threshold,
+        use_repair_adapter=use_repair_adapter,
+        repair_layers=repair_layers,
+        repair_source_layers=repair_source_layers,
+        repair_bottleneck_dim=repair_bottleneck_dim,
+        repair_dropout=repair_dropout,
+        repair_mask_encoder_type=repair_mask_encoder_type,
+        repair_use_pruned_info=repair_use_pruned_info,
+        repair_alpha_init=repair_alpha_init,
+        repair_detach_input=repair_detach_input,
+    )
 
     # 冻结基础模型
     model.freeze_base_model()
@@ -440,16 +375,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 model.pruner_manager.load_state_dict(checkpoint['pruner_state_dict'])
                 if is_main_process():
                     logger.info("  Loaded pruner_manager state")
-
-            if 'adapter_state_dict' in checkpoint and model.use_adapter and not model.use_separated_adapters:
-                model.adapter_manager.load_state_dict(checkpoint['adapter_state_dict'])
-                if is_main_process():
-                    logger.info("  Loaded adapter_manager state")
-
-            if 'separated_adapter_state_dict' in checkpoint and model.use_adapter and model.use_separated_adapters:
-                model.separated_adapter_manager.load_state_dict(checkpoint['separated_adapter_state_dict'])
-                if is_main_process():
-                    logger.info("  Loaded separated_adapter_manager state")
 
             # 新版 delayed repair adapter
             if 'repair_context_encoder_state_dict' in checkpoint and getattr(model, 'use_repair_adapter', False):
@@ -877,12 +802,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                 }
                 if disc_optimizer is not None:
                     ckpt_data['disc_optimizer'] = disc_optimizer.state_dict()
-                # 根据 adapter 类型保存
-                if model.use_adapter:
-                    if model.use_separated_adapters:
-                        ckpt_data['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
-                    else:
-                        ckpt_data['adapter_state_dict'] = model.adapter_manager.state_dict()
                 # 新版 delayed repair adapter
                 if getattr(model, 'use_repair_adapter', False):
                     if getattr(model, 'repair_context_encoder', None) is not None:
@@ -911,11 +830,6 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
             'pruner_state_dict': model.pruner_manager.state_dict(),
             'disc_state_dict': model.disc_manager.state_dict(),
         }
-        if model.use_adapter:
-            if model.use_separated_adapters:
-                final_ckpt['separated_adapter_state_dict'] = model.separated_adapter_manager.state_dict()
-            else:
-                final_ckpt['adapter_state_dict'] = model.adapter_manager.state_dict()
         if getattr(model, 'use_repair_adapter', False):
             if getattr(model, 'repair_context_encoder', None) is not None:
                 final_ckpt['repair_context_encoder_state_dict'] = model.repair_context_encoder.state_dict()

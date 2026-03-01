@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any, List
 
-from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
+from engine.data_utils import preprocess_batch
 
 
 def _flatten_masked(h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -171,6 +171,16 @@ def train_step(
     method_cfg = config.method_settings
     adversarial_mode = method_cfg.get('adversarial_mode', 'none')  # 'none' | 'discriminator' | 'mse'（旧逻辑）
 
+    # ==================== Ablations（论文消融开关，尽量一键启用）====================
+    # - w/o pruner: top-k attention baseline
+    # - w/o adapter: 关闭 delayed repair 注入（同时关闭 repair loss，避免变成“无 adapter 的对齐训练”）
+    # - w/o repair loss: 保留 delayed repair 注入，但关掉 teacher-student 对齐损失
+    # - mean-only: soft repair 对齐只对齐均值（α=0）
+    ab_w_o_pruner_topk = bool(method_cfg.get("ablation_w_o_pruner_topk_attn", False))
+    ab_w_o_adapter = bool(method_cfg.get("ablation_w_o_adapter", False))
+    ab_w_o_repair_loss = bool(method_cfg.get("ablation_w_o_repair_loss", False))
+    ab_mean_only = bool(method_cfg.get("ablation_repair_mean_only", False))
+
     # === Gumbel Mode 两阶段调度 ===
     gumbel_mode = method_cfg.get('gumbel_mode', 'never')
     skip_phase1 = method_cfg.get('skip_phase1', False)
@@ -233,12 +243,7 @@ def train_step(
     # === 预处理 ===
     max_length = config.trainer_settings.get('dl_settings', {}).get('max_length', 2048)
 
-    # 根据模型类型选择预处理函数
-    backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
-    if 'qwen2-vl' in backbone_name.lower():
-        prep = preprocess_batch_qwen2vl(batch, processor, device, max_length=max_length)
-    else:
-        prep = preprocess_batch(batch, processor, device, max_length=max_length)
+    prep = preprocess_batch(batch, processor, device, max_length=max_length)
     inputs = prep['inputs']
 
     # === Forward ===
@@ -253,6 +258,17 @@ def train_step(
     repair_loss_type = method_cfg.get('repair_loss_type', 'mean_var')
     repair_var_weight = method_cfg.get('repair_var_weight', 1.0)
     teacher_forward_enable = method_cfg.get('teacher_forward_enable', False)
+
+    if ab_w_o_adapter:
+        # 纯 pruning baseline（不做 delayed repair，也不做 repair loss）
+        teacher_forward_enable = False
+        repair_loss_weight = 0.0
+    if ab_w_o_repair_loss:
+        # 保留 delayed repair 注入，但不使用 repair 对齐监督
+        teacher_forward_enable = False
+        repair_loss_weight = 0.0
+    if ab_mean_only:
+        repair_var_weight = 0.0
 
     capture_layers = repair_layers if (teacher_forward_enable and repair_loss_weight > 0 and repair_layers) else []
 
@@ -269,14 +285,11 @@ def train_step(
         'answer_ends': prep['answer_ends'],
         'return_pruning_info': True,  # student 需要 pruning_infos 来算 sparsity
         'detach_h_fake_for_adv': detach_adv_from_pruner,
-        'pruning_mode': 'normal',
-        'apply_repair': True,
+        'pruning_mode': ('topk_attn' if ab_w_o_pruner_topk else 'normal'),
+        'target_token_num': method_cfg.get('target_token_num', None),
+        'apply_repair': (not ab_w_o_adapter),
         'capture_layers': capture_layers,
     }
-
-    # Qwen2-VL 需要 image_grid_thw
-    if 'image_grid_thw' in inputs:
-        forward_kwargs['image_grid_thw'] = inputs['image_grid_thw']
 
     output = model(**forward_kwargs)
 
@@ -551,21 +564,6 @@ def train_step(
             losses['entropy_loss'] = entropy_loss
             stats['entropy_loss'] = entropy_loss.item()
 
-    # === Adapter Delta 正则：限制修正幅度 ===
-    adapter_delta_weight = method_cfg.get('adapter_delta_weight', 0.0)
-    if adapter_delta_weight > 0:
-        base_model = model.module if hasattr(model, 'module') else model
-        delta_loss = None
-        if getattr(base_model, 'use_adapter', False):
-            if base_model.use_separated_adapters and base_model.separated_adapter_manager is not None:
-                delta_loss = base_model.separated_adapter_manager.collect_delta_loss()
-            elif base_model.adapter_manager is not None:
-                delta_loss = base_model.adapter_manager.collect_delta_loss()
-        if delta_loss is not None:
-            losses['adapter_delta_loss'] = delta_loss
-            stats['adapter_delta_loss'] = delta_loss.item()
-            stats['adapter_delta_weight'] = adapter_delta_weight
-
     # === 应用权重 ===
     task_weight = method_cfg.get('task_loss_weight', 1.0)
     repair_weight = method_cfg.get('repair_loss_weight', 0.0)
@@ -600,8 +598,6 @@ def train_step(
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
     if 'entropy_loss' in losses:
         weighted_losses['entropy_loss'] = losses['entropy_loss'] * entropy_weight
-    if 'adapter_delta_loss' in losses:
-        weighted_losses['adapter_delta_loss'] = losses['adapter_delta_loss'] * adapter_delta_weight
     if 'tightening_loss' in losses:
         weighted_losses['tightening_loss'] = losses['tightening_loss']  # 权重已在计算时应用
     # 不再使用判别器相关损失（如需可恢复旧逻辑）

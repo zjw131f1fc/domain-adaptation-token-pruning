@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional, Callable, Tuple
 from tqdm import tqdm
 
 from engine.distributed import is_main_process
-from engine.data_utils import preprocess_batch, preprocess_batch_qwen2vl
+from engine.data_utils import preprocess_batch
 
 
 def _normalize_eos_token_id(eos_token_id) -> Optional[int]:
@@ -91,8 +91,10 @@ def _generate_with_forward_pruning(
     question_starts: List[int],
     question_ends: List[int],
     max_new_tokens: int = 32,
-    image_grid_thw: Optional[torch.LongTensor] = None,
     pruning_layers: Optional[List[int]] = None,
+    pruning_mode: str = "normal",
+    target_token_num: Optional[int] = None,
+    apply_repair: Optional[bool] = None,
 ) -> Tuple[torch.LongTensor, Dict[str, float]]:
     """用 forward() + greedy decode 做评估用生成（不走物理剪枝）。
 
@@ -136,11 +138,10 @@ def _generate_with_forward_pruning(
         # 用 +1 让 gen_answer 覆盖到 prompt 的最后一个 token（用于预测第一个 answer token）
         "answer_ends": [int(generated_ids.shape[1]) + 1],
         "return_pruning_info": True,
-        # apply_repair=None -> forward 内部按 self.use_repair_adapter 自动决定
+        "pruning_mode": pruning_mode,
+        "target_token_num": target_token_num,
+        "apply_repair": apply_repair,
     }
-    if image_grid_thw is not None:
-        prompt_forward_kwargs["image_grid_thw"] = image_grid_thw
-
     out_prompt = model(**prompt_forward_kwargs)
     kept_stats = _extract_kept_stats_from_pruning_infos(
         getattr(out_prompt, "pruning_infos", None),
@@ -165,10 +166,10 @@ def _generate_with_forward_pruning(
             # +1 让 gen_answer 覆盖到最后一个 token，从而影响下一 token 的 logits
             "answer_ends": [cur_len + 1],
             "return_pruning_info": False,
+            "pruning_mode": pruning_mode,
+            "target_token_num": target_token_num,
+            "apply_repair": apply_repair,
         }
-        if image_grid_thw is not None:
-            forward_kwargs["image_grid_thw"] = image_grid_thw
-
         out = model(**forward_kwargs)
         logits = out.logits
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -217,6 +218,15 @@ def evaluate(
         评估结果字典
     """
     model.eval()
+
+    # Ablations（与 train_step 对齐）
+    method_cfg = config.method_settings
+    ab_w_o_pruner_topk = bool(method_cfg.get("ablation_w_o_pruner_topk_attn", False))
+    ab_w_o_adapter = bool(method_cfg.get("ablation_w_o_adapter", False))
+
+    eval_pruning_mode = "topk_attn" if ab_w_o_pruner_topk else "normal"
+    eval_target_token_num = method_cfg.get("target_token_num", None)
+    eval_apply_repair = False if ab_w_o_adapter else None
 
     # 设置评估时的温度和阈值
     method_cfg = config.method_settings
@@ -268,27 +278,14 @@ def evaluate(
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
 
-        # 根据模型类型选择预处理函数
-        backbone_name = config.backbone_settings.get('name', 'llava-1.5-7b')
-        is_qwen2vl = 'qwen2-vl' in backbone_name.lower()
-
         if mode in ("hard", "hard_forward"):
-            if is_qwen2vl:
-                preprocessed = preprocess_batch_qwen2vl(
-                    batch=[sample],
-                    processor=processor,
-                    device=device,
-                    max_length=max_length,
-                    mode="inference"
-                )
-            else:
-                preprocessed = preprocess_batch(
-                    batch=[sample],
-                    processor=processor,
-                    device=device,
-                    max_length=max_length,
-                    mode="inference"
-                )
+            preprocessed = preprocess_batch(
+                batch=[sample],
+                processor=processor,
+                device=device,
+                max_length=max_length,
+                mode="inference"
+            )
             inputs = preprocessed['inputs']
 
             if mode == "hard_forward":
@@ -302,9 +299,11 @@ def evaluate(
                     vision_end=preprocessed["vision_end"],
                     question_starts=preprocessed["question_starts"],
                     question_ends=preprocessed["question_ends"],
-                    image_grid_thw=inputs.get("image_grid_thw", None),
                     max_new_tokens=32,
                     pruning_layers=pruning_layers,
+                    pruning_mode=eval_pruning_mode,
+                    target_token_num=eval_target_token_num,
+                    apply_repair=eval_apply_repair,
                 )
             else:
                 # ========== 物理剪枝推理（旧 hard 模式）==========
@@ -321,8 +320,6 @@ def evaluate(
                     "answer_ends": [preprocessed["question_ends"][0] + 1],
                     "return_pruning_info": True,
                 }
-                if "image_grid_thw" in inputs:
-                    forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
 
                 debug_train_ratios = {}
                 if step_idx <= 5 and is_main_process():
@@ -344,13 +341,10 @@ def evaluate(
                     "max_new_tokens": 32,
                     "debug_generate": (step_idx <= 3 and is_main_process()),
                 }
-                if "image_grid_thw" in inputs:
-                    generate_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
 
                 if hasattr(model, "generate_with_hard_pruning"):
                     output_ids, stats = model.generate_with_hard_pruning(**generate_kwargs)
                 elif hasattr(model, "generate_with_pruning"):
-                    # Qwen2-VL 路径（无物理删除，返回 dict）
                     gen_out = model.generate_with_pruning(
                         **generate_kwargs,
                         return_dict_in_generate=True,
@@ -387,35 +381,14 @@ def evaluate(
                         layer_kept_ratios[layer_idx].append(value)
         elif mode == "origin":
             # origin 模式：使用原始模型生成
-            if is_qwen2vl:
-                # Qwen2-VL 格式
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": "placeholder"},
-                            {"type": "text", "text": sample['question']},
-                        ],
-                    },
-                ]
-                prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=prompt,
-                    images=sample['image'],
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_length,
-                ).to(device)
-            else:
-                # LLaVA 格式
-                prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
-                inputs = processor(
-                    text=prompt,
-                    images=sample['image'],
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_length,
-                ).to(device)
+            prompt = f"USER: <image>\n{sample['question']}\nASSISTANT:"
+            inputs = processor(
+                text=prompt,
+                images=sample['image'],
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            ).to(device)
 
             output_ids = model.generate(
                 **inputs,
@@ -427,19 +400,10 @@ def evaluate(
 
         generated = processor.decode(output_ids[0], skip_special_tokens=True)
 
-        # 根据模型类型提取预测结果
-        if is_qwen2vl:
-            # Qwen2-VL: 提取 assistant 回复
-            if "assistant\n" in generated.lower():
-                pred = generated.lower().split("assistant\n")[-1].strip()
-            else:
-                pred = generated.strip()
+        if "ASSISTANT:" in generated:
+            pred = generated.split("ASSISTANT:")[-1].strip()
         else:
-            # LLaVA
-            if "ASSISTANT:" in generated:
-                pred = generated.split("ASSISTANT:")[-1].strip()
-            else:
-                pred = generated.strip()
+            pred = generated.strip()
 
         predictions.append(pred)
 
