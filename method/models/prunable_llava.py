@@ -601,7 +601,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                     # 选取 <= layer_idx 的最近 pruning layer
                     eligible = [k for k in repair_context_cache.keys() if k <= layer_idx]
                     source_layer = max(eligible) if eligible else None
-
                 ctx = repair_context_cache.get(source_layer, None) if source_layer is not None else None
                 if ctx is not None:
                     adapter = self.repair_adapter_manager.get_adapter(layer_idx)
@@ -615,10 +614,15 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                         pruned_emb=ctx.get("pruned_emb"),
                     )
                     delta = adapted - adapter_in
-                    # task forward：允许梯度通过 base（用于训练 pruner），delta 梯度只回到 adapter（若 detach_input=True）
+                    # task forward：允许梯度通过 base（用于训练 pruner）
+                    # - repair_detach_input=True: delta 梯度只回到 adapter（更稳定，repair_loss 不经由 base 回流）
+                    # - repair_detach_input=False: repair 分支也会对 base（进而对 pruner）产生更强监督
                     hidden_states = base + gen_mask_full.unsqueeze(-1) * delta
-                    # repair loss：stop-grad base，避免 repair 目标回流到 pruner
-                    hidden_states_for_repair = base.detach() + gen_mask_full.unsqueeze(-1) * delta
+                    # repair loss：用于 teacher/student 对齐的捕获
+                    # - repair_detach_input=True: stop-grad base，避免 repair 目标经由 base 直接回流到 pruner
+                    # - repair_detach_input=False: 允许 repair_loss 通过 base 形成更强监督通路
+                    base_for_repair = base.detach() if self.repair_detach_input else base
+                    hidden_states_for_repair = base_for_repair + gen_mask_full.unsqueeze(-1) * delta
 
             # === Capture ===
             if layer_idx in capture_layers_set:

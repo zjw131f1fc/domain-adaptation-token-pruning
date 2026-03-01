@@ -42,6 +42,16 @@ def _extract_kept_stats_from_pruning_infos(
     stats: Dict[str, float] = {}
     weighted_kept = 0.0
 
+    pruning_layers = sorted([int(x) for x in (pruning_layers or [])])
+    if not pruning_layers or total_layers <= 0:
+        return {}
+
+    # 关键：剪枝层之前的 layer 没有 pruning_infos，它们默认是 100% 保留。
+    # 旧实现会漏算这段，导致 avg_kept_ratio 偏小（尤其当第一个剪枝层较深时）。
+    first_prune_layer = int(pruning_layers[0])
+    if first_prune_layer > 0:
+        weighted_kept += float(first_prune_layer) * 1.0
+
     for i, layer_idx in enumerate(pruning_layers):
         info = pruning_infos.get(layer_idx)
         if not info:
@@ -63,8 +73,7 @@ def _extract_kept_stats_from_pruning_infos(
             n_affected = total_layers - layer_idx
         weighted_kept += float(n_affected) * ratio
 
-    if total_layers > 0:
-        stats["avg_kept_ratio"] = weighted_kept / float(total_layers)
+    stats["avg_kept_ratio"] = weighted_kept / float(total_layers)
 
     return stats
 

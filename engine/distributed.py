@@ -54,7 +54,11 @@ def sync_gradients(model):
     由于我们的模型结构特殊（冻结主干 + 可训练小模块），
     使用手动梯度同步比 DDP 更灵活。
 
-    这个函数会对所有有梯度的参数执行 all_reduce 平均。
+    这个函数会对所有可训练参数执行 all_reduce 平均。
+
+    注意：不同 rank 可能因为数据差异/条件分支导致某些参数在该步没有梯度（grad=None）。
+    如果只对“有梯度的参数”做 all_reduce，会造成各 rank 参与的 collective 不一致，从而死锁。
+    因此这里对每个参数都执行一次 all_reduce：有梯度就同步真实梯度，没有梯度就同步一个同形状的零张量。
     """
     if not dist.is_initialized():
         return
@@ -63,33 +67,20 @@ def sync_gradients(model):
     if world_size == 1:
         return
 
-    # 收集所有需要同步的梯度
-    grads = []
-    for param in model.get_pruner_parameters():
-        if param.grad is not None:
-            grads.append(param.grad.data)
-    for param in model.get_adapter_parameters():
-        if param.grad is not None:
-            grads.append(param.grad.data)
-    for param in model.get_discriminator_parameters():
-        if param.grad is not None:
-            grads.append(param.grad.data)
+    # 固定顺序遍历参数，确保所有 rank 调用的 collective 完全一致
+    params = []
+    params.extend(list(model.get_pruner_parameters()))
+    params.extend(list(model.get_adapter_parameters()))
+    params.extend(list(model.get_discriminator_parameters()))
 
-    # 合并成一个大 tensor 以减少通信开销
-    if grads:
-        # 扁平化所有梯度
-        flat_grads = torch.cat([g.flatten() for g in grads])
+    for param in params:
+        if param.grad is None:
+            zero_grad = torch.zeros_like(param.data)
+            dist.all_reduce(zero_grad, op=dist.ReduceOp.SUM)
+            continue
 
-        # All-reduce（求和后平均）
-        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
-        flat_grads.div_(world_size)
-
-        # 写回原始梯度
-        offset = 0
-        for grad in grads:
-            numel = grad.numel()
-            grad.copy_(flat_grads[offset:offset + numel].view_as(grad))
-            offset += numel
+        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        param.grad.data.div_(world_size)
 
 
 def broadcast_model_params(model, src: int = 0):

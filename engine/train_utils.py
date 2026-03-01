@@ -60,6 +60,41 @@ def compute_distribution_alignment_loss(
     return mean_loss + var_weight * var_loss
 
 
+def compute_distribution_alignment_details(
+    student_h: torch.Tensor,
+    teacher_h: torch.Tensor,
+    mask: torch.Tensor,
+    loss_type: str = "mean_var",
+    var_weight: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    """返回对齐损失及其可解释分解项（用于训练时打印诊断指标）。"""
+    Xs = _flatten_masked(student_h, mask).float()
+    Xt = _flatten_masked(teacher_h, mask).float()
+
+    ms = Xs.mean(dim=0)
+    mt = Xt.mean(dim=0)
+    vs = Xs.var(dim=0, unbiased=False)
+    vt = Xt.var(dim=0, unbiased=False)
+
+    mean_mse = F.mse_loss(ms, mt)
+    var_mse = F.mse_loss(vs, vt)
+
+    n = min(Xs.shape[0], Xt.shape[0])
+    token_mse = F.mse_loss(Xs[:n], Xt[:n]) if n > 0 else torch.tensor(0.0, device=Xs.device)
+
+    if loss_type == "mse":
+        total = token_mse
+    else:
+        total = mean_mse + var_weight * var_mse
+
+    return {
+        "total": total,
+        "mean_mse": mean_mse,
+        "var_mse": var_mse,
+        "token_mse": token_mse,
+    }
+
+
 def compute_task_loss(
     logits: torch.Tensor,
     answer_starts: List[int],
@@ -280,33 +315,65 @@ def train_step(
         student_caps = output.captured_for_repair or output.captured
         teacher_caps = teacher_output.captured
         layer_losses = []
+        layer_mean_mse = []
+        layer_var_mse = []
+        layer_token_mse = []
         per_layer = {}
+        per_layer_mean = {}
+        per_layer_var = {}
+        per_layer_token = {}
         for layer_idx in capture_layers:
             if layer_idx not in student_caps or layer_idx not in teacher_caps:
                 continue
             s = student_caps[layer_idx]
             t = teacher_caps[layer_idx]
             m = s["mask"] * t["mask"]
-            layer_loss = compute_distribution_alignment_loss(
-                s["h"], t["h"], m,
+            details = compute_distribution_alignment_details(
+                s["h"],
+                t["h"],
+                m,
                 loss_type=repair_loss_type,
                 var_weight=repair_var_weight,
             )
+            layer_loss = details["total"]
             layer_losses.append(layer_loss)
-            per_layer[layer_idx] = float(layer_loss.detach().item())
+            layer_mean_mse.append(details["mean_mse"])
+            layer_var_mse.append(details["var_mse"])
+            layer_token_mse.append(details["token_mse"])
+
+            per_layer[layer_idx] = float(details["total"].detach().item())
+            per_layer_mean[layer_idx] = float(details["mean_mse"].detach().item())
+            per_layer_var[layer_idx] = float(details["var_mse"].detach().item())
+            per_layer_token[layer_idx] = float(details["token_mse"].detach().item())
 
         if layer_losses:
             repair_loss = torch.stack(layer_losses).mean()
+            mean_mse = torch.stack(layer_mean_mse).mean()
+            var_mse = torch.stack(layer_var_mse).mean()
+            token_mse = torch.stack(layer_token_mse).mean()
         else:
             repair_loss = torch.tensor(0.0, device=device)
+            mean_mse = torch.tensor(0.0, device=device)
+            var_mse = torch.tensor(0.0, device=device)
+            token_mse = torch.tensor(0.0, device=device)
 
         losses['repair_loss'] = repair_loss
         stats['raw_repair_loss'] = float(repair_loss.detach().item())
         stats['repair_loss_type'] = repair_loss_type
+        stats['raw_repair_mean_mse'] = float(mean_mse.detach().item())
+        stats['raw_repair_var_mse'] = float(var_mse.detach().item())
+        stats['raw_repair_token_mse'] = float(token_mse.detach().item())
+        stats['repair_var_weight'] = float(repair_var_weight)
         stats['repair_per_layer'] = per_layer
+        stats['repair_mean_per_layer'] = per_layer_mean
+        stats['repair_var_per_layer'] = per_layer_var
+        stats['repair_token_per_layer'] = per_layer_token
     else:
         losses['repair_loss'] = torch.tensor(0.0, device=device)
         stats['raw_repair_loss'] = 0.0
+        stats['raw_repair_mean_mse'] = 0.0
+        stats['raw_repair_var_mse'] = 0.0
+        stats['raw_repair_token_mse'] = 0.0
 
     # 3. Sparsity Loss
     if output.pruning_infos and len(output.pruning_infos) > 0:
@@ -343,23 +410,6 @@ def train_step(
             cumulative_ratio = cumulative_mask.float().mean()
             cumulative_ratios.append(cumulative_ratio)
             stats[f'L{layer_idx}_kept'] = cumulative_ratio.item()
-        # 计算独立保留率 p_i = 当前层的 current_mask 的平均值
-        # 不再使用除法 cumulative_r_i / cumulative_r_{i-1}，避免梯度计算不稳定
-        independent_ratios = []
-        for i, layer_idx in enumerate(pruning_layers):
-            info = output.pruning_infos[layer_idx]
-            current_mask = info.get('current_mask')
-            if current_mask is None:
-                # 向后兼容：如果没有 current_mask，使用除法计算
-                if i == 0:
-                    p_i = cumulative_ratios[i]
-                else:
-                    prev_cum = cumulative_ratios[i - 1].clamp(min=1e-6)
-                    p_i = cumulative_ratios[i] / prev_cum
-            else:
-                p_i = current_mask.float().mean()
-            p_i = p_i.clamp(min=1e-6, max=1.0)
-            independent_ratios.append(p_i)
 
         # 计算各段的层数：[n0, n1, ..., nK]，长度 = n_pruning_layers + 1
         # n0 = 第一层剪枝前的层数（这些层没有被剪）
@@ -372,18 +422,26 @@ def train_step(
         segment_lengths.append(total_layers - pruning_layers[-1])
 
         if sparsity_loss_mode == 'exact':
-            # avg = (n0*1 + n1*p1 + n2*p1*p2 + ...) / total_layers
+            # 直接使用 cumulative_ratio 计算平均算力（最贴近“全层平均算力”的定义）
+            # avg = (n0*1 + n1*r1 + n2*r2 + ... ) / total_layers
+            # 其中 r_i 为 pruning_layers[i] 处的 cumulative_mask mean
             avg_kept = torch.tensor(0.0, device=device)
             avg_kept = avg_kept + segment_lengths[0] * 1.0
-            cumulative_product = torch.tensor(1.0, device=device)
             for i in range(n_pruning_layers):
-                cumulative_product = cumulative_product * independent_ratios[i]
-                avg_kept = avg_kept + segment_lengths[i + 1] * cumulative_product
+                avg_kept = avg_kept + segment_lengths[i + 1] * cumulative_ratios[i]
             avg_kept = avg_kept / total_layers
             sparsity_loss = torch.abs(avg_kept - target_ratio)
             stats['avg_kept_ratio'] = avg_kept.item()
         else:
             # harmonic mean 近似
+            # 先从 cumulative_ratios 恢复每层的条件独立保留率 p_i = r_i / r_{i-1}
+            independent_ratios = []
+            for i in range(n_pruning_layers):
+                if i == 0:
+                    p_i = cumulative_ratios[i]
+                else:
+                    p_i = cumulative_ratios[i] / cumulative_ratios[i - 1].clamp(min=1e-6)
+                independent_ratios.append(p_i.clamp(min=1e-6, max=1.0))
             inv_sum = sum(1.0 / p for p in independent_ratios)
             hm = n_pruning_layers / inv_sum
             avg_approx = torch.tensor(0.0, device=device)

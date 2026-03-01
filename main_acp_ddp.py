@@ -756,6 +756,23 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                         per_layer_strs.append(f"L{layer_idx}={mse_val:.4f}(cos={cosine_val:.3f})")
                     logger.info(f"  Alignment: MSE={stats['avg_mse']:.4f}, Cosine={stats['avg_cosine']:.3f} [{', '.join(per_layer_strs)}]")
 
+                # Delayed repair：显示 mean/var 对齐诊断指标（更弱监督，但可判断方差是否在收敛）
+                if 'raw_repair_loss' in stats and stats.get('repair_weight', 0.0) > 0:
+                    mean_mse = stats.get('raw_repair_mean_mse', 0.0)
+                    var_mse = stats.get('raw_repair_var_mse', 0.0)
+                    token_mse = stats.get('raw_repair_token_mse', 0.0)
+                    var_w = stats.get('repair_var_weight', 1.0)
+                    per_layer = []
+                    per_layer_mean = stats.get('repair_mean_per_layer', {})
+                    per_layer_var = stats.get('repair_var_per_layer', {})
+                    for layer_idx in sorted(per_layer_mean.keys()):
+                        per_layer.append(f"L{layer_idx}={per_layer_mean[layer_idx]:.4f}+{var_w}*{per_layer_var.get(layer_idx, 0.0):.4f}")
+                    layer_str = f" [{', '.join(per_layer)}]" if per_layer else ""
+                    logger.info(
+                        f"  RepairAlign: total={stats['raw_repair_loss']:.4f} "
+                        f"(mean={mean_mse:.4f}, var={var_mse:.4f}, token_mse={token_mse:.4f}, var_w={var_w}){layer_str}"
+                    )
+
             # 计算 eval loss（用于检测过拟合，按 batch 数判断）
             if eval_loss_loader is not None and global_batch % eval_loss_every == 0:
                 # 获取一个 eval batch

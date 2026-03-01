@@ -19,13 +19,13 @@ global_settings:
 
 config_settings:
   # 每次启动都把整份配置打印到 log 里会很长；默认关闭，只保留关键日志。
-  log_config_on_load: false
+  log_config_on_load: true
 
 # 观察到总batch增加后，准确率大幅上升
 trainer_settings:
   dl_settings:
     epochs: 1
-    batch_size: 1
+    batch_size: 2
     gradient_accumulation_steps: 4
     # 序列最大长度（LLaVA 1.5: 576 vision tokens + 文本）
     # ScienceQA 等长文本数据集建议 2048，VQAv2 等短文本可用 1024
@@ -55,7 +55,7 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 150000
+    train: 50000
     test: 5000
   fast_load_no_random: false
   category_priority:
@@ -99,7 +99,7 @@ method_settings:
   hybrid_phase1_end: 0.6    # 探索期结束点（占总步数比例）
   hybrid_phase2_end: 0.8    # 稳定期结束点，之后进入对齐期（关闭 noise）
   hybrid_phase1_temp_start: 1.5   # 探索期起始温度
-  hybrid_phase1_temp_end: 0.5     # 探索期结束温度（也是稳定期和对齐期温度）
+  hybrid_phase1_temp_end: 0.2     # 探索期结束温度（也是稳定期和对齐期温度）
 
   # ==================== 对抗训练（禁用） ====================
   # 当前训练：不使用判别器；用 teacher keep-all 前向作为 source 分布，
@@ -177,7 +177,7 @@ method_settings:
   # L4 之后：修复点放在 13
   # L14 之后：修复点放在 22
   # L24 之后：修复点放在 29
-  repair_layers: [13, 22, 29]
+  repair_layers: [12, 22, 29]
   # repair 上下文来源（与 repair_layers 一一对应）
   repair_source_layers: [4, 14, 24]
   repair_bottleneck_dim: 512
@@ -185,23 +185,23 @@ method_settings:
   repair_mask_encoder_type: attention
   repair_use_pruned_info: true
   repair_alpha_init: 0.1
-  # 默认 detach 输入：repair 的梯度不回流到 pruner（更稳定）
-  repair_detach_input: true
+  # 更强监督通路：repair_loss 允许经由 base hidden_states 回流到 pruner（更强但可能更不稳定）
+  repair_detach_input: false
 
   # teacher 前向（每 step 一次）：keep_all 作为 source 分布
   teacher_forward_enable: true
   teacher_pruning_mode: keep_all
 
   # repair loss（分布级对齐，而非点到点对齐）
-  repair_loss_weight: 0.1
+  repair_loss_weight: 3.0
   repair_loss_type: mean_var   # mean_var | mse
-  repair_var_weight: 1.0
+  repair_var_weight: 3.0
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 192  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
@@ -218,7 +218,7 @@ method_settings:
   temperature_min: 0.1
   temperature_anneal_rate: 0.5
   # 评估时使用的温度（应与训练结束时的温度一致）
-  eval_temperature: 0.5
+  eval_temperature: 0.2
   # 评估时的剪枝阈值（sigmoid 后的阈值，默认 0.5）
   # 降低阈值会保留更多 token，提高阈值会剪掉更多 token
   eval_pruning_threshold: 0.5
@@ -230,7 +230,7 @@ method_settings:
 
   task_loss_weight: 1.5
   adv_loss_weight: 1.0
-  sparsity_weight: 20.0   # 提高到 5.0，让 sparsity loss 有足够影响力
+  sparsity_weight: 40.0   # 提高到 5.0，让 sparsity loss 有足够影响力
   entropy_weight: 0    # Entropy 正则：鼓励 logits 生成极端值，使训练和推理行为一致
   # Per-Pruner Tightening: 惩罚每个 pruner 的保留率，使其倾向于剪掉更多 tokens
   # 可以是单个值（所有层相同）或 list（对应 pruning_layers 的每一层）

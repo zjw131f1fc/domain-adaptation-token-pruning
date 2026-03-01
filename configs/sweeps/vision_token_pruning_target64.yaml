@@ -187,7 +187,8 @@ method_settings:
   repair_use_pruned_info: true
   repair_alpha_init: 0.1
   # 默认 detach 输入：repair 的梯度不回流到 pruner（更稳定）
-  repair_detach_input: true
+  # 更强监督通路：repair_loss 允许经由 base hidden_states 回流到 pruner（更强但可能更不稳定）
+  repair_detach_input: false
 
   # teacher 前向（每 step 一次）：keep_all 作为 source 分布
   teacher_forward_enable: true
