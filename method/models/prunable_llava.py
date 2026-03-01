@@ -219,7 +219,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
     def _replace_all_layers(self):
         """替换所有层为 PrunableLlamaDecoderLayer
 
-        剪枝层：有 pruner, discriminator, adapter
+        剪枝层：有 pruner, discriminator，并在 pruning_info 中缓存 repair context（供 delayed repair 使用）
         非剪枝层：没有 pruner，但可以应用 cumulative_mask（post-softmax masking）
         """
         llm = self.base_model.model.language_model
@@ -245,7 +245,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 repair_adapter.to(device=layer_device, dtype=layer_dtype)
 
             if layer_idx in self.pruning_layers:
-                # 剪枝层：有 pruner, discriminator, adapter
+                # 剪枝层：有 pruner, discriminator（并可缓存 repair context）
                 pruner = self.pruner_manager.get_pruner(layer_idx)
                 discriminator = self.disc_manager.get_discriminator(layer_idx)
                 pruner.to(device=layer_device, dtype=layer_dtype)
@@ -681,11 +681,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         return chain(*param_iters)
 
     def freeze_base_model(self):
-        """冻结基础模型参数（但保持 pruner, discriminator, adapter 可训练）"""
+        """冻结基础模型参数（但保持 pruner、discriminator、delayed repair 模块可训练）"""
         for param in self.base_model.parameters():
             param.requires_grad = False
 
-        # 重新启用 pruner, discriminator, adapter 的梯度
+        # 重新启用 pruner、discriminator、repair 的梯度
         # （因为它们已经被添加到 llm.layers 中，会被上面的循环冻结）
         for param in self.pruner_manager.parameters():
             param.requires_grad = True
@@ -981,8 +981,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # kept_indices[i] = 原始序列中被保留的 token 索引列表
         kept_indices = [list(range(seq_len)) for _ in range(batch_size)]
 
-        # 累积 vision mask（相对于原始 n_vision 个 token，用于 adapter）
-        # 与训练时保持一致：adapter 接收的 mask 始终是原始 n_vision 维
+        # 累积 vision mask（相对于原始 n_vision 个 token）
+        # 与训练时保持一致：mask 始终是原始 n_vision 维（供 pruner / repair context encoder 使用）
         cumulative_vision_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
 
         for layer_idx, decoder_layer in enumerate(llm.layers):
@@ -1038,10 +1038,6 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             query_states = attn.q_proj(hidden_normed)
             key_states = attn.k_proj(hidden_normed)
             value_states = attn.v_proj(hidden_normed)
-
-            # 保存 query_states_flat 用于 adapter（在 reshape 之前）
-            # 与训练时保持一致：adapter 接收 (batch, seq, hidden_size) 的 query
-            query_states_flat = query_states
 
             # Reshape
             query_states = query_states.view(batch_size, current_seq_len, num_heads, head_dim).transpose(1, 2)

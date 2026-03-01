@@ -187,7 +187,7 @@ def load_model(config, device: torch.device, local_rank: int):
     if logger:
         logger.info(f"Model loaded. Pruning layers: {pruning_layers}, gumbel_mode: {gumbel_mode}")
         logger.info(f"Trainable parameters: Pruners={sum(p.numel() for p in model.get_pruner_parameters()):,}, "
-                   f"Adapters={sum(p.numel() for p in model.get_adapter_parameters()):,}, "
+                   f"Repair={sum(p.numel() for p in model.get_adapter_parameters()):,}, "
                    f"Discriminators={sum(p.numel() for p in model.get_discriminator_parameters()):,}")
 
     return model, processor
