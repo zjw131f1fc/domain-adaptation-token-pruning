@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: null
+  checkpoint: outputs/tasks/20260301-1919_vqa-vqav2_llava157b_c110/checkpoints/checkpoint_final.pt
   # 加载 checkpoint 时是否重置 step 计数（用于在新数据集上微调时重新开始退火）
   reset_step_on_load: true
 
@@ -53,10 +53,10 @@ trainer_settings:
     grad_clip_max_norm: null
 
 dataset_settings:
-  name: "vqa-vqav2"
+  name: "vqa-mme"
   split:
-    train: 20000
-    test: 5000
+    train: -1
+    test: "all"
   fast_load_no_random: false
   category_priority:
     enable: false
@@ -201,7 +201,7 @@ method_settings:
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火

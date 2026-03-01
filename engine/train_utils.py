@@ -313,19 +313,24 @@ def train_step(
     # 2. Repair loss（teacher-forcing, gen_answer region, distribution alignment）
     if (teacher_output is not None) and output.captured and teacher_output.captured:
         student_caps = output.captured_for_repair or output.captured
+        student_caps_pre = getattr(output, "captured_pre_repair", None) or output.captured
         teacher_caps = teacher_output.captured
         layer_losses = []
         layer_mean_mse = []
         layer_var_mse = []
         layer_token_mse = []
+        layer_pre_losses = []
         per_layer = {}
         per_layer_mean = {}
         per_layer_var = {}
         per_layer_token = {}
+        per_layer_pre = {}
+        per_layer_gain = {}
         for layer_idx in capture_layers:
             if layer_idx not in student_caps or layer_idx not in teacher_caps:
                 continue
             s = student_caps[layer_idx]
+            s_pre = student_caps_pre.get(layer_idx, None) if isinstance(student_caps_pre, dict) else None
             t = teacher_caps[layer_idx]
             m = s["mask"] * t["mask"]
             details = compute_distribution_alignment_details(
@@ -346,16 +351,33 @@ def train_step(
             per_layer_var[layer_idx] = float(details["var_mse"].detach().item())
             per_layer_token[layer_idx] = float(details["token_mse"].detach().item())
 
+            # 诊断：修复前的 gap（不参与反传）
+            if s_pre is not None:
+                with torch.no_grad():
+                    pre_details = compute_distribution_alignment_details(
+                        s_pre["h"], t["h"], s_pre["mask"] * t["mask"],
+                        loss_type=repair_loss_type,
+                        var_weight=repair_var_weight,
+                    )
+                pre_total = pre_details["total"]
+                layer_pre_losses.append(pre_total)
+                pre_val = float(pre_total.detach().item())
+                post_val = float(details["total"].detach().item())
+                per_layer_pre[layer_idx] = pre_val
+                per_layer_gain[layer_idx] = pre_val - post_val
+
         if layer_losses:
             repair_loss = torch.stack(layer_losses).mean()
             mean_mse = torch.stack(layer_mean_mse).mean()
             var_mse = torch.stack(layer_var_mse).mean()
             token_mse = torch.stack(layer_token_mse).mean()
+            pre_repair = torch.stack(layer_pre_losses).mean() if layer_pre_losses else torch.tensor(0.0, device=device)
         else:
             repair_loss = torch.tensor(0.0, device=device)
             mean_mse = torch.tensor(0.0, device=device)
             var_mse = torch.tensor(0.0, device=device)
             token_mse = torch.tensor(0.0, device=device)
+            pre_repair = torch.tensor(0.0, device=device)
 
         losses['repair_loss'] = repair_loss
         stats['raw_repair_loss'] = float(repair_loss.detach().item())
@@ -363,17 +385,23 @@ def train_step(
         stats['raw_repair_mean_mse'] = float(mean_mse.detach().item())
         stats['raw_repair_var_mse'] = float(var_mse.detach().item())
         stats['raw_repair_token_mse'] = float(token_mse.detach().item())
+        stats['raw_repair_pre'] = float(pre_repair.detach().item())
+        stats['raw_repair_gain'] = float((pre_repair - repair_loss).detach().item())
         stats['repair_var_weight'] = float(repair_var_weight)
         stats['repair_per_layer'] = per_layer
         stats['repair_mean_per_layer'] = per_layer_mean
         stats['repair_var_per_layer'] = per_layer_var
         stats['repair_token_per_layer'] = per_layer_token
+        stats['repair_pre_per_layer'] = per_layer_pre
+        stats['repair_gain_per_layer'] = per_layer_gain
     else:
         losses['repair_loss'] = torch.tensor(0.0, device=device)
         stats['raw_repair_loss'] = 0.0
         stats['raw_repair_mean_mse'] = 0.0
         stats['raw_repair_var_mse'] = 0.0
         stats['raw_repair_token_mse'] = 0.0
+        stats['raw_repair_pre'] = 0.0
+        stats['raw_repair_gain'] = 0.0
 
     # 3. Sparsity Loss
     if output.pruning_infos and len(output.pruning_infos) > 0:

@@ -87,6 +87,8 @@ class PrunableLlavaOutput:
     captured: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     # 仅用于 repair loss 的捕获（可选：对 base hidden_states 做 stop-grad，避免 repair loss 回流到 pruner）
     captured_for_repair: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    # 仅用于诊断：repair 发生前（同一 pruning 条件下）的 gen_answer 表征
+    captured_pre_repair: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
 
 
 class PrunableLlavaForConditionalGeneration(nn.Module):
@@ -476,6 +478,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         capture_layers_set = set(capture_layers or [])
         captured = {}
         captured_for_repair = {}
+        captured_pre_repair = {}
 
         # 运行时决定是否应用 repair（默认：仅当启用 repair_adapter 时才应用）
         if apply_repair is None:
@@ -588,6 +591,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
 
             # === Delayed repair: 仅修复 gen_answer tokens ===
             hidden_states_for_repair = None
+            hidden_states_pre_repair = None
             if (
                 apply_repair
                 and self.use_repair_adapter
@@ -605,6 +609,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 if ctx is not None:
                     adapter = self.repair_adapter_manager.get_adapter(layer_idx)
                     base = hidden_states
+                    # 诊断用：记录修复前的表示（同一 pruning 条件下）
+                    hidden_states_pre_repair = base.detach()
                     adapter_in = base.detach() if self.repair_detach_input else base
                     adapted = adapter(
                         adapter_in,
@@ -629,9 +635,15 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 captured[layer_idx] = _capture_gen_answer(hidden_states)
                 if hidden_states_for_repair is not None:
                     captured_for_repair[layer_idx] = _capture_gen_answer(hidden_states_for_repair)
+                    # 如果 repair 生效，优先使用修复前的 base；否则退化为当前 hidden_states（detach）
+                    if hidden_states_pre_repair is not None:
+                        captured_pre_repair[layer_idx] = _capture_gen_answer(hidden_states_pre_repair)
+                    else:
+                        captured_pre_repair[layer_idx] = _capture_gen_answer(hidden_states.detach())
                 else:
                     # 非 repair layer：保持一致（但 detach 一下以避免无意义的图保留）
                     captured_for_repair[layer_idx] = _capture_gen_answer(hidden_states.detach())
+                    captured_pre_repair[layer_idx] = _capture_gen_answer(hidden_states.detach())
 
 
         # Final LayerNorm
@@ -661,6 +673,7 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             adjusted_answer_ends=answer_ends,
             captured=captured if capture_layers_set else None,
             captured_for_repair=captured_for_repair if capture_layers_set else None,
+            captured_pre_repair=captured_pre_repair if capture_layers_set else None,
         )
 
     def set_temperature(self, temperature: float):

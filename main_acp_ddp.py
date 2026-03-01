@@ -761,6 +761,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     mean_mse = stats.get('raw_repair_mean_mse', 0.0)
                     var_mse = stats.get('raw_repair_var_mse', 0.0)
                     token_mse = stats.get('raw_repair_token_mse', 0.0)
+                    pre_gap = stats.get('raw_repair_pre', 0.0)
+                    gain = stats.get('raw_repair_gain', 0.0)
                     var_w = stats.get('repair_var_weight', 1.0)
                     per_layer = []
                     per_layer_mean = stats.get('repair_mean_per_layer', {})
@@ -770,7 +772,8 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                     layer_str = f" [{', '.join(per_layer)}]" if per_layer else ""
                     logger.info(
                         f"  RepairAlign: total={stats['raw_repair_loss']:.4f} "
-                        f"(mean={mean_mse:.4f}, var={var_mse:.4f}, token_mse={token_mse:.4f}, var_w={var_w}){layer_str}"
+                        f"(pre={pre_gap:.4f} -> post={stats['raw_repair_loss']:.4f}, gain={gain:.4f}; "
+                        f"mean={mean_mse:.4f}, var={var_mse:.4f}, token_mse={token_mse:.4f}, var_w={var_w}){layer_str}"
                     )
 
             # 计算 eval loss（用于检测过拟合，按 batch 数判断）
