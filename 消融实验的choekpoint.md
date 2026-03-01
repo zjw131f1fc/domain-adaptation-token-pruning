@@ -10,5 +10,6 @@ no adapter only pruner  128实际约192  outputs/tasks/20260227-0811_vqa-vqav2_l
 
 192 vqav2base  outputs/tasks/20260301-1919_vqa-vqav2_llava157b_c110/checkpoints/checkpoint_final.pt
 
+128 vqav2base  outputs/tasks/20260302-0000_vqa-vqav2_llava157b_acea/checkpoints/checkpoint_final.pt
 
 64 vqav2base  outputs/tasks/20260301-2248_vqa-vqav2_llava157b_250c/checkpoints/checkpoint_final.pt
