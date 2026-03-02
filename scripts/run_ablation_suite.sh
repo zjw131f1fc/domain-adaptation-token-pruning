@@ -19,6 +19,11 @@
 
 set -euo pipefail
 
+# Ensure we run from repo root (so relative paths like logs/ and configs/ resolve).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR"
+
 GPU_IDS="${1:-}"
 if [[ -z "$GPU_IDS" ]]; then
   echo "Error: GPU_IDS is required (use your 2 GPUs), e.g. '4,5'." >&2
@@ -72,9 +77,10 @@ function _latest_eval_log() {
 function _extract_final_ckpt() {
   local train_log="$1"
   local ckpt
-  ckpt="$(grep -F \"Training completed. Final checkpoint saved to\" \"$train_log\" | tail -n 1 | sed -E 's/.*Final checkpoint saved to //')"
+  ckpt="$(grep -F 'Training completed. Final checkpoint saved to' "$train_log" | tail -n 1 | sed -E 's/^.*Final checkpoint saved to //')"
   if [[ -z "$ckpt" ]]; then
-    return 1
+    # Fallback: infer from latest task checkpoint (useful if log parsing changes).
+    ckpt="$(ls -1t outputs/tasks/*/checkpoints/checkpoint_final.pt 2>/dev/null | head -n 1 || true)"
   fi
   echo "$ckpt"
 }
