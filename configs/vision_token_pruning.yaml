@@ -55,7 +55,7 @@ trainer_settings:
 dataset_settings:
   name: "vqa-vqav2"
   split:
-    train: 20000
+    train: 10000
     test: 5000
   fast_load_no_random: false
   category_priority:
@@ -82,8 +82,8 @@ method_settings:
 
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  # pruning_layers: [1,13,25]
-  pruning_layers: [4,14,24]
+  pruning_layers: [1,13,25]
+  # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
@@ -160,7 +160,8 @@ method_settings:
   # L24 之后：修复点放在 29
   repair_layers: [12, 22, 29]
   # repair 上下文来源（与 repair_layers 一一对应）
-  repair_source_layers: [4, 14, 24]
+  # repair_source_layers: [4, 14, 24]
+  repair_source_layers: [1,13,25]
   repair_bottleneck_dim: 512
   repair_dropout: 0.0
   repair_mask_encoder_type: attention
@@ -175,14 +176,16 @@ method_settings:
 
   # repair loss（分布级对齐，而非点到点对齐）
   repair_loss_weight: 3.0
+  # repair_loss_weight: 0.0
   repair_loss_type: mean_var   # mean_var | mse
   repair_var_weight: 3.0
+  # repair_var_weight: 0.0
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
 
   # ==================== 剪枝目标 ====================
-  target_token_num: 128  # 目标保留的 vision token 数量
+  target_token_num: 64  # 目标保留的 vision token 数量
   # 剪枝目标退火：从 100% 保留逐渐退火到 target_token_num
   # 0.0 = 不退火，直接使用目标值
   # 0.3 = 前 30% 训练步数进行余弦退火
@@ -229,4 +232,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["origin", "hard_forward"]
+  eval_mode: ["hard_forward"]

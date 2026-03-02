@@ -13,3 +13,9 @@ no adapter only pruner  128实际约192  outputs/tasks/20260227-0811_vqa-vqav2_l
 128 vqav2base  outputs/tasks/20260302-0000_vqa-vqav2_llava157b_acea/checkpoints/checkpoint_final.pt
 
 64 vqav2base  outputs/tasks/20260301-2248_vqa-vqav2_llava157b_250c/checkpoints/checkpoint_final.pt
+
+64 vqav2base no adapter outputs/tasks/20260302-0853_vqa-vqav2_llava157b_c65b/checkpoints/checkpoint_final.pt   76.73/80.49
+
+64 vqav2base no adapter no repair loss outputs/tasks/20260302-0945_vqa-vqav2_llava157b_882d/checkpoints/checkpoint_final.pt  76.73  不要了  看起来repair loss 可以看作只作用在adapter上，也可能是梯度传到有bug，传不到pruner
+
+64 vqav2base no repair loss outputs/tasks/20260302-1035_vqa-vqav2_llava157b_8507/checkpoints/checkpoint_final.pt  74.83

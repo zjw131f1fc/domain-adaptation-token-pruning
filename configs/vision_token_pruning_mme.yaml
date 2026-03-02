@@ -13,7 +13,7 @@ global_settings:
   # Checkpoint 路径（用于恢复训练或评估）
   # 训练时：如果指定则从该 checkpoint 恢复训练
   # 评估时：必须指定，否则报错（也可通过命令行 --checkpoint 覆盖）
-  checkpoint: outputs/tasks/20260301-1919_vqa-vqav2_llava157b_c110/checkpoints/checkpoint_final.pt
+  checkpoint: outputs/tasks/20260301-2248_vqa-vqav2_llava157b_250c/checkpoints/checkpoint_final.pt
   # 加载 checkpoint 时是否重置 step 计数（用于在新数据集上微调时重新开始退火）
   reset_step_on_load: true
 
@@ -76,8 +76,8 @@ method_settings:
 
   # ==================== 剪枝层配置 ====================
   # 剪枝器和判别器是配套的，每个剪枝层都有一个判别器
-  # pruning_layers: [1,13,25]
-  pruning_layers: [4,14,24]
+  pruning_layers: [1,13,25]
+  # pruning_layers: [4,14,24]
 
   # ==================== Pruner 配置 ====================
   # CrossAttentionPruner: 使用可学习 queries 评估 vision tokens 重要性
