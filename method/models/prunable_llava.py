@@ -407,7 +407,15 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         else:
             cumulative_mask = None
 
-        # === w/o pruner baseline：top-k attention schedule（逐 pruning layer 逐步收缩到 target_token_num）===
+        # === w/o pruner baseline：top-k attention baseline ===
+        # 目标：
+        # - 不依赖任何“遗留/手工填写”的 per-layer k（例如旧配置里的 pruner_topk_ks）
+        # - 仅依赖 target_token_num=K，并在每个 pruning layer 都使用同一个 K
+        #   （由于 cumulative_mask 的存在，实际上在第一个 pruning layer 选出 K 之后，后续层不会“复活”被剪掉的 token）
+        #
+        # 之前实现过“逐层收缩”的 geometric schedule（K_i 从大到小收缩到 K），
+        # 但这会导致早期层保留显著多于 K，从而造成 avg_kept_ratio 明显高于 target_ratio，
+        # 在日志上看起来像是“k 用了旧值/不对齐”。这里改为固定 K，更符合 paper 的 top-k baseline 直觉。
         topk_schedule = None
         if pruning_mode == "topk_attn":
             if target_token_num is None:
@@ -419,20 +427,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             pruning_layers_sorted = sorted([int(x) for x in (self.pruning_layers or [])])
             if not pruning_layers_sorted:
                 raise ValueError("topk_attn mode requires non-empty pruning_layers.")
-            n_pruners = len(pruning_layers_sorted)
-            r_final = max(min(K / float(N), 1.0), 0.0)
-            topk_schedule = {}
-            prev_k = N
-            for i, layer_idx in enumerate(pruning_layers_sorted, start=1):
-                if i == n_pruners:
-                    k_i = K
-                else:
-                    ratio_i = r_final ** (float(i) / float(n_pruners))
-                    k_i = int(round(N * ratio_i))
-                    k_i = max(k_i, K)
-                k_i = min(k_i, prev_k)
-                topk_schedule[int(layer_idx)] = int(k_i)
-                prev_k = int(k_i)
+            K = max(0, min(K, N))
+            topk_schedule = {int(layer_idx): int(K) for layer_idx in pruning_layers_sorted}
 
         # === 当前状态（不做物理删除，位置保持不变）===
         hidden_states = inputs_embeds
