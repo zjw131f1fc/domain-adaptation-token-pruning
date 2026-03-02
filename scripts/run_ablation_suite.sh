@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run all paper ablations (128-token base) sequentially:
+# Run all paper ablations (target-token base) sequentially:
 #   1) Train / eval on VQAv2 via configs/vision_token_pruning.yaml (auto-eval at end of training)
 #   2) Eval the trained checkpoint on POPE via configs/vision_token_pruning_pope.yaml
 #
@@ -8,9 +8,10 @@
 #   - scripts/run_eval_ddp.sh
 #
 # Usage:
-#   ./scripts/run_ablation_suite.sh <GPU_IDS>
+#   ./scripts/run_ablation_suite.sh <GPU_IDS> [TARGET_TOKEN_NUM]
 # Example (2 GPUs):
-#   ./scripts/run_ablation_suite.sh 4,5
+#   ./scripts/run_ablation_suite.sh 4,5 128
+#   ./scripts/run_ablation_suite.sh 4,5 64
 #
 # Outputs:
 #   - logs/ddp_runs/train_*.log            (from run_ddp.sh)
@@ -29,6 +30,12 @@ if [[ -z "$GPU_IDS" ]]; then
   echo "Error: GPU_IDS is required (use your 2 GPUs), e.g. '4,5'." >&2
   exit 1
 fi
+TARGET_TOKEN_NUM="${2:-64}"
+if ! [[ "$TARGET_TOKEN_NUM" =~ ^[0-9]+$ ]]; then
+  echo "Error: TARGET_TOKEN_NUM must be an integer (got '$TARGET_TOKEN_NUM')." >&2
+  exit 1
+fi
+STUDY_PREFIX="ab${TARGET_TOKEN_NUM}"
 NUM_GPUS="$(echo "$GPU_IDS" | tr ',' '\n' | wc -l | tr -d ' ')"
 if [[ "$NUM_GPUS" != "2" ]]; then
   echo "Error: this suite expects exactly 2 GPUs (got '$GPU_IDS' => $NUM_GPUS GPUs)." >&2
@@ -54,13 +61,14 @@ mkdir -p "$SWEEP_DIR"
 
 echo "[AblationSuite] Run ID: $RUN_ID"
 echo "[AblationSuite] Sweep dir: $SWEEP_DIR"
+echo "[AblationSuite] Target token num: $TARGET_TOKEN_NUM"
 
 MANIFEST_PATH="$(python scripts/gen_ablation_configs.py \
   --base_train "$BASE_TRAIN_CFG" \
   --base_pope "$BASE_POPE_CFG" \
   --out_dir "$SWEEP_DIR" \
-  --target_token_num 128 \
-  --study_prefix ab128)"
+  --target_token_num "$TARGET_TOKEN_NUM" \
+  --study_prefix "$STUDY_PREFIX")"
 
 echo "[AblationSuite] Manifest: $MANIFEST_PATH"
 
