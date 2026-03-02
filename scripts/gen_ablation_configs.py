@@ -10,7 +10,7 @@ Outputs:
   - <out_dir>/configs/train_<variant>.yaml
   - <out_dir>/configs/pope_<variant>.yaml
 
-Variants (128-token base):
+Available variants:
   - full
   - w_o_pruner_topk_attn
   - w_o_adapter
@@ -137,6 +137,20 @@ def build_variants() -> List[Tuple[str, Dict[str, Any]]]:
     ]
 
 
+def _filter_variants(
+    variants: List[Tuple[str, Dict[str, Any]]],
+    selected: List[str] | None,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    if not selected:
+        return variants
+    name_to_variant = {name: opts for name, opts in variants}
+    unknown = [v for v in selected if v not in name_to_variant]
+    if unknown:
+        available = ", ".join([name for name, _ in variants])
+        raise ValueError(f"Unknown variants: {unknown}. Available: [{available}]")
+    return [(name, name_to_variant[name]) for name in selected]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_train", type=str, required=True, help="Base VQAv2 training config (yaml)")
@@ -144,6 +158,15 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--target_token_num", type=int, default=128, help="Target kept vision tokens (default: 128)")
     parser.add_argument("--study_prefix", type=str, default="ab128", help="Prefix for global_settings.study_name")
+    parser.add_argument(
+        "--variants",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated variant names to generate (default: generate all). "
+            "Example: 'w_o_pruner_topk_attn,repair_mean_only'."
+        ),
+    )
     args = parser.parse_args()
 
     base_train = Path(args.base_train)
@@ -159,7 +182,8 @@ def main() -> None:
     manifest_path = out_dir / "manifest.tsv"
     rows: List[str] = ["variant\ttrain_config\tpope_config"]
 
-    for variant, opts in build_variants():
+    selected = [v.strip() for v in (args.variants or "").split(",") if v.strip()]
+    for variant, opts in _filter_variants(build_variants(), selected):
         train_cfg = yaml.safe_load(yaml.safe_dump(train_base_cfg, sort_keys=False, allow_unicode=True))
         pope_cfg = yaml.safe_load(yaml.safe_dump(pope_base_cfg, sort_keys=False, allow_unicode=True))
 
@@ -200,4 +224,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

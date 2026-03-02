@@ -8,10 +8,11 @@
 #   - scripts/run_eval_ddp.sh
 #
 # Usage:
-#   ./scripts/run_ablation_suite.sh <GPU_IDS> [TARGET_TOKEN_NUM]
+#   ./scripts/run_ablation_suite.sh <GPU_IDS> [TARGET_TOKEN_NUM] [VARIANTS]
 # Example (2 GPUs):
 #   ./scripts/run_ablation_suite.sh 4,5 128
 #   ./scripts/run_ablation_suite.sh 4,5 64
+#   ./scripts/run_ablation_suite.sh 4,5 64 full,w_o_pruner_topk_attn,repair_mean_only
 #
 # Outputs:
 #   - logs/ddp_runs/train_*.log            (from run_ddp.sh)
@@ -35,6 +36,7 @@ if ! [[ "$TARGET_TOKEN_NUM" =~ ^[0-9]+$ ]]; then
   echo "Error: TARGET_TOKEN_NUM must be an integer (got '$TARGET_TOKEN_NUM')." >&2
   exit 1
 fi
+VARIANTS="${3:-full,w_o_pruner_topk_attn,repair_mean_only}"
 STUDY_PREFIX="ab${TARGET_TOKEN_NUM}"
 NUM_GPUS="$(echo "$GPU_IDS" | tr ',' '\n' | wc -l | tr -d ' ')"
 if [[ "$NUM_GPUS" != "2" ]]; then
@@ -62,13 +64,15 @@ mkdir -p "$SWEEP_DIR"
 echo "[AblationSuite] Run ID: $RUN_ID"
 echo "[AblationSuite] Sweep dir: $SWEEP_DIR"
 echo "[AblationSuite] Target token num: $TARGET_TOKEN_NUM"
+echo "[AblationSuite] Variants: $VARIANTS"
 
 MANIFEST_PATH="$(python scripts/gen_ablation_configs.py \
   --base_train "$BASE_TRAIN_CFG" \
   --base_pope "$BASE_POPE_CFG" \
   --out_dir "$SWEEP_DIR" \
   --target_token_num "$TARGET_TOKEN_NUM" \
-  --study_prefix "$STUDY_PREFIX")"
+  --study_prefix "$STUDY_PREFIX" \
+  --variants "$VARIANTS")"
 
 echo "[AblationSuite] Manifest: $MANIFEST_PATH"
 
