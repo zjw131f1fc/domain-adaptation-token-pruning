@@ -268,12 +268,35 @@ def evaluate(
     # 确保 local_log_interval 不超过每卡实际处理的样本数，否则日志永不触发
     log_interval = 200
     local_samples = len(local_indices)
+    min_local_samples = local_samples
+    if distributed and dist.is_initialized():
+        # 关键：某些数据集大小无法整除 world_size，会导致各 rank 的 local_samples 相差 1。
+        # 如果仍按各自 local_samples 触发中间 all_gather（collective），可能出现：
+        # - 某些 rank 在最后一步触发 interim gather
+        # - 其他 rank 已经进入最终 gather
+        # 从而 collective 顺序不一致导致卡死（典型 DDP deadlock）。
+        #
+        # 解决：用全局 min_local_samples 约束中间日志，只在所有 rank 都能达到的步数上触发。
+        min_tensor = torch.tensor(int(local_samples), device=device, dtype=torch.int64)
+        dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+        min_local_samples = int(min_tensor.item())
+
     if distributed and dist.is_initialized():
         # 每个 rank 处理 local_log_interval 个样本时，全局约处理 log_interval 个
         # 同时确保至少打印 4 次中间日志（如果样本数足够）
-        local_log_interval = max(1, min(log_interval // world_size, local_samples // 4))
+        safe_div = max(1, (min_local_samples // 4))
+        local_log_interval = max(1, min(log_interval // world_size, safe_div))
     else:
-        local_log_interval = max(1, min(log_interval, local_samples // 4))
+        safe_div = max(1, (local_samples // 4))
+        local_log_interval = max(1, min(log_interval, safe_div))
+
+    # 只允许触发到所有 rank 都能达到的最后一个同步步
+    last_sync_step = 0
+    if local_log_interval > 0:
+        if distributed and dist.is_initialized():
+            last_sync_step = (min_local_samples // local_log_interval) * local_log_interval
+        else:
+            last_sync_step = (local_samples // local_log_interval) * local_log_interval
 
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
@@ -428,7 +451,7 @@ def evaluate(
             samples_for_aggregate.append(sample_info)
 
         # 每 local_log_interval 步打印中间统计
-        if step_idx % local_log_interval == 0:
+        if (step_idx % local_log_interval == 0) and (step_idx <= last_sync_step):
             _print_interim_stats(
                 step_idx, predictions, references, kept_ratios, layer_kept_ratios,
                 judge, distributed, world_size, requires_aggregate_eval
