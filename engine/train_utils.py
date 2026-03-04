@@ -3,6 +3,8 @@
 import math
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
 from typing import Dict, Any, List
 
 from engine.data_utils import preprocess_batch
@@ -29,6 +31,7 @@ def compute_distribution_alignment_loss(
     mask: torch.Tensor,
     loss_type: str = "mean_var",
     var_weight: float = 1.0,
+    reduce_across_ranks: bool = True,
 ) -> torch.Tensor:
     """分布级对齐损失（仅用于 gen_answer tokens）。
 
@@ -41,23 +44,15 @@ def compute_distribution_alignment_loss(
             - "mse": 点到点 MSE（作为对照）
             - "mean_var": 对齐均值 + 方差（更像“分布接近”）
     """
-    Xs = _flatten_masked(student_h, mask).float()
-    Xt = _flatten_masked(teacher_h, mask).float()
-
-    if loss_type == "mse":
-        # 点到点：要求 token 顺序一致（这里 pad 后是对齐的）
-        n = min(Xs.shape[0], Xt.shape[0])
-        return F.mse_loss(Xs[:n], Xt[:n])
-
-    # mean + diag(var) 对齐
-    ms = Xs.mean(dim=0)
-    mt = Xt.mean(dim=0)
-    vs = Xs.var(dim=0, unbiased=False)
-    vt = Xt.var(dim=0, unbiased=False)
-
-    mean_loss = F.mse_loss(ms, mt)
-    var_loss = F.mse_loss(vs, vt)
-    return mean_loss + var_weight * var_loss
+    details = compute_distribution_alignment_details(
+        student_h=student_h,
+        teacher_h=teacher_h,
+        mask=mask,
+        loss_type=loss_type,
+        var_weight=var_weight,
+        reduce_across_ranks=reduce_across_ranks,
+    )
+    return details["total"]
 
 
 def compute_distribution_alignment_details(
@@ -66,26 +61,76 @@ def compute_distribution_alignment_details(
     mask: torch.Tensor,
     loss_type: str = "mean_var",
     var_weight: float = 1.0,
+    reduce_across_ranks: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """返回对齐损失及其可解释分解项（用于训练时打印诊断指标）。"""
-    Xs = _flatten_masked(student_h, mask).float()
-    Xt = _flatten_masked(teacher_h, mask).float()
+    if student_h is None or teacher_h is None or mask is None:
+        raise ValueError("compute_distribution_alignment_details requires student_h, teacher_h and mask.")
+    if student_h.dim() != 3 or teacher_h.dim() != 3 or mask.dim() != 2:
+        raise ValueError(
+            f"Expected student_h/teacher_h=(b,L,D) and mask=(b,L), got "
+            f"{tuple(student_h.shape)} / {tuple(teacher_h.shape)} / {tuple(mask.shape)}"
+        )
+    if student_h.shape != teacher_h.shape:
+        raise ValueError(f"student_h and teacher_h must have same shape, got {tuple(student_h.shape)} vs {tuple(teacher_h.shape)}")
 
-    ms = Xs.mean(dim=0)
-    mt = Xt.mean(dim=0)
-    vs = Xs.var(dim=0, unbiased=False)
-    vt = Xt.var(dim=0, unbiased=False)
+    # Masked moment matching over all valid gen_answer tokens in the (local) batch.
+    # In distributed training, optionally reduce moments across ranks to approximate "global batch" statistics.
+    h_s = student_h.float()
+    h_t = teacher_h.float()
+    m = mask.to(dtype=h_s.dtype)
+    m_exp = m.unsqueeze(-1)  # (b, L, 1)
+
+    sum_s = (h_s * m_exp).sum(dim=(0, 1))  # (D,)
+    sum_s2 = ((h_s * h_s) * m_exp).sum(dim=(0, 1))  # (D,)
+    sum_t = (h_t * m_exp).sum(dim=(0, 1))  # (D,)
+    sum_t2 = ((h_t * h_t) * m_exp).sum(dim=(0, 1))  # (D,)
+
+    # token-wise MSE (diagnostic + loss_type="mse")
+    diff2_sum = (((h_s - h_t) * m_exp) ** 2).sum()  # scalar
+
+    count = m.sum()  # scalar (token count)
+    d = float(h_s.shape[-1])
+
+    if reduce_across_ranks and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        # Fuse multiple reductions into one collective to reduce latency.
+        D = sum_s.shape[0]
+        pack = torch.cat(
+            [
+                sum_s,
+                sum_s2,
+                sum_t,
+                sum_t2,
+                count.reshape(1),
+                diff2_sum.reshape(1),
+            ],
+            dim=0,
+        )
+        pack = dist_nn_f.all_reduce(pack, op=dist.ReduceOp.SUM)
+        sum_s = pack[0:D]
+        sum_s2 = pack[D:2 * D]
+        sum_t = pack[2 * D:3 * D]
+        sum_t2 = pack[3 * D:4 * D]
+        count = pack[4 * D]
+        diff2_sum = pack[4 * D + 1]
+
+    denom = count.clamp(min=1.0)
+    inv = 1.0 / denom
+    ms = sum_s * inv
+    mt = sum_t * inv
+    # var = E[x^2] - (E[x])^2  (matches unbiased=False)
+    vs = sum_s2 * inv - ms * ms
+    vt = sum_t2 * inv - mt * mt
+
+    # Small numeric negatives can happen due to fp32 rounding.
+    vs = vs.clamp(min=0.0)
+    vt = vt.clamp(min=0.0)
 
     mean_mse = F.mse_loss(ms, mt)
     var_mse = F.mse_loss(vs, vt)
+    token_mse = diff2_sum / (denom * d)
 
-    n = min(Xs.shape[0], Xt.shape[0])
-    token_mse = F.mse_loss(Xs[:n], Xt[:n]) if n > 0 else torch.tensor(0.0, device=Xs.device)
-
-    if loss_type == "mse":
-        total = token_mse
-    else:
-        total = mean_mse + var_weight * var_mse
+    total = token_mse if loss_type == "mse" else (mean_mse + var_weight * var_mse)
 
     return {
         "total": total,

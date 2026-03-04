@@ -122,6 +122,18 @@ def parse_args():
     )
     p.add_argument("--deep_dive_neighbors", type=int, default=1, help="Neighbor layers (+/-K) to include around key layers.")
     p.add_argument("--deep_dive_topk", type=int, default=5, help="Add top-k layers with largest (B-A) mean L2 gap to deep-dive.")
+    p.add_argument(
+        "--skip_repair_layers_a",
+        type=str,
+        default="",
+        help="Comma-separated list of repair layer indices to skip for checkpoint A (e.g., '13' or '13,22'). Use 'first' to skip the first layer, 'last' to skip the last.",
+    )
+    p.add_argument(
+        "--skip_repair_layers_b",
+        type=str,
+        default="",
+        help="Comma-separated list of repair layer indices to skip for checkpoint B (e.g., '13' or '13,22'). Use 'first' to skip the first layer, 'last' to skip the last.",
+    )
     return p.parse_args()
 
 
@@ -172,6 +184,40 @@ def _parse_layer_list(s: str, *, num_layers: Optional[int] = None) -> List[int]:
             seen.add(x)
             dedup.append(x)
     return dedup
+
+
+def _parse_skip_repair_layers(skip_spec: str, all_repair_layers: List[int]) -> List[int]:
+    """Parse skip_repair_layers specification.
+
+    Args:
+        skip_spec: Comma-separated layer indices, or 'first'/'last' keywords.
+        all_repair_layers: All available repair layers from checkpoint (sorted).
+
+    Returns:
+        List of layer indices to skip.
+    """
+    skip_spec = (skip_spec or "").strip()
+    if not skip_spec:
+        return []
+
+    if not all_repair_layers:
+        return []
+
+    skip_layers = []
+    for part in skip_spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part == "first":
+            skip_layers.append(all_repair_layers[0])
+        elif part == "last":
+            skip_layers.append(all_repair_layers[-1])
+        else:
+            try:
+                skip_layers.append(int(part))
+            except ValueError:
+                print(f"  Warning: Invalid skip_repair_layers value '{part}', ignoring.")
+    return list(set(skip_layers))  # Remove duplicates
 
 
 def load_samples(num_samples: int, config_path: str):
@@ -411,8 +457,36 @@ def _infer_adapter_layers_from_state_dict(adapter_state_dict: Dict[str, Any]) ->
     return sorted(layers)
 
 
-def load_model_from_checkpoint(checkpoint_path: str, config_path: str, device: torch.device, model_path: str):
-    """Load PrunableLlava model; auto-enable repair adapter only if checkpoint contains its weights."""
+def _resolve_skip_repair_layers(checkpoint_path: str, skip_spec: str) -> List[int]:
+    """Resolve skip_repair_layers by loading checkpoint and parsing spec.
+
+    Args:
+        checkpoint_path: Path to checkpoint file.
+        skip_spec: Skip specification (e.g., 'first', '13', '13,22').
+
+    Returns:
+        List of layer indices to skip.
+    """
+    if not skip_spec.strip():
+        return []
+
+    try:
+        meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "repair_adapter_state_dict" not in meta:
+            return []
+        all_layers = _infer_adapter_layers_from_state_dict(meta["repair_adapter_state_dict"])
+        return _parse_skip_repair_layers(skip_spec, all_layers)
+    except Exception as e:
+        print(f"  Warning: Failed to resolve skip_repair_layers from {checkpoint_path}: {e}")
+        return []
+
+
+def load_model_from_checkpoint(checkpoint_path: str, config_path: str, device: torch.device, model_path: str, skip_repair_layers: Optional[List[int]] = None):
+    """Load PrunableLlava model; auto-enable repair adapter only if checkpoint contains its weights.
+
+    Args:
+        skip_repair_layers: List of repair layer indices to skip loading (e.g., [13] to skip layer 13).
+    """
     from transformers import LlavaForConditionalGeneration
     from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
     from engine.configs.loader import load_config
@@ -437,8 +511,18 @@ def load_model_from_checkpoint(checkpoint_path: str, config_path: str, device: t
             if repair_layers_cfg and (sorted([int(x) for x in repair_layers_cfg]) != inferred):
                 print(f"  Note: config repair_layers={repair_layers_cfg} != checkpoint repair_layers={inferred}; using checkpoint.")
             repair_layers_for_model = inferred
+
+            # Apply skip_repair_layers filter
+            if skip_repair_layers:
+                original_layers = repair_layers_for_model
+                repair_layers_for_model = [l for l in repair_layers_for_model if l not in skip_repair_layers]
+                print(f"  Note: Skipping repair layers {skip_repair_layers}. Using layers {repair_layers_for_model} (original: {original_layers})")
+                if not repair_layers_for_model:
+                    print("  Warning: All repair layers were skipped; disabling repair adapter.")
+                    use_repair_adapter = False
+
             # Only keep explicit source mapping if it matches inferred layers length.
-            if repair_source_layers_cfg is not None and len(list(repair_source_layers_cfg)) != len(inferred):
+            if repair_source_layers_cfg is not None and len(list(repair_source_layers_cfg)) != len(repair_layers_for_model):
                 print(
                     "  Note: config repair_source_layers length mismatches checkpoint repair_layers; "
                     "disabling explicit mapping (will auto-pick nearest pruning layer)."
@@ -482,8 +566,25 @@ def load_model_from_checkpoint(checkpoint_path: str, config_path: str, device: t
         print("  Loaded pruner_state_dict")
     if model.use_repair_adapter:
         model.repair_context_encoder.load_state_dict(ckpt["repair_context_encoder_state_dict"])
-        model.repair_adapter_manager.load_state_dict(ckpt["repair_adapter_state_dict"])
-        print("  Loaded repair_context_encoder_state_dict + repair_adapter_state_dict")
+
+        # Selectively load repair adapter weights (skip specified layers)
+        full_adapter_state = ckpt["repair_adapter_state_dict"]
+        if skip_repair_layers:
+            filtered_state = {}
+            for key, value in full_adapter_state.items():
+                # Check if this key belongs to a skipped layer
+                # Expected key format: 'adapters.{layer_idx}....'
+                m = re.match(r"^adapters\.(\d+)\.", str(key))
+                if m:
+                    layer_idx = int(m.group(1))
+                    if layer_idx in skip_repair_layers:
+                        continue  # Skip this layer
+                filtered_state[key] = value
+            model.repair_adapter_manager.load_state_dict(filtered_state, strict=False)
+            print(f"  Loaded repair_adapter_state_dict (skipped layers: {skip_repair_layers})")
+        else:
+            model.repair_adapter_manager.load_state_dict(full_adapter_state)
+            print("  Loaded repair_context_encoder_state_dict + repair_adapter_state_dict")
 
     model.eval()
     return model, config
@@ -1411,6 +1512,15 @@ def main():
     print(f"Config A: {args.config_a}")
     print(f"Config B: {args.config_b}")
 
+    # Resolve skip_repair_layers for A and B
+    print("\n=== Resolving skip_repair_layers ===")
+    skip_repair_layers_a = _resolve_skip_repair_layers(args.checkpoint_a, args.skip_repair_layers_a)
+    skip_repair_layers_b = _resolve_skip_repair_layers(args.checkpoint_b, args.skip_repair_layers_b)
+    if skip_repair_layers_a:
+        print(f"  Checkpoint A: will skip repair layers {skip_repair_layers_a}")
+    if skip_repair_layers_b:
+        print(f"  Checkpoint B: will skip repair layers {skip_repair_layers_b}")
+
     # load samples (use real config for dataset settings)
     samples = load_samples(args.num_samples, args.config_real)
     print(f"Loaded {len(samples)} samples")
@@ -1432,7 +1542,7 @@ def main():
             model_path=args.model_path,
         )
     else:
-        model_real, _ = load_model_from_checkpoint(args.checkpoint_real, args.config_real, device, args.model_path)
+        model_real, _ = load_model_from_checkpoint(args.checkpoint_real, args.config_real, device, args.model_path, skip_repair_layers=None)
     num_layers_total = _infer_num_decoder_layers(model_real)
 
     # Resolve capture layers (may depend on model depth when using 'all' / open ranges)
@@ -1482,7 +1592,7 @@ def main():
 
         # A pooled
         print("\n=== Load & run A (summary) ===")
-        model_a, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path)
+        model_a, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path, skip_repair_layers=skip_repair_layers_a)
         apply_repair_a = bool(getattr(model_a, "use_repair_adapter", False))
         a_pooled = collect_pooled_only(
             model=model_a,
@@ -1499,7 +1609,7 @@ def main():
 
         # B pooled
         print("\n=== Load & run B (summary) ===")
-        model_b, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path)
+        model_b, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path, skip_repair_layers=skip_repair_layers_b)
         apply_repair_b = bool(getattr(model_b, "use_repair_adapter", False))
         b_pooled = collect_pooled_only(
             model=model_b,
@@ -1586,7 +1696,7 @@ def main():
                 model_path=args.model_path,
             )
         else:
-            model_real2, _ = load_model_from_checkpoint(args.checkpoint_real, args.config_real, device, args.model_path)
+            model_real2, _ = load_model_from_checkpoint(args.checkpoint_real, args.config_real, device, args.model_path, skip_repair_layers=None)
         data_real = collect_h_real_only(
             model=model_real2,
             prepared_samples=prepared,
@@ -1599,7 +1709,7 @@ def main():
 
         # A deep-dive
         print("\n=== Load & run A (deep-dive) ===")
-        model_a2, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path)
+        model_a2, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path, skip_repair_layers=skip_repair_layers_a)
         apply_repair_a2 = bool(getattr(model_a2, "use_repair_adapter", False))
         data_a = collect_h_pred_only(
             model=model_a2,
@@ -1614,7 +1724,7 @@ def main():
 
         # B deep-dive
         print("\n=== Load & run B (deep-dive) ===")
-        model_b2, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path)
+        model_b2, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path, skip_repair_layers=skip_repair_layers_b)
         apply_repair_b2 = bool(getattr(model_b2, "use_repair_adapter", False))
         data_b = collect_h_pred_only(
             model=model_b2,
@@ -1666,7 +1776,7 @@ def main():
 
     # Run A
     print("\n=== Load & run A ===")
-    model_a, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path)
+    model_a, _ = load_model_from_checkpoint(args.checkpoint_a, args.config_a, device, args.model_path, skip_repair_layers=skip_repair_layers_a)
     apply_repair_a = bool(getattr(model_a, "use_repair_adapter", False))
     data_a = collect_h_pred_only(
         model=model_a,
@@ -1681,7 +1791,7 @@ def main():
 
     # Run B
     print("\n=== Load & run B ===")
-    model_b, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path)
+    model_b, _ = load_model_from_checkpoint(args.checkpoint_b, args.config_b, device, args.model_path, skip_repair_layers=skip_repair_layers_b)
     apply_repair_b = bool(getattr(model_b, "use_repair_adapter", False))
     data_b = collect_h_pred_only(
         model=model_b,
