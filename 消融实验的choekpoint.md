@@ -25,4 +25,4 @@ no adapter only pruner  128实际约192  outputs/tasks/20260227-0811_vqa-vqav2_l
 outputs/tasks/20260304-1214_vqa-vqav2_llava157b_dbae/checkpoints/checkpoint_final.pt
 
 
-outputs/tasks/20260304-1405_vqa-vqav2_llava157b_6056/checkpoints/checkpoint_final.pt
+full 需要删L12 outputs/tasks/20260304-1405_vqa-vqav2_llava157b_6056/checkpoints/checkpoint_final.pt

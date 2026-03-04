@@ -194,21 +194,78 @@ def flatten_capture_tokens(capture_entry: Dict[str, torch.Tensor]) -> torch.Tens
     return h2[m2]
 
 
-class StreamingMSE:
-    """流式计算 token-wise MSE"""
+class StreamingDistributionAlignment:
+    """流式计算分布对齐指标（与训练时相同）"""
     def __init__(self):
-        self.sse = 0.0
-        self.n_elem = 0
+        self.sum_s = None  # student 的和
+        self.sum_s2 = None  # student 的平方和
+        self.sum_t = None  # teacher 的和
+        self.sum_t2 = None  # teacher 的平方和
+        self.count = 0  # token 数量
 
-    def update(self, X: torch.Tensor, Y: torch.Tensor):
-        if X is None or Y is None or X.shape != Y.shape or X.numel() <= 0:
+    def update(self, student: torch.Tensor, teacher: torch.Tensor):
+        """更新统计量
+        Args:
+            student: (N, D) 学生表示
+            teacher: (N, D) 教师表示
+        """
+        if student is None or teacher is None or student.shape != teacher.shape or student.numel() <= 0:
             return
-        diff = X.float() - Y.float()
-        self.sse += float((diff * diff).sum().detach().cpu().item())
-        self.n_elem += int(diff.numel())
 
-    def value(self) -> float:
-        return float(self.sse / self.n_elem) if self.n_elem > 0 else float("nan")
+        N, D = student.shape
+        s = student.float()
+        t = teacher.float()
+
+        # 累积统计量
+        s_sum = s.sum(dim=0)  # (D,)
+        s2_sum = (s * s).sum(dim=0)  # (D,)
+        t_sum = t.sum(dim=0)  # (D,)
+        t2_sum = (t * t).sum(dim=0)  # (D,)
+
+        if self.sum_s is None:
+            self.sum_s = s_sum.cpu().numpy()
+            self.sum_s2 = s2_sum.cpu().numpy()
+            self.sum_t = t_sum.cpu().numpy()
+            self.sum_t2 = t2_sum.cpu().numpy()
+        else:
+            self.sum_s += s_sum.cpu().numpy()
+            self.sum_s2 += s2_sum.cpu().numpy()
+            self.sum_t += t_sum.cpu().numpy()
+            self.sum_t2 += t2_sum.cpu().numpy()
+
+        self.count += N
+
+    def compute_alignment(self, var_weight: float = 1.0) -> Dict[str, float]:
+        """计算分布对齐指标
+        Returns:
+            dict with keys: mean_mse, var_mse, total
+        """
+        if self.count <= 0 or self.sum_s is None:
+            return {"mean_mse": float("nan"), "var_mse": float("nan"), "total": float("nan")}
+
+        # 计算均值
+        inv = 1.0 / float(self.count)
+        mean_s = self.sum_s * inv
+        mean_t = self.sum_t * inv
+
+        # 计算方差 (unbiased=False, 与训练一致)
+        var_s = self.sum_s2 * inv - mean_s * mean_s
+        var_t = self.sum_t2 * inv - mean_t * mean_t
+
+        # 数值稳定性
+        var_s = np.maximum(var_s, 0.0)
+        var_t = np.maximum(var_t, 0.0)
+
+        # 计算 MSE
+        mean_mse = float(np.mean((mean_s - mean_t) ** 2))
+        var_mse = float(np.mean((var_s - var_t) ** 2))
+        total = mean_mse + var_weight * var_mse
+
+        return {
+            "mean_mse": mean_mse,
+            "var_mse": var_mse,
+            "total": total,
+        }
 
 
 def main():
@@ -232,6 +289,7 @@ def main():
     repair_layers = [int(x) for x in (getattr(model, "repair_layers", None) or [])] if model.use_repair_adapter else []
     target_token_num = method_cfg.get("target_token_num", None)
     teacher_pruning_mode = method_cfg.get("teacher_pruning_mode", "keep_all")
+    var_weight = float(method_cfg.get("repair_var_weight", 1.0))
 
     # 推断层数
     num_layers = infer_num_decoder_layers(model)
@@ -241,14 +299,15 @@ def main():
     print(f"剪枝层: {pruning_layers}")
     print(f"Repair 层: {repair_layers}")
     print(f"目标 token 数: {target_token_num}")
+    print(f"Var weight: {var_weight}")
 
     # 加载数据
     print(f"\n加载数据: {num_samples} 个样本")
     samples = load_samples(config_path, num_samples)
 
-    # 初始化指标累加器
-    token_mse_acc = {
-        l: {"off": StreamingMSE(), "on": StreamingMSE()}
+    # 初始化指标累加器（使用分布对齐指标）
+    alignment_acc = {
+        l: {"off": StreamingDistributionAlignment(), "on": StreamingDistributionAlignment()}
         for l in capture_layers
     }
 
@@ -334,9 +393,9 @@ def main():
             off_tok = flatten_capture_tokens({"h": off_entry["h"], "mask": m_common})
             on_tok = flatten_capture_tokens({"h": on_entry["h"], "mask": m_common})
 
-            # 更新 MSE
-            token_mse_acc[layer]["off"].update(off_tok, t_tok)
-            token_mse_acc[layer]["on"].update(on_tok, t_tok)
+            # 更新分布对齐指标
+            alignment_acc[layer]["off"].update(off_tok, t_tok)
+            alignment_acc[layer]["on"].update(on_tok, t_tok)
 
         if (i + 1) % 10 == 0:
             print(f"已处理 {i + 1}/{num_samples} 个样本...")
@@ -350,14 +409,21 @@ def main():
     print("\n计算结果...")
     results = []
     for layer in capture_layers:
-        mse_off = token_mse_acc[layer]["off"].value()
-        mse_on = token_mse_acc[layer]["on"].value()
-        gain = mse_off - mse_on
+        metrics_off = alignment_acc[layer]["off"].compute_alignment(var_weight)
+        metrics_on = alignment_acc[layer]["on"].compute_alignment(var_weight)
+
+        total_off = metrics_off["total"]
+        total_on = metrics_on["total"]
+        gain = total_off - total_on
 
         results.append({
             "layer": layer,
-            "mse_off": mse_off,
-            "mse_on": mse_on,
+            "total_off": total_off,
+            "mean_mse_off": metrics_off["mean_mse"],
+            "var_mse_off": metrics_off["var_mse"],
+            "total_on": total_on,
+            "mean_mse_on": metrics_on["mean_mse"],
+            "var_mse_on": metrics_on["var_mse"],
             "gain": gain,
             "is_pruning": layer in pruning_layers,
             "is_repair": layer in repair_layers,
@@ -373,21 +439,27 @@ def main():
     import csv
     csv_path = os.path.join(output_dir, "repair_analysis.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["layer", "mse_off", "mse_on", "gain", "is_pruning", "is_repair"])
+        writer = csv.DictWriter(f, fieldnames=[
+            "layer", "total_off", "mean_mse_off", "var_mse_off",
+            "total_on", "mean_mse_on", "var_mse_on",
+            "gain", "is_pruning", "is_repair"
+        ])
         writer.writeheader()
         writer.writerows(results)
     print(f"\n已保存 CSV: {csv_path}")
 
-    # 生成图表
-    layers = [r["layer"] for r in results]
-    mse_off = [r["mse_off"] for r in results]
-    mse_on = [r["mse_on"] for r in results]
-    gains = [r["gain"] for r in results]
+    # 生成图表（排除 Layer 31 - 解码层噪声太大）
+    results_for_plot = [r for r in results if r["layer"] != 31]
+
+    layers = [r["layer"] for r in results_for_plot]
+    total_off = [r["total_off"] for r in results_for_plot]
+    total_on = [r["total_on"] for r in results_for_plot]
+    gains = [r["gain"] for r in results_for_plot]
 
     # 图1: MSE 对比
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(layers, mse_off, marker="o", color="tab:red", label="OFF (no repair)")
-    ax.plot(layers, mse_on, marker="o", color="tab:blue", label="ON (repair)")
+    ax.plot(layers, total_off, marker="o", color="tab:red", label="OFF (no repair)")
+    ax.plot(layers, total_on, marker="o", color="tab:blue", label="ON (repair)")
 
     # 标记剪枝层和 repair 层
     for l in pruning_layers:
@@ -396,8 +468,8 @@ def main():
         ax.axvline(l, color="tab:green", linestyle="--", alpha=0.3, linewidth=1.2)
 
     ax.set_xlabel("Layer")
-    ax.set_ylabel("MSE to Teacher")
-    ax.set_title("Repair Objective: MSE to Teacher (gen_answer tokens)")
+    ax.set_ylabel("Distribution Alignment Loss (mean_mse + var_mse)")
+    ax.set_title("Repair Objective: Distribution Alignment (gen_answer tokens)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -406,7 +478,84 @@ def main():
     plt.close(fig)
     print(f"已保存图表: {fig_path}")
 
-    # 图2: Gain
+    # 图2: Gain（改进版 - 多种可视化）
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 2.1: 绝对 Gain
+    ax = axes[0, 0]
+    ax.plot(layers, gains, marker="o", color="tab:purple", label="Gain = OFF - ON")
+    ax.axhline(0, color="k", linewidth=1.0, alpha=0.4)
+    for l in pruning_layers:
+        ax.axvline(l, color="k", linestyle="--", alpha=0.2, linewidth=1.0)
+    for l in repair_layers:
+        ax.axvline(l, color="tab:green", linestyle="--", alpha=0.3, linewidth=1.2)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Gain (MSE)")
+    ax.set_title("Absolute Gain (OFF - ON)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 2.2: 相对 Gain (百分比)
+    ax = axes[0, 1]
+    relative_gains = [(g / off * 100 if off > 1e-10 else 0) for g, off in zip(gains, total_off)]
+    ax.plot(layers, relative_gains, marker="o", color="tab:orange", label="Relative Gain %")
+    ax.axhline(0, color="k", linewidth=1.0, alpha=0.4)
+    for l in pruning_layers:
+        ax.axvline(l, color="k", linestyle="--", alpha=0.2, linewidth=1.0)
+    for l in repair_layers:
+        ax.axvline(l, color="tab:green", linestyle="--", alpha=0.3, linewidth=1.2)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Relative Gain (%)")
+    ax.set_title("Relative Gain: (OFF - ON) / OFF × 100%")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 2.3: 只显示有显著差异的层（gain != 0）
+    ax = axes[1, 0]
+    nonzero_indices = [i for i, g in enumerate(gains) if abs(g) > 1e-10]
+    if nonzero_indices:
+        nonzero_layers = [layers[i] for i in nonzero_indices]
+        nonzero_gains = [gains[i] for i in nonzero_indices]
+        ax.bar(nonzero_layers, nonzero_gains, color="tab:purple", alpha=0.7)
+        ax.axhline(0, color="k", linewidth=1.0, alpha=0.4)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Gain (MSE)")
+        ax.set_title(f"Non-zero Gains Only ({len(nonzero_indices)} layers)")
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "No non-zero gains", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("Non-zero Gains Only (none found)")
+
+    # 2.4: 对数尺度的 MSE 对比（更容易看出差异）
+    ax = axes[1, 1]
+    # 过滤掉 0 值
+    valid_indices = [i for i, (off, on) in enumerate(zip(total_off, total_on)) if off > 1e-10 and on > 1e-10]
+    if valid_indices:
+        valid_layers = [layers[i] for i in valid_indices]
+        valid_off = [total_off[i] for i in valid_indices]
+        valid_on = [total_on[i] for i in valid_indices]
+        ax.plot(valid_layers, valid_off, marker="o", color="tab:red", label="OFF", alpha=0.7)
+        ax.plot(valid_layers, valid_on, marker="o", color="tab:blue", label="ON", alpha=0.7)
+        ax.set_yscale("log")
+        for l in pruning_layers:
+            ax.axvline(l, color="k", linestyle="--", alpha=0.2, linewidth=1.0)
+        for l in repair_layers:
+            ax.axvline(l, color="tab:green", linestyle="--", alpha=0.3, linewidth=1.2)
+        ax.set_xlabel("Layer")
+        ax.set_ylabel("Distribution Alignment Loss (log scale)")
+        ax.set_title("Distribution Alignment: OFF vs ON (Log Scale)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "No valid data", ha="center", va="center", transform=ax.transAxes)
+
+    plt.tight_layout()
+    fig_path = os.path.join(output_dir, "gain_detailed.png")
+    fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"已保存详细增益图表: {fig_path}")
+
+    # 原来的简单 gain 图也保留
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(layers, gains, marker="o", color="tab:purple", label="Gain = OFF - ON")
     ax.axhline(0, color="k", linewidth=1.0, alpha=0.4)
@@ -427,20 +576,35 @@ def main():
     plt.close(fig)
     print(f"已保存图表: {fig_path}")
 
-    # 打印摘要
+    # 打印摘要（排除 Layer 31 - 解码层噪声太大）
     print("\n=== 摘要 ===")
-    avg_mse_off = np.mean([r["mse_off"] for r in results])
-    avg_mse_on = np.mean([r["mse_on"] for r in results])
-    avg_gain = np.mean([r["gain"] for r in results])
 
-    print(f"平均 MSE (OFF): {avg_mse_off:.6f}")
-    print(f"平均 MSE (ON):  {avg_mse_on:.6f}")
-    print(f"平均 Gain:      {avg_gain:.6f}")
+    # 排除 Layer 31
+    results_filtered = [r for r in results if r["layer"] != 31]
+
+    avg_total_off = np.mean([r["total_off"] for r in results_filtered])
+    avg_total_on = np.mean([r["total_on"] for r in results_filtered])
+    avg_gain = np.mean([r["gain"] for r in results_filtered])
+
+    print(f"平均 Total (OFF): {avg_total_off:.6f} (排除 Layer 31)")
+    print(f"平均 Total (ON):  {avg_total_on:.6f} (排除 Layer 31)")
+    print(f"平均 Gain:        {avg_gain:.6f} (排除 Layer 31)")
+
+    # 统计非零 gain 的层（排除 Layer 31）
+    nonzero_gains = [r for r in results_filtered if abs(r["gain"]) > 1e-10]
+    if nonzero_gains:
+        print(f"\n非零 Gain 的层数: {len(nonzero_gains)} (排除 Layer 31)")
+        print("非零 Gain 的层:")
+        for r in nonzero_gains:
+            print(f"  Layer {r['layer']}: gain={r['gain']:.6e} ({r['gain']/r['total_off']*100:.2f}%)")
 
     if repair_layers:
-        repair_results = [r for r in results if r["is_repair"]]
-        avg_gain_repair = np.mean([r["gain"] for r in repair_results])
-        print(f"\nRepair 层平均 Gain: {avg_gain_repair:.6f}")
+        repair_results = [r for r in results_filtered if r["is_repair"]]
+        if repair_results:
+            avg_gain_repair = np.mean([r["gain"] for r in repair_results])
+            print(f"\nRepair 层平均 Gain: {avg_gain_repair:.6f} (排除 Layer 31)")
+        else:
+            print("\n注意: 没有 repair 层有数据（可能都被跳过了）")
 
     print(f"\n所有输出已保存到: {output_dir}")
 
