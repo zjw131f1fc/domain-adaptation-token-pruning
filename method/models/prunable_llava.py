@@ -882,6 +882,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         vision_end: int = None,
         question_starts: List[int] = None,
         question_ends: List[int] = None,
+        hard_pruning_mode: str = "normal",  # 'normal' | 'keep_all'
+        apply_pruner: Optional[bool] = None,
+        apply_repair: Optional[bool] = None,
         **generate_kwargs
     ) -> Tuple[torch.LongTensor, Dict[str, float]]:
         """带硬剪枝的生成 - 物理删除被剪掉的 tokens 以减少 FLOPS
@@ -911,6 +914,19 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         self.eval()
         model = self.base_model.model
         llm = model.language_model
+
+        hard_pruning_mode = str(hard_pruning_mode or "normal")
+        if hard_pruning_mode not in {"normal", "keep_all"}:
+            raise ValueError(
+                f"Invalid hard_pruning_mode={hard_pruning_mode!r}, expected 'normal' or 'keep_all'."
+            )
+        if apply_pruner is None:
+            apply_pruner = bool(hard_pruning_mode == "normal")
+        if apply_repair is None:
+            apply_repair = bool(self.use_repair_adapter and (self.repair_adapter_manager is not None))
+        # keep_all baseline: never run pruner (and never physically prune)
+        if hard_pruning_mode == "keep_all":
+            apply_pruner = False
 
         # 获取 image features 并准备 inputs_embeds
         vision_feature_layer = self.config.vision_feature_layer
@@ -981,6 +997,69 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         # 与训练时保持一致：mask 始终是原始 n_vision 维（供 pruner / repair context encoder 使用）
         cumulative_vision_mask = torch.ones(batch_size, n_vision, device=device, dtype=dtype)
 
+        # ==================== Delayed Repair Adapter (deployed) ====================
+        # hard 模式本身是“物理删除 + KV cache”的推理路径。
+        # 这里额外接入 delayed repair adapter（语言侧）：
+        # - pruning layer: 计算并缓存 repair context（mask_emb / pruned_emb）
+        # - repair layer: 使用缓存 context 对“最后一个 token”做修复（对短生成的部署更贴近）
+        #
+        # 注意：此处以 “部署/速度口径” 为主，不追求与训练 forward() 的数值完全一致。
+        repair_context_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        def _pick_repair_ctx(r_layer: int) -> Optional[Dict[str, torch.Tensor]]:
+            if not apply_repair:
+                return None
+            if not (self.use_repair_adapter and (self.repair_adapter_manager is not None)):
+                return None
+            if not repair_context_cache:
+                return None
+
+            # 选择 repair context 来源：显式指定 or 最近的 pruning layer
+            source_layer = self._repair_source_by_layer.get(int(r_layer), None)
+            if source_layer is None:
+                eligible = [k for k in repair_context_cache.keys() if int(k) <= int(r_layer)]
+                source_layer = max(eligible) if eligible else None
+            if source_layer is None:
+                return None
+            return repair_context_cache.get(int(source_layer), None)
+
+        def _apply_delayed_repair(r_layer: int, h: torch.Tensor) -> torch.Tensor:
+            if not apply_repair:
+                return h
+            if not (self.use_repair_adapter and (self.repair_adapter_manager is not None)):
+                return h
+            if int(r_layer) not in set(int(x) for x in (self.repair_layers or [])):
+                return h
+            ctx = _pick_repair_ctx(int(r_layer))
+            if ctx is None:
+                return h
+
+            adapter = self.repair_adapter_manager.get_adapter(int(r_layer))
+            base = h
+            adapter_in = base.detach() if self.repair_detach_input else base
+            adapted = adapter(
+                adapter_in,
+                mask=None,
+                query=adapter_in,
+                mask_emb=ctx.get("mask_emb"),
+                pruned_emb=ctx.get("pruned_emb"),
+            )
+            delta = adapted - adapter_in
+
+            # hard 推理：只修复“最后一个 token”（用于下一 token 的预测）。
+            bsz, seq, _ = base.shape
+            gen_mask = torch.zeros(bsz, seq, device=base.device, dtype=base.dtype)
+            if seq == 1:
+                gen_mask[:] = 1
+            else:
+                for i in range(bsz):
+                    # kept_indices[i] = 当前序列里每个 token 对应的原始 index（长度=该样本真实 seq_len）
+                    # 这里选最后一个“真实 token”，避免 pad 位置。
+                    li = len(kept_indices[i]) if i < len(kept_indices) else int(seq)
+                    last_idx = max(min(int(li) - 1, int(seq) - 1), 0)
+                    gen_mask[i, last_idx] = 1
+            return base + gen_mask.unsqueeze(-1) * delta
+
         for layer_idx, decoder_layer in enumerate(llm.layers):
             # 获取原始层
             if isinstance(decoder_layer, PrunableLlamaDecoderLayer):
@@ -1012,6 +1091,8 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 else:
                     hidden_states = layer_outputs
 
+                # Delayed repair（deployed adapter）：在 repair_layers 处修复最后一个 token
+                hidden_states = _apply_delayed_repair(layer_idx, hidden_states)
                 continue
 
             # === 剪枝层：手动计算 attention 以实现剪枝 ===
@@ -1064,6 +1145,29 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             attn_weights = attn_weights + causal_mask
 
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype)
+
+            # ==================== Baseline: hard route but keep_all (no pruner / no physical pruning) ====================
+            if not apply_pruner:
+                # Standard attention output (no masking)
+                attn_output = torch.matmul(attn_weights, value_states_expanded)
+                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, current_seq_len, hidden_size)
+                attn_output = attn.o_proj(attn_output)
+
+                # Residual + MLP (same as normal path)
+                hidden_states = hidden_states + attn_output
+                residual = hidden_states
+                hidden_states = original_layer.post_attention_layernorm(hidden_states)
+                hidden_states = original_layer.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+                # Optional delayed repair (typically disabled for baseline)
+                hidden_states = _apply_delayed_repair(layer_idx, hidden_states)
+
+                # Record keep-all mask for stats
+                current_n_vision = current_vision_end - current_vision_start
+                hard_mask_keep_all = torch.ones(batch_size, current_n_vision, device=device, dtype=dtype)
+                masks[layer_idx] = (hard_mask_keep_all, int(current_n_vision))
+                continue
 
             # === 剪枝层处理 ===
             # Step 1: 计算 question->vision attention 和 hard_mask
@@ -1157,20 +1261,16 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             hard_mask = torch.stack(hard_mask_list, dim=0)
 
             # Step 2: 用 mask 修改 attention weights（与训练一致）
-            mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_vision)
-
-            # 创建完整的 mask（非 vision 部分为 1，vision 部分为 hard_mask）
-            ones_before = torch.ones(batch_size, num_heads, current_seq_len, current_vision_start,
-                                     device=device, dtype=dtype)
-            ones_after = torch.ones(batch_size, num_heads, current_seq_len, current_seq_len - current_vision_end,
-                                    device=device, dtype=dtype)
-            mask_vision = mask_expanded.expand(-1, num_heads, current_seq_len, -1)
-            full_mask = torch.cat([ones_before, mask_vision, ones_after], dim=-1)
-
-            # 应用 mask 并重新归一化
-            attn_weights_masked = attn_weights * full_mask
-            attn_sum = attn_weights_masked.sum(dim=-1, keepdim=True)
-            attn_weights_masked = (attn_weights_masked / (attn_sum + 1e-8)).to(dtype)
+            # 关键优化：避免构造 (b,h,seq,seq) 的 full_mask（ones_before/after + cat），
+            # 直接在 vision 区间上做 in-place masking，再整体归一化。
+            # attn_weights: (batch, heads, current_seq_len, current_seq_len)
+            # hard_mask: (batch, current_n_vision)
+            mask_expanded = hard_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, current_n_vision)
+            attn_weights[..., current_vision_start:current_vision_end] = (
+                attn_weights[..., current_vision_start:current_vision_end] * mask_expanded
+            )
+            attn_sum = attn_weights.sum(dim=-1, keepdim=True)
+            attn_weights_masked = (attn_weights / (attn_sum + 1e-8)).to(dtype)
 
             # Step 3: 计算剪枝后的 attention output
             attn_output = torch.matmul(attn_weights_masked, value_states_expanded)
@@ -1189,6 +1289,11 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             n_kept_absolute = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
             masks[layer_idx] = (hard_mask, n_kept_absolute, scattered_mask, vision_hidden_padded)
 
+            # 缓存 repair context（mask_emb / pruned_emb），供后续 repair layers 使用
+            if apply_repair and self.use_repair_adapter and (self.repair_context_encoder is not None):
+                mask_emb, pruned_emb = self.repair_context_encoder(vision_hidden_padded, cumulative_vision_mask)
+                repair_context_cache[int(layer_idx)] = {"mask_emb": mask_emb, "pruned_emb": pruned_emb}
+
             attn_output = attn.o_proj(attn_output)
 
             # 残差连接
@@ -1200,103 +1305,158 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
             hidden_states = original_layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
+            # Delayed repair（deployed adapter）：允许 pruning layer 本身也是 repair layer（虽然一般不会这样配）
+            hidden_states = _apply_delayed_repair(layer_idx, hidden_states)
+
             # === 硬剪枝（物理删除 tokens）- 现在只有剪枝层会到达这里 ===
+            if hard_pruning_mode != "normal":
+                continue
+
             # 物理删除被剪掉的 vision tokens
             # 对于每个样本，根据 hard_mask 选择要保留的 tokens
-            new_hidden_states_list = []
-            new_position_ids_list = []
-            new_kept_indices_list = []
+            if batch_size == 1:
+                sample_mask = hard_mask[0]  # (current_n_vision,)
+                kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]
 
-            for i in range(batch_size):
-                # 当前样本的 mask
-                sample_mask = hard_mask[i]  # (current_n_vision,)
-                kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]  # 保留的 vision token 的相对索引
-
-                # 构建新的序列：[前部分] + [保留的 vision tokens] + [后部分]
-                # 前部分：position 0 到 current_vision_start
-                # 后部分：current_vision_end 到末尾
-
-                before_vision = hidden_states[i, :current_vision_start, :]  # (vision_start, hidden)
-                kept_vision = hidden_states[i, current_vision_start:current_vision_end, :][kept_vision_indices]  # (n_kept, hidden)
-                after_vision = hidden_states[i, current_vision_end:, :]  # (rest, hidden)
-
-                new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
-                new_hidden_states_list.append(new_hidden)
-
-                # 更新 kept_indices（记录哪些原始位置被保留）
-                old_kept = kept_indices[i]
-                new_kept = (
-                    old_kept[:current_vision_start] +
-                    [old_kept[current_vision_start + j] for j in kept_vision_indices.tolist()] +
-                    old_kept[current_vision_end:]
+                before_vision = hidden_states[0, :current_vision_start, :]
+                kept_vision = hidden_states[0, current_vision_start:current_vision_end, :].index_select(
+                    0, kept_vision_indices
                 )
-                new_kept_indices_list.append(new_kept)
+                after_vision = hidden_states[0, current_vision_end:, :]
+                new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
+                hidden_states = new_hidden.unsqueeze(0)
 
-                # 更新 position_ids（保持原位置，不重新编号）
-                new_pos_ids = torch.tensor(new_kept, device=device, dtype=torch.long)
-                new_position_ids_list.append(new_pos_ids)
+                old_kept = kept_indices[0]
+                new_kept = (
+                    old_kept[:current_vision_start]
+                    + [old_kept[current_vision_start + j] for j in kept_vision_indices.tolist()]
+                    + old_kept[current_vision_end:]
+                )
+                kept_indices = [new_kept]
+                position_ids = torch.tensor(new_kept, device=device, dtype=torch.long).unsqueeze(0)
+            else:
+                new_hidden_states_list = []
+                new_position_ids_list = []
+                new_kept_indices_list = []
 
-            # Pad to same length (batch 内可能长度不同)
-            max_new_len = max(h.shape[0] for h in new_hidden_states_list)
+                for i in range(batch_size):
+                    # 当前样本的 mask
+                    sample_mask = hard_mask[i]  # (current_n_vision,)
+                    kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]  # 保留的 vision token 的相对索引
 
-            padded_hidden = torch.zeros(batch_size, max_new_len, hidden_size, device=device, dtype=dtype)
-            padded_position_ids = torch.zeros(batch_size, max_new_len, device=device, dtype=torch.long)
+                    # 构建新的序列：[前部分] + [保留的 vision tokens] + [后部分]
+                    before_vision = hidden_states[i, :current_vision_start, :]  # (vision_start, hidden)
+                    kept_vision = hidden_states[i, current_vision_start:current_vision_end, :][
+                        kept_vision_indices
+                    ]  # (n_kept, hidden)
+                    after_vision = hidden_states[i, current_vision_end:, :]  # (rest, hidden)
 
-            for i in range(batch_size):
-                length = new_hidden_states_list[i].shape[0]
-                padded_hidden[i, :length] = new_hidden_states_list[i]
-                padded_position_ids[i, :length] = new_position_ids_list[i]
+                    new_hidden = torch.cat([before_vision, kept_vision, after_vision], dim=0)
+                    new_hidden_states_list.append(new_hidden)
 
-            hidden_states = padded_hidden
-            position_ids = padded_position_ids
-            kept_indices = new_kept_indices_list
+                    # 更新 kept_indices（记录哪些原始位置被保留）
+                    old_kept = kept_indices[i]
+                    new_kept = (
+                        old_kept[:current_vision_start]
+                        + [old_kept[current_vision_start + j] for j in kept_vision_indices.tolist()]
+                        + old_kept[current_vision_end:]
+                    )
+                    new_kept_indices_list.append(new_kept)
+
+                    # 更新 position_ids（保持原位置，不重新编号）
+                    new_pos_ids = torch.tensor(new_kept, device=device, dtype=torch.long)
+                    new_position_ids_list.append(new_pos_ids)
+
+                # Pad to same length (batch 内可能长度不同)
+                max_new_len = max(h.shape[0] for h in new_hidden_states_list)
+
+                padded_hidden = torch.zeros(batch_size, max_new_len, hidden_size, device=device, dtype=dtype)
+                padded_position_ids = torch.zeros(batch_size, max_new_len, device=device, dtype=torch.long)
+
+                for i in range(batch_size):
+                    length = new_hidden_states_list[i].shape[0]
+                    padded_hidden[i, :length] = new_hidden_states_list[i]
+                    padded_position_ids[i, :length] = new_position_ids_list[i]
+
+                hidden_states = padded_hidden
+                position_ids = padded_position_ids
+                kept_indices = new_kept_indices_list
 
             # 更新 vision 位置（batch_size=1，直接用第一个样本）
             n_kept = (hard_mask[0] > 0.5).sum().int().item()  # 用 >0.5 避免 bfloat16 sum 误差
             current_vision_end = current_vision_start + n_kept
 
+            # 如果没有实际剪掉 tokens，则跳过 cache 重建（避免额外开销）
+            if n_kept >= current_n_vision:
+                continue
+
             # 更新 KV cache（删除被剪掉的 tokens）
             # 需要重新构建 cache
-            new_cache = DynamicCache()
-            for l_idx in range(layer_idx + 1):
-                # 使用 layers[l_idx].keys 和 layers[l_idx].values 访问
-                old_k = past_key_values.layers[l_idx].keys  # (batch, heads, old_seq, head_dim)
-                old_v = past_key_values.layers[l_idx].values
+            if batch_size == 1:
+                sample_mask = hard_mask[0]
+                kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]  # relative in vision slice
+                old_seq_len = int(past_key_values.layers[0].keys.shape[-2])
+                idx_before = torch.arange(int(current_vision_start), device=device, dtype=torch.long)
+                idx_kept = kept_vision_indices.to(device=device, dtype=torch.long) + int(current_vision_start)
+                idx_after = torch.arange(
+                    int(current_vision_start) + int(current_n_vision),
+                    int(old_seq_len),
+                    device=device,
+                    dtype=torch.long,
+                )
+                select_idx = torch.cat([idx_before, idx_kept, idx_after], dim=0)
 
-                new_k_list = []
-                new_v_list = []
+                # In-place prune cache for layers up to current pruning layer (avoid rebuilding a brand-new cache).
+                for l_idx in range(layer_idx + 1):
+                    old_k = past_key_values.layers[l_idx].keys  # (1, kv_heads, old_seq, head_dim)
+                    old_v = past_key_values.layers[l_idx].values
+                    past_key_values.layers[l_idx].keys = old_k.index_select(dim=-2, index=select_idx)
+                    past_key_values.layers[l_idx].values = old_v.index_select(dim=-2, index=select_idx)
+            else:
+                new_cache = DynamicCache()
+                for l_idx in range(layer_idx + 1):
+                    # 使用 layers[l_idx].keys 和 layers[l_idx].values 访问
+                    old_k = past_key_values.layers[l_idx].keys  # (batch, heads, old_seq, head_dim)
+                    old_v = past_key_values.layers[l_idx].values
 
-                for i in range(batch_size):
-                    sample_mask = hard_mask[i]
-                    kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]
+                    new_k_list = []
+                    new_v_list = []
 
-                    # 同样的逻辑：保留 before + kept_vision + after
-                    before_k = old_k[i, :, :current_vision_start, :]
-                    kept_k = old_k[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
-                    after_k = old_k[i, :, current_vision_start + len(sample_mask):, :]
-                    new_k = torch.cat([before_k, kept_k, after_k], dim=1)
-                    new_k_list.append(new_k)
+                    for i in range(batch_size):
+                        sample_mask = hard_mask[i]
+                        kept_vision_indices = sample_mask.nonzero(as_tuple=True)[0]
 
-                    before_v = old_v[i, :, :current_vision_start, :]
-                    kept_v = old_v[i, :, current_vision_start:current_vision_start + len(sample_mask), :][:, kept_vision_indices, :]
-                    after_v = old_v[i, :, current_vision_start + len(sample_mask):, :]
-                    new_v = torch.cat([before_v, kept_v, after_v], dim=1)
-                    new_v_list.append(new_v)
+                        # 同样的逻辑：保留 before + kept_vision + after
+                        before_k = old_k[i, :, :current_vision_start, :]
+                        kept_k = old_k[i, :, current_vision_start:current_vision_start + len(sample_mask), :][
+                            :, kept_vision_indices, :
+                        ]
+                        after_k = old_k[i, :, current_vision_start + len(sample_mask):, :]
+                        new_k = torch.cat([before_k, kept_k, after_k], dim=1)
+                        new_k_list.append(new_k)
 
-                # Pad KV cache
-                max_kv_len = max(k.shape[1] for k in new_k_list)
-                padded_k = torch.zeros(batch_size, old_k.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
-                padded_v = torch.zeros(batch_size, old_v.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
+                        before_v = old_v[i, :, :current_vision_start, :]
+                        kept_v = old_v[i, :, current_vision_start:current_vision_start + len(sample_mask), :][
+                            :, kept_vision_indices, :
+                        ]
+                        after_v = old_v[i, :, current_vision_start + len(sample_mask):, :]
+                        new_v = torch.cat([before_v, kept_v, after_v], dim=1)
+                        new_v_list.append(new_v)
 
-                for i in range(batch_size):
-                    length = new_k_list[i].shape[1]
-                    padded_k[i, :, :length, :] = new_k_list[i]
-                    padded_v[i, :, :length, :] = new_v_list[i]
+                    # Pad KV cache
+                    max_kv_len = max(k.shape[1] for k in new_k_list)
+                    padded_k = torch.zeros(batch_size, old_k.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
+                    padded_v = torch.zeros(batch_size, old_v.shape[1], max_kv_len, head_dim, device=device, dtype=dtype)
 
-                # 使用 update 方法添加到新 cache
-                new_cache.update(padded_k, padded_v, l_idx, {})
+                    for i in range(batch_size):
+                        length = new_k_list[i].shape[1]
+                        padded_k[i, :, :length, :] = new_k_list[i]
+                        padded_v[i, :, :length, :] = new_v_list[i]
 
-            past_key_values = new_cache
+                    # 使用 update 方法添加到新 cache
+                    new_cache.update(padded_k, padded_v, l_idx, {})
+
+                past_key_values = new_cache
 
         # Final LayerNorm
         hidden_states = llm.norm(hidden_states)
@@ -1322,15 +1482,14 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
         head_dim = first_attn.head_dim
         num_kv_groups = num_heads // num_kv_heads
 
-        # 获取 EOS token ID（LLaVA 模型可能在 text_config 中）
-        eos_token_id = self.base_model.config.eos_token_id
+        # 获取 EOS token ID（transformers 版本/配置可能差异较大）
+        eos_token_id = getattr(self.base_model.config, "eos_token_id", None)
         if eos_token_id is None:
-            eos_token_id = getattr(self.base_model.config, 'text_config', {})
-            if hasattr(eos_token_id, 'eos_token_id'):
-                eos_token_id = eos_token_id.eos_token_id
-            else:
-                eos_token_id = 2  # 默认 LLaMA EOS token ID
-        if isinstance(eos_token_id, list):
+            text_cfg = getattr(self.base_model.config, "text_config", None)
+            eos_token_id = getattr(text_cfg, "eos_token_id", None) if text_cfg is not None else None
+        if eos_token_id is None:
+            eos_token_id = 2  # 默认 LLaMA EOS token ID
+        if isinstance(eos_token_id, (list, tuple)):
             eos_token_id = eos_token_id[0]
 
         # 获取下一个 token
@@ -1414,6 +1573,9 @@ class PrunableLlavaForConditionalGeneration(nn.Module):
                 hidden_states = original_layer.post_attention_layernorm(hidden_states)
                 hidden_states = original_layer.mlp(hidden_states)
                 hidden_states = residual + hidden_states
+
+                # Delayed repair（deployed adapter）：decode 时 seq_len=1，直接作用在当前 token
+                hidden_states = _apply_delayed_repair(layer_idx, hidden_states)
 
             hidden_states = llm.norm(hidden_states)
             logits = self.base_model.lm_head(hidden_states)

@@ -26,3 +26,9 @@ outputs/tasks/20260304-1214_vqa-vqav2_llava157b_dbae/checkpoints/checkpoint_fina
 
 
 full 需要删L12 outputs/tasks/20260304-1405_vqa-vqav2_llava157b_6056/checkpoints/checkpoint_final.pt
+
+
+no adapter no repair outputs/tasks/20260304-1707_vqa-vqav2_llava157b_b7cd/checkpoints/checkpoint_final.pt
+
+
+L13 25 outputs/tasks/20260304-1707_vqa-vqav2_llava157b_beec/checkpoints/checkpoint_final.pt  76.57

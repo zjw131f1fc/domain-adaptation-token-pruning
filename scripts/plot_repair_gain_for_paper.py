@@ -19,11 +19,11 @@ def set_paper_style():
         "font.size": 11,
         "axes.labelsize": 12,
         "axes.titlesize": 13,
-        "legend.fontsize": 11,
+        "legend.fontsize": 13,  # 统一图例字体
         "xtick.labelsize": 10,
         "ytick.labelsize": 10,
-        "lines.linewidth": 2.5,
-        "lines.markersize": 6.0,
+        "lines.linewidth": 3.5,  # 进一步增大线条粗细
+        "lines.markersize": 8.0,  # 进一步增大标记点
         "axes.grid": True,
         "grid.alpha": 0.3,
         "pdf.fonttype": 42,
