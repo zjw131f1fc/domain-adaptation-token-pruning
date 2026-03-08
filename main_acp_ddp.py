@@ -788,6 +788,33 @@ def train(config, rank: int, world_size: int, local_rank: int, device: torch.dev
                                 logger.info(f"  [{eval_mode}] Avg kept ratio: "
                                            f"{eval_result['avg_kept_ratio']:.2%} [{layer_str}]")
 
+                            # Representation drift (W2^2 surrogate) diagnostics
+                            if "avg_w2_sq_sample" in eval_result:
+                                pre = eval_result.get("avg_w2_sq_sample_pre", None)
+                                post = eval_result.get("avg_w2_sq_sample", None)
+                                gain = eval_result.get("avg_w2_sq_sample_gain", None)
+                                if (pre is not None) and (gain is not None) and (post is not None):
+                                    logger.info(
+                                        f"  [{eval_mode}] Avg W2^2 (sample-avg): pre={pre:.6f}, post={post:.6f}, gain={gain:+.6f}"
+                                    )
+                                else:
+                                    logger.info(f"  [{eval_mode}] Avg W2^2 (sample-avg): {eval_result['avg_w2_sq_sample']:.6f}")
+
+                                repair_layers = [int(x) for x in (config.method_settings.get("repair_layers", []) or [])]
+                                if repair_layers:
+                                    parts = []
+                                    for r in repair_layers:
+                                        k_post = f"L{r}_w2_sq_sample"
+                                        k_pre = f"L{r}_w2_sq_sample_pre"
+                                        k_gain = f"L{r}_w2_sq_sample_gain"
+                                        if k_post in eval_result:
+                                            post_r = float(eval_result[k_post])
+                                            pre_r = float(eval_result.get(k_pre, float("nan")))
+                                            gain_r = float(eval_result.get(k_gain, float("nan")))
+                                            parts.append(f"L{r}: {pre_r:.6f}->{post_r:.6f} (Δ={gain_r:+.6f})")
+                                    if parts:
+                                        logger.info(f"  [{eval_mode}] W2^2 per adapter (sample-avg): " + " | ".join(parts))
+
                 model.train()
 
             # 保存（只在主进程，按 batch 数判断）

@@ -474,7 +474,13 @@ def evaluate(
     w2_layers: List[int] = []
     w2_accs: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     w2_sample_sum: Optional[torch.Tensor] = None
+    w2_sample_sum_pre: Optional[torch.Tensor] = None
+    w2_sample_sum_gain: Optional[torch.Tensor] = None
     w2_sample_count: Optional[torch.Tensor] = None
+    w2_layer_sum: Optional[torch.Tensor] = None
+    w2_layer_sum_pre: Optional[torch.Tensor] = None
+    w2_layer_sum_gain: Optional[torch.Tensor] = None
+    w2_layer_count: Optional[torch.Tensor] = None
 
     pruning_layers = config.method_settings.get('pruning_layers', [4, 14, 24])
     desc = f"Evaluating ({mode})"
@@ -534,7 +540,14 @@ def evaluate(
             w2_accs = _init_w2_accumulators(layers=w2_layers, hidden_size=int(hidden_size), device=device)
             # Dataset average over samples (each sample contributes one scalar = mean over layers).
             w2_sample_sum = torch.zeros(1, device=device, dtype=torch.float32)
+            w2_sample_sum_pre = torch.zeros(1, device=device, dtype=torch.float32)
+            w2_sample_sum_gain = torch.zeros(1, device=device, dtype=torch.float32)
             w2_sample_count = torch.zeros(1, device=device, dtype=torch.float32)
+            # Per-layer sample-average accumulators (aligned with "per adapter" analysis).
+            w2_layer_sum = torch.zeros(len(w2_layers), device=device, dtype=torch.float32)
+            w2_layer_sum_pre = torch.zeros(len(w2_layers), device=device, dtype=torch.float32)
+            w2_layer_sum_gain = torch.zeros(len(w2_layers), device=device, dtype=torch.float32)
+            w2_layer_count = torch.zeros(len(w2_layers), device=device, dtype=torch.float32)
 
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
@@ -672,9 +685,12 @@ def evaluate(
                         or getattr(out_student, "captured", None)
                         or {}
                     )
+                    student_caps_pre = getattr(out_student, "captured_pre_repair", None) or {}
 
                     per_sample_w2 = []
-                    for layer_idx in w2_layers:
+                    per_sample_w2_pre = []
+                    per_sample_w2_gain = []
+                    for layer_pos, layer_idx in enumerate(w2_layers):
                         if layer_idx not in w2_accs:
                             continue
                         if layer_idx not in teacher_caps or layer_idx not in student_caps:
@@ -683,14 +699,40 @@ def evaluate(
                         s = student_caps[layer_idx]
                         m = s["mask"] * t["mask"]
                         _update_w2_accumulator(w2_accs[layer_idx], s["h"], t["h"], m)
-                        details = _compute_w2_from_masked_tokens(s["h"], t["h"], m)
-                        if details is not None:
-                            per_sample_w2.append(details["w2_sq"])
+                        details_post = _compute_w2_from_masked_tokens(s["h"], t["h"], m)
+
+                        # per-adapter breakdown: pre-repair vs post-repair at the same layer
+                        details_pre = None
+                        if layer_idx in student_caps_pre:
+                            sp = student_caps_pre[layer_idx]
+                            mp = sp["mask"] * t["mask"]
+                            details_pre = _compute_w2_from_masked_tokens(sp["h"], t["h"], mp)
+
+                        if details_post is not None:
+                            per_sample_w2.append(details_post["w2_sq"])
+                            if w2_layer_sum is not None and w2_layer_count is not None:
+                                w2_layer_sum[layer_pos] += details_post["w2_sq"].reshape_as(w2_layer_sum[layer_pos])
+                                w2_layer_count[layer_pos] += 1.0
+
+                        if details_pre is not None:
+                            per_sample_w2_pre.append(details_pre["w2_sq"])
+                            if w2_layer_sum_pre is not None:
+                                w2_layer_sum_pre[layer_pos] += details_pre["w2_sq"].reshape_as(w2_layer_sum_pre[layer_pos])
+
+                        if (details_pre is not None) and (details_post is not None):
+                            gain = (details_pre["w2_sq"] - details_post["w2_sq"]).reshape_as(details_post["w2_sq"])
+                            per_sample_w2_gain.append(gain)
+                            if w2_layer_sum_gain is not None:
+                                w2_layer_sum_gain[layer_pos] += gain.reshape_as(w2_layer_sum_gain[layer_pos])
 
                     if per_sample_w2 and (w2_sample_sum is not None) and (w2_sample_count is not None):
                         # 训练时 repair loss 是 "mean over layers"，这里保持一致：每个样本先对 layer 求均值。
                         w2_sample_sum += torch.stack(per_sample_w2).mean().reshape_as(w2_sample_sum)
                         w2_sample_count += 1.0
+                        if per_sample_w2_pre and (w2_sample_sum_pre is not None):
+                            w2_sample_sum_pre += torch.stack(per_sample_w2_pre).mean().reshape_as(w2_sample_sum_pre)
+                        if per_sample_w2_gain and (w2_sample_sum_gain is not None):
+                            w2_sample_sum_gain += torch.stack(per_sample_w2_gain).mean().reshape_as(w2_sample_sum_gain)
 
                     del out_teacher, out_student
 
@@ -781,7 +823,15 @@ def evaluate(
                     dist.all_reduce(acc[k], op=dist.ReduceOp.SUM)
             if w2_sample_sum is not None and w2_sample_count is not None:
                 dist.all_reduce(w2_sample_sum, op=dist.ReduceOp.SUM)
+            if w2_sample_sum_pre is not None:
+                dist.all_reduce(w2_sample_sum_pre, op=dist.ReduceOp.SUM)
+            if w2_sample_sum_gain is not None:
+                dist.all_reduce(w2_sample_sum_gain, op=dist.ReduceOp.SUM)
+            if w2_sample_count is not None:
                 dist.all_reduce(w2_sample_count, op=dist.ReduceOp.SUM)
+            for t in (w2_layer_sum, w2_layer_sum_pre, w2_layer_sum_gain, w2_layer_count):
+                if t is not None:
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
         per_layer_w2 = []
         per_layer_mean = []
@@ -806,6 +856,26 @@ def evaluate(
             c = float(w2_sample_count.detach().item())
             if c > 0:
                 w2_metrics["avg_w2_sq_sample"] = float((w2_sample_sum / w2_sample_count).detach().item())
+                if w2_sample_sum_pre is not None:
+                    w2_metrics["avg_w2_sq_sample_pre"] = float((w2_sample_sum_pre / w2_sample_count).detach().item())
+                if w2_sample_sum_gain is not None:
+                    w2_metrics["avg_w2_sq_sample_gain"] = float((w2_sample_sum_gain / w2_sample_count).detach().item())
+
+        # Per-layer sample averages (adapter-wise breakdown).
+        if w2_layer_sum is not None and w2_layer_count is not None:
+            for layer_pos, layer_idx in enumerate(w2_layers):
+                cnt = float(w2_layer_count[layer_pos].detach().item())
+                if cnt <= 0:
+                    continue
+                w2_metrics[f"L{int(layer_idx)}_w2_sq_sample"] = float((w2_layer_sum[layer_pos] / w2_layer_count[layer_pos]).detach().item())
+                if w2_layer_sum_pre is not None:
+                    w2_metrics[f"L{int(layer_idx)}_w2_sq_sample_pre"] = float(
+                        (w2_layer_sum_pre[layer_pos] / w2_layer_count[layer_pos]).detach().item()
+                    )
+                if w2_layer_sum_gain is not None:
+                    w2_metrics[f"L{int(layer_idx)}_w2_sq_sample_gain"] = float(
+                        (w2_layer_sum_gain[layer_pos] / w2_layer_count[layer_pos]).detach().item()
+                    )
 
     # 根据是否需要聚合评估调用不同的 judge
     if requires_aggregate_eval and aggregate_judge is not None:

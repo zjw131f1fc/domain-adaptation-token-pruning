@@ -499,7 +499,28 @@ def main():
 
                 # Representation drift diagnostic (W2^2 surrogate, teacher-forcing on GT answer)
                 if 'avg_w2_sq_sample' in eval_result:
-                    print(f"  Avg W2^2 (dataset mean): {eval_result['avg_w2_sq_sample']:.6f}")
+                    pre = eval_result.get("avg_w2_sq_sample_pre", None)
+                    post = eval_result.get("avg_w2_sq_sample", None)
+                    gain = eval_result.get("avg_w2_sq_sample_gain", None)
+                    if (pre is not None) and (gain is not None) and (post is not None):
+                        print(f"  Avg W2^2 (sample-avg): pre={pre:.6f}, post={post:.6f}, gain={gain:+.6f}")
+                    else:
+                        print(f"  Avg W2^2 (sample-avg): {eval_result['avg_w2_sq_sample']:.6f}")
+
+                    repair_layers = [int(x) for x in (config.method_settings.get("repair_layers", []) or [])]
+                    if repair_layers:
+                        parts = []
+                        for r in repair_layers:
+                            k_post = f"L{r}_w2_sq_sample"
+                            k_pre = f"L{r}_w2_sq_sample_pre"
+                            k_gain = f"L{r}_w2_sq_sample_gain"
+                            if k_post in eval_result:
+                                post_r = float(eval_result[k_post])
+                                pre_r = float(eval_result.get(k_pre, float("nan")))
+                                gain_r = float(eval_result.get(k_gain, float("nan")))
+                                parts.append(f"L{r}: {pre_r:.6f}->{post_r:.6f} (Δ={gain_r:+.6f})")
+                        if parts:
+                            print("  W2^2 per adapter (sample-avg): " + " | ".join(parts))
                 elif 'avg_w2_sq' in eval_result:
                     # Fallback: token/moment aggregated metric if sample-average not available
                     print(f"  Avg W2^2: {eval_result['avg_w2_sq']:.6f}")
