@@ -497,6 +497,13 @@ def main():
                     if layer_ratios:
                         print(f"  Per-layer: [{', '.join(layer_ratios)}]")
 
+                # Representation drift diagnostic (W2^2 surrogate, teacher-forcing on GT answer)
+                if 'avg_w2_sq_sample' in eval_result:
+                    print(f"  Avg W2^2 (dataset mean): {eval_result['avg_w2_sq_sample']:.6f}")
+                elif 'avg_w2_sq' in eval_result:
+                    # Fallback: token/moment aggregated metric if sample-average not available
+                    print(f"  Avg W2^2: {eval_result['avg_w2_sq']:.6f}")
+
         if is_main_process():
             print("\n" + "=" * 60)
             print("Evaluation completed.")

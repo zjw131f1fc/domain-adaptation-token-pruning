@@ -78,6 +78,182 @@ def _extract_kept_stats_from_pruning_infos(
     return stats
 
 
+def _resolve_answer_text(sample: Dict[str, Any]) -> Optional[str]:
+    """Resolve a single answer string from a dataset sample.
+
+    Many datasets provide:
+      - sample["answer"]: a training/official answer (string)
+      - sample["answers"]: a list of acceptable answers for judging
+    For representation-alignment metrics (teacher-forcing), we need a single string.
+    """
+    ans = sample.get("answer", None)
+    if ans is not None:
+        s = str(ans).strip()
+        return s if s else None
+    answers = sample.get("answers", None)
+    if isinstance(answers, (list, tuple)) and len(answers) > 0:
+        s = str(answers[0]).strip()
+        return s if s else None
+    return None
+
+
+def _init_w2_accumulators(
+    *,
+    layers: List[int],
+    hidden_size: int,
+    device: torch.device,
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    """Initialize streaming moment accumulators for diagonal-Gaussian W2^2.
+
+    Each layer keeps:
+      sum_s, sum_s2, sum_t, sum_t2: (D,)
+      count: (1,)
+    """
+    accs: Dict[int, Dict[str, torch.Tensor]] = {}
+    for layer in layers:
+        accs[int(layer)] = {
+            "sum_s": torch.zeros(hidden_size, device=device, dtype=torch.float32),
+            "sum_s2": torch.zeros(hidden_size, device=device, dtype=torch.float32),
+            "sum_t": torch.zeros(hidden_size, device=device, dtype=torch.float32),
+            "sum_t2": torch.zeros(hidden_size, device=device, dtype=torch.float32),
+            "count": torch.zeros(1, device=device, dtype=torch.float32),
+        }
+    return accs
+
+
+def _update_w2_accumulator(
+    acc: Dict[str, torch.Tensor],
+    student_h: torch.Tensor,
+    teacher_h: torch.Tensor,
+    mask: torch.Tensor,
+):
+    """Update moment accumulator with masked tokens.
+
+    Args:
+        student_h/teacher_h: (b, L, D)
+        mask: (b, L) 0/1 (float or bool). Only masked positions contribute.
+    """
+    if student_h is None or teacher_h is None or mask is None:
+        return
+    if student_h.shape != teacher_h.shape:
+        return
+    if student_h.dim() != 3 or mask.dim() != 2:
+        return
+
+    h_s = student_h.float()
+    h_t = teacher_h.float()
+    m = mask.to(dtype=h_s.dtype)
+    m_exp = m.unsqueeze(-1)  # (b, L, 1)
+
+    acc["sum_s"] += (h_s * m_exp).sum(dim=(0, 1))
+    acc["sum_s2"] += ((h_s * h_s) * m_exp).sum(dim=(0, 1))
+    acc["sum_t"] += (h_t * m_exp).sum(dim=(0, 1))
+    acc["sum_t2"] += ((h_t * h_t) * m_exp).sum(dim=(0, 1))
+    acc["count"] += m.sum().reshape_as(acc["count"])
+
+
+def _finalize_w2_accumulator(
+    acc: Dict[str, torch.Tensor],
+    *,
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    """Compute diagonal-Gaussian W2^2 proxy metrics from accumulated moments."""
+    count = float(acc["count"].detach().item())
+    if count <= 0:
+        return {
+            "count": 0.0,
+            "mean_mse": float("nan"),
+            "std_mse": float("nan"),
+            "w2_sq": float("nan"),
+        }
+
+    denom = acc["count"].clamp(min=1.0)
+    inv = 1.0 / denom
+
+    ms = acc["sum_s"] * inv
+    mt = acc["sum_t"] * inv
+
+    vs = acc["sum_s2"] * inv - ms * ms
+    vt = acc["sum_t2"] * inv - mt * mt
+    vs = vs.clamp(min=0.0)
+    vt = vt.clamp(min=0.0)
+
+    std_s = torch.sqrt(vs + float(eps))
+    std_t = torch.sqrt(vt + float(eps))
+
+    mean_mse = torch.mean((ms - mt) ** 2).detach().item()
+    std_mse = torch.mean((std_s - std_t) ** 2).detach().item()
+    w2_sq = float(mean_mse + std_mse)
+
+    return {
+        "count": count,
+        "mean_mse": float(mean_mse),
+        "std_mse": float(std_mse),
+        "w2_sq": float(w2_sq),
+    }
+
+
+def _compute_w2_from_masked_tokens(
+    student_h: torch.Tensor,
+    teacher_h: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Compute diagonal-Gaussian W2^2 surrogate from masked tokens (no distributed reduce).
+
+    This mirrors the training-side "mean + std" surrogate:
+      W2^2 = mean((mu_s - mu_t)^2) + mean((sigma_s - sigma_t)^2)
+
+    Returns:
+        Dict with scalar tensors (float32): count, mean_mse, std_mse, w2_sq.
+        Returns None if inputs are invalid or mask has zero count.
+    """
+    if student_h is None or teacher_h is None or mask is None:
+        return None
+    if student_h.shape != teacher_h.shape:
+        return None
+    if student_h.dim() != 3 or mask.dim() != 2:
+        return None
+
+    h_s = student_h.float()
+    h_t = teacher_h.float()
+    m = mask.to(dtype=h_s.dtype)
+    count = m.sum()
+    if float(count.detach().item()) <= 0:
+        return None
+
+    m_exp = m.unsqueeze(-1)
+    denom = count.clamp(min=1.0)
+    inv = 1.0 / denom
+
+    sum_s = (h_s * m_exp).sum(dim=(0, 1))
+    sum_s2 = ((h_s * h_s) * m_exp).sum(dim=(0, 1))
+    sum_t = (h_t * m_exp).sum(dim=(0, 1))
+    sum_t2 = ((h_t * h_t) * m_exp).sum(dim=(0, 1))
+
+    ms = sum_s * inv
+    mt = sum_t * inv
+    vs = sum_s2 * inv - ms * ms
+    vt = sum_t2 * inv - mt * mt
+    vs = vs.clamp(min=0.0)
+    vt = vt.clamp(min=0.0)
+
+    std_s = torch.sqrt(vs + float(eps))
+    std_t = torch.sqrt(vt + float(eps))
+
+    mean_mse = torch.mean((ms - mt) ** 2)
+    std_mse = torch.mean((std_s - std_t) ** 2)
+    w2_sq = mean_mse + std_mse
+
+    return {
+        "count": count.detach().to(dtype=torch.float32),
+        "mean_mse": mean_mse.detach().to(dtype=torch.float32),
+        "std_mse": std_mse.detach().to(dtype=torch.float32),
+        "w2_sq": w2_sq.detach().to(dtype=torch.float32),
+    }
+
+
 @torch.no_grad()
 def _generate_with_forward_pruning(
     *,
@@ -288,6 +464,18 @@ def evaluate(
     kept_ratios = []
     layer_kept_ratios = {}
 
+    # ===== Representation drift metric: eval-average diagonal-Gaussian W2^2 (teacher-forcing) =====
+    # This is a diagnostic metric aligned with the "distribution alignment" motivation:
+    # compare the student route (pruned, optionally repaired) to a keep-all teacher route.
+    #
+    # Default behavior:
+    # - enabled for hard/hard_forward modes (can be disabled via evaluation_settings.report_w2=false)
+    report_w2 = False
+    w2_layers: List[int] = []
+    w2_accs: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
+    w2_sample_sum: Optional[torch.Tensor] = None
+    w2_sample_count: Optional[torch.Tensor] = None
+
     pruning_layers = config.method_settings.get('pruning_layers', [4, 14, 24])
     desc = f"Evaluating ({mode})"
 
@@ -327,6 +515,26 @@ def evaluate(
             last_sync_step = (min_local_samples // local_log_interval) * local_log_interval
         else:
             last_sync_step = (local_samples // local_log_interval) * local_log_interval
+
+    if getattr(config, "evaluation_settings", None) is not None:
+        report_w2 = bool(config.evaluation_settings.get("report_w2", mode in ("hard", "hard_forward")))
+    else:
+        report_w2 = bool(mode in ("hard", "hard_forward"))
+
+    if report_w2:
+        w2_layers = [int(x) for x in (config.method_settings.get("repair_layers", []) or [])]
+        if not w2_layers:
+            report_w2 = False
+        else:
+            hidden_size = getattr(model, "hidden_size", None)
+            if hidden_size is None and getattr(model, "base_model", None) is not None:
+                hidden_size = getattr(model.base_model.model.language_model.config, "hidden_size", None)
+            if hidden_size is None:
+                raise RuntimeError("Cannot infer model hidden_size for W2 accumulator.")
+            w2_accs = _init_w2_accumulators(layers=w2_layers, hidden_size=int(hidden_size), device=device)
+            # Dataset average over samples (each sample contributes one scalar = mean over layers).
+            w2_sample_sum = torch.zeros(1, device=device, dtype=torch.float32)
+            w2_sample_count = torch.zeros(1, device=device, dtype=torch.float32)
 
     for step_idx, i in enumerate(tqdm(local_indices, desc=desc, disable=not show_progress), start=1):
         sample = dataset[i]
@@ -420,6 +628,72 @@ def evaluate(
                             f"infer={infer_ratio:.2%}, diff={diff:.4f}"
                         )
 
+            # Representation drift metric (teacher-forcing, uses GT answer)
+            if report_w2 and w2_accs is not None:
+                answer_text = _resolve_answer_text(sample)
+                if answer_text is not None:
+                    w2_sample = dict(sample)
+                    w2_sample["answer"] = answer_text
+                    w2_prep = preprocess_batch(
+                        batch=[w2_sample],
+                        processor=processor,
+                        device=device,
+                        max_length=max_length,
+                        mode="train",
+                    )
+                    w2_inputs = w2_prep["inputs"]
+                    student_kwargs = {
+                        "input_ids": w2_inputs["input_ids"],
+                        "pixel_values": w2_inputs.get("pixel_values"),
+                        "attention_mask": w2_inputs.get("attention_mask"),
+                        "vision_start": w2_prep["vision_start"],
+                        "vision_end": w2_prep["vision_end"],
+                        "question_starts": w2_prep["question_starts"],
+                        "question_ends": w2_prep["question_ends"],
+                        "answer_starts": w2_prep["answer_starts"],
+                        "answer_ends": w2_prep["answer_ends"],
+                        "return_pruning_info": False,
+                        "pruning_mode": eval_pruning_mode,
+                        "target_token_num": eval_target_token_num,
+                        "apply_repair": eval_apply_repair,
+                        "capture_layers": w2_layers,
+                    }
+                    teacher_kwargs = dict(student_kwargs)
+                    teacher_kwargs["pruning_mode"] = "keep_all"
+                    teacher_kwargs["target_token_num"] = None
+                    teacher_kwargs["apply_repair"] = False
+
+                    out_teacher = model(**teacher_kwargs)
+                    out_student = model(**student_kwargs)
+
+                    teacher_caps = getattr(out_teacher, "captured", None) or {}
+                    student_caps = (
+                        getattr(out_student, "captured_for_repair", None)
+                        or getattr(out_student, "captured", None)
+                        or {}
+                    )
+
+                    per_sample_w2 = []
+                    for layer_idx in w2_layers:
+                        if layer_idx not in w2_accs:
+                            continue
+                        if layer_idx not in teacher_caps or layer_idx not in student_caps:
+                            continue
+                        t = teacher_caps[layer_idx]
+                        s = student_caps[layer_idx]
+                        m = s["mask"] * t["mask"]
+                        _update_w2_accumulator(w2_accs[layer_idx], s["h"], t["h"], m)
+                        details = _compute_w2_from_masked_tokens(s["h"], t["h"], m)
+                        if details is not None:
+                            per_sample_w2.append(details["w2_sq"])
+
+                    if per_sample_w2 and (w2_sample_sum is not None) and (w2_sample_count is not None):
+                        # 训练时 repair loss 是 "mean over layers"，这里保持一致：每个样本先对 layer 求均值。
+                        w2_sample_sum += torch.stack(per_sample_w2).mean().reshape_as(w2_sample_sum)
+                        w2_sample_count += 1.0
+
+                    del out_teacher, out_student
+
             if "avg_kept_ratio" in stats:
                 kept_ratios.append(stats["avg_kept_ratio"])
             for key, value in stats.items():
@@ -496,6 +770,43 @@ def evaluate(
                 samples_for_aggregate, requires_aggregate_eval
             )
 
+    # Finalize W2^2 drift metrics (reduce across ranks once).
+    w2_metrics: Dict[str, float] = {}
+    if report_w2 and w2_accs is not None and w2_layers:
+        if distributed and dist.is_initialized():
+            # All ranks must reduce in the same order to avoid deadlocks.
+            for layer_idx in w2_layers:
+                acc = w2_accs[int(layer_idx)]
+                for k in ("sum_s", "sum_s2", "sum_t", "sum_t2", "count"):
+                    dist.all_reduce(acc[k], op=dist.ReduceOp.SUM)
+            if w2_sample_sum is not None and w2_sample_count is not None:
+                dist.all_reduce(w2_sample_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(w2_sample_count, op=dist.ReduceOp.SUM)
+
+        per_layer_w2 = []
+        per_layer_mean = []
+        per_layer_std = []
+        for layer_idx in w2_layers:
+            acc = w2_accs[int(layer_idx)]
+            m = _finalize_w2_accumulator(acc)
+            if m["count"] <= 0:
+                continue
+            w2_metrics[f"L{int(layer_idx)}_w2_sq"] = m["w2_sq"]
+            per_layer_w2.append(m["w2_sq"])
+            per_layer_mean.append(m["mean_mse"])
+            per_layer_std.append(m["std_mse"])
+
+        if per_layer_w2:
+            w2_metrics["avg_w2_sq"] = float(sum(per_layer_w2) / len(per_layer_w2))
+            w2_metrics["avg_w2_mean_mse"] = float(sum(per_layer_mean) / len(per_layer_mean))
+            w2_metrics["avg_w2_std_mse"] = float(sum(per_layer_std) / len(per_layer_std))
+
+        # Dataset average over samples (each sample contributes one number).
+        if w2_sample_sum is not None and w2_sample_count is not None:
+            c = float(w2_sample_count.detach().item())
+            if c > 0:
+                w2_metrics["avg_w2_sq_sample"] = float((w2_sample_sum / w2_sample_count).detach().item())
+
     # 根据是否需要聚合评估调用不同的 judge
     if requires_aggregate_eval and aggregate_judge is not None:
         result = aggregate_judge(predictions, references, samples_for_aggregate)
@@ -509,6 +820,7 @@ def evaluate(
 
     # 合并 judge 返回的所有字段
     eval_result.update(result)
+    eval_result.update(w2_metrics)
 
     # 兼容旧接口：如果没有 accuracy 字段但有其他主指标，添加 accuracy 别名
     if 'accuracy' not in eval_result:
