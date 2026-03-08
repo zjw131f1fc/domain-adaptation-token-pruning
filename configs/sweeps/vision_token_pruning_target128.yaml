@@ -160,7 +160,7 @@ method_settings:
 
   # repair loss（分布级对齐，而非点到点对齐）
   repair_loss_weight: 0.1
-  repair_loss_type: mean_var   # mean_var | mse
+  repair_loss_type: w2   # w2 (mean+std) | mean_var (mean+var) | mse
   repair_var_weight: 1.0
 
   # ==================== Pruner Warmup ====================

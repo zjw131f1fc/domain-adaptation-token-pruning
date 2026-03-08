@@ -41,7 +41,8 @@ def compute_distribution_alignment_loss(
         mask: (batch, Lmax) 0/1，有效位置
         loss_type:
             - "mse": 点到点 MSE（作为对照）
-            - "mean_var": 对齐均值 + 方差（更像“分布接近”）
+            - "mean_var": 对齐均值 + 方差（旧口径）
+            - "w2": diagonal-Gaussian W2^2 surrogate（对齐均值 + 标准差；建议使用）
     """
     details = compute_distribution_alignment_details(
         student_h=student_h,
@@ -131,14 +132,31 @@ def compute_distribution_alignment_details(
 
     mean_mse = F.mse_loss(ms, mt)
     var_mse = F.mse_loss(vs, vt)
+    # W2^2 (diag-Gaussian) uses std (sqrt variance), not variance.
+    # Add epsilon to avoid unstable gradients when var is very small.
+    std_s = torch.sqrt(vs + 1e-8)
+    std_t = torch.sqrt(vt + 1e-8)
+    std_mse = F.mse_loss(std_s, std_t)
     token_mse = diff2_sum / (denom * d)
 
-    total = token_mse if loss_type == "mse" else (mean_mse + var_weight * var_mse)
+    loss_type = str(loss_type or "mean_var").strip().lower()
+    if loss_type == "mse":
+        total = token_mse
+    elif loss_type == "mean_var":
+        total = mean_mse + var_weight * var_mse
+    elif loss_type in {"w2", "mean_std"}:
+        # In diagonal-Gaussian W2^2, the scale term is std_mse with coefficient 1.0.
+        # We keep `var_weight` as the generic "scale weight" for ablations (e.g., mean-only: set it to 0).
+        total = mean_mse + var_weight * std_mse
+    else:
+        raise ValueError(f"Unknown distribution alignment loss_type={loss_type!r} (expected 'mse', 'mean_var', 'w2').")
 
     return {
         "total": total,
         "mean_mse": mean_mse,
         "var_mse": var_mse,
+        "std_mse": std_mse,
+        "w2_sq": mean_mse + std_mse,
         "token_mse": token_mse,
     }
 
@@ -379,11 +397,13 @@ def train_step(
         layer_losses = []
         layer_mean_mse = []
         layer_var_mse = []
+        layer_std_mse = []
         layer_token_mse = []
         layer_pre_losses = []
         per_layer = {}
         per_layer_mean = {}
         per_layer_var = {}
+        per_layer_std = {}
         per_layer_token = {}
         per_layer_pre = {}
         per_layer_gain = {}
@@ -405,11 +425,15 @@ def train_step(
             layer_losses.append(layer_loss)
             layer_mean_mse.append(details["mean_mse"])
             layer_var_mse.append(details["var_mse"])
+            if "std_mse" in details:
+                layer_std_mse.append(details["std_mse"])
             layer_token_mse.append(details["token_mse"])
 
             per_layer[layer_idx] = float(details["total"].detach().item())
             per_layer_mean[layer_idx] = float(details["mean_mse"].detach().item())
             per_layer_var[layer_idx] = float(details["var_mse"].detach().item())
+            if "std_mse" in details:
+                per_layer_std[layer_idx] = float(details["std_mse"].detach().item())
             per_layer_token[layer_idx] = float(details["token_mse"].detach().item())
 
             # 诊断：修复前的 gap（不参与反传）
@@ -431,12 +455,14 @@ def train_step(
             repair_loss = torch.stack(layer_losses).mean()
             mean_mse = torch.stack(layer_mean_mse).mean()
             var_mse = torch.stack(layer_var_mse).mean()
+            std_mse = torch.stack(layer_std_mse).mean() if layer_std_mse else torch.tensor(0.0, device=device)
             token_mse = torch.stack(layer_token_mse).mean()
             pre_repair = torch.stack(layer_pre_losses).mean() if layer_pre_losses else torch.tensor(0.0, device=device)
         else:
             repair_loss = torch.tensor(0.0, device=device)
             mean_mse = torch.tensor(0.0, device=device)
             var_mse = torch.tensor(0.0, device=device)
+            std_mse = torch.tensor(0.0, device=device)
             token_mse = torch.tensor(0.0, device=device)
             pre_repair = torch.tensor(0.0, device=device)
 
@@ -445,6 +471,8 @@ def train_step(
         stats['repair_loss_type'] = repair_loss_type
         stats['raw_repair_mean_mse'] = float(mean_mse.detach().item())
         stats['raw_repair_var_mse'] = float(var_mse.detach().item())
+        stats['raw_repair_std_mse'] = float(std_mse.detach().item())
+        stats['raw_repair_w2_sq'] = float((mean_mse + std_mse).detach().item())
         stats['raw_repair_token_mse'] = float(token_mse.detach().item())
         stats['raw_repair_pre'] = float(pre_repair.detach().item())
         stats['raw_repair_gain'] = float((pre_repair - repair_loss).detach().item())
@@ -452,6 +480,7 @@ def train_step(
         stats['repair_per_layer'] = per_layer
         stats['repair_mean_per_layer'] = per_layer_mean
         stats['repair_var_per_layer'] = per_layer_var
+        stats['repair_std_per_layer'] = per_layer_std
         stats['repair_token_per_layer'] = per_layer_token
         stats['repair_pre_per_layer'] = per_layer_pre
         stats['repair_gain_per_layer'] = per_layer_gain
@@ -460,6 +489,8 @@ def train_step(
         stats['raw_repair_loss'] = 0.0
         stats['raw_repair_mean_mse'] = 0.0
         stats['raw_repair_var_mse'] = 0.0
+        stats['raw_repair_std_mse'] = 0.0
+        stats['raw_repair_w2_sq'] = 0.0
         stats['raw_repair_token_mse'] = 0.0
         stats['raw_repair_pre'] = 0.0
         stats['raw_repair_gain'] = 0.0

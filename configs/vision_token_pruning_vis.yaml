@@ -133,9 +133,9 @@ method_settings:
   # teacher 前向：keep-all 作为 source 分布
   teacher_forward_enable: true
   teacher_pruning_mode: keep_all
-  # repair loss：分布级对齐（均值 + 方差）
+  # repair loss：分布级对齐（diagonal-Gaussian W2^2 proxy: 均值 + 标准差）
   repair_loss_weight: 0.2
-  repair_loss_type: mean_var
+  repair_loss_type: w2
   repair_var_weight: 1.0
 
   # ==================== Pruner Warmup ====================

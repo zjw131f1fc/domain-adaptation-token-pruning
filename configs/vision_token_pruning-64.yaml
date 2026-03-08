@@ -162,8 +162,8 @@ method_settings:
 
   # repair loss（分布级对齐，而非点到点对齐）
   repair_loss_weight: 3.0
-  repair_loss_type: mean_var   # mean_var | mse
-  repair_var_weight: 3.0
+  repair_loss_type: w2   # w2 (mean+std) | mean_var (mean+var) | mse
+  repair_var_weight: 1.0  # w2: std term weight (recommended 1.0); mean_var: var term weight
 
   # ==================== Pruner Warmup ====================
   pruner_warmup_ratio: 0  # 前 10% 步数不做对抗训练
