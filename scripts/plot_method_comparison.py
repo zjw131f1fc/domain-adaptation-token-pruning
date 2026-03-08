@@ -14,18 +14,24 @@ sys.path.insert(0, str(project_root))
 def set_paper_style():
     """设置论文风格"""
     plt.rcParams.update({
-        "figure.dpi": 120,
+        # 目标：顶会常见风格（干净、紧凑、半页/单栏放大不显得臃肿）
+        "figure.dpi": 150,
         "savefig.dpi": 300,
-        "font.size": 11,
-        "axes.labelsize": 12,
-        "axes.titlesize": 13,
-        "legend.fontsize": 13,  # 增大图例字体
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "lines.linewidth": 3.5,  # 统一线条粗细
-        "lines.markersize": 8.0,  # 统一标记点大小
-        "axes.grid": True,
-        "grid.alpha": 0.3,
+        "font.size": 8.8,
+        "axes.labelsize": 9.6,
+        "axes.titlesize": 9.6,
+        "legend.fontsize": 8.6,
+        "xtick.labelsize": 8.4,
+        "ytick.labelsize": 8.4,
+        "axes.labelpad": 1.8,
+        "axes.linewidth": 0.9,
+        "xtick.major.size": 3.8,
+        "ytick.major.size": 3.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "lines.linewidth": 2.2,
+        "lines.markersize": 5.0,
+        "axes.grid": False,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
         "font.family": "serif",
@@ -47,7 +53,7 @@ def plot_method_comparison(csv_ours: str, csv_baseline: str, output_path: str):
     set_paper_style()
 
     # 创建图表
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(3.45, 2.35))
 
     layers_ours = df_ours["layer"].values
     layers_baseline = df_baseline["layer"].values
@@ -70,21 +76,21 @@ def plot_method_comparison(csv_ours: str, csv_baseline: str, output_path: str):
 
     # 绘制两条曲线
     ax.plot(layers_baseline_valid, total_baseline_valid,
-            marker="s", color="#d62728", linewidth=3.0,
-            markersize=7, label="Baseline (no repair)",
+            marker="s", color="#d62728", linewidth=2.2,
+            markersize=4.6, label="Baseline (w/o repair)",
             markerfacecolor="#d62728", markeredgewidth=0, alpha=0.8)
 
     ax.plot(layers_ours_valid, total_ours_valid,
-            marker="o", color="#2ca02c", linewidth=3.0,
-            markersize=7, label="Ours (with repair)",
+            marker="o", color="#2ca02c", linewidth=2.2,
+            markersize=4.6, label="Ours (w/ repair)",
             markerfacecolor="#2ca02c", markeredgewidth=0, alpha=0.8)
 
     # 设置对数尺度
     ax.set_yscale("log")
 
     # 设置标签
-    ax.set_xlabel("Decoder Layer", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Distribution Alignment Loss", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Decoder Layer")
+    ax.set_ylabel("Distribution Alignment Loss")
     # 不需要标题
 
     # 设置 x 轴范围和刻度
@@ -93,15 +99,24 @@ def plot_method_comparison(csv_ours: str, csv_baseline: str, output_path: str):
     ax.set_xticks(range(0, max(all_layers) + 1, 5))
 
     # 网格
-    ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.8)
+    ax.grid(True, which="major", axis="y", linestyle=":", linewidth=0.6, alpha=0.22)
 
-    # 图例
-    ax.legend(loc="upper left", frameon=True, fancybox=True, shadow=True)
+    # 图例：放到坐标轴上方，避免覆盖数据
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=2,
+        frameon=False,
+        handlelength=1.5,
+        labelspacing=0.3,
+        columnspacing=0.8,
+        borderaxespad=0.0,
+    )
 
     # 保存
-    plt.tight_layout()
-    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.05)
-    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.05, dpi=300)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.08, dpi=300)
     plt.close(fig)
 
     print(f"已保存对比图: {output_path}")

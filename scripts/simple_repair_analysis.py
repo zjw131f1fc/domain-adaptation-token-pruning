@@ -34,6 +34,7 @@ def load_model_and_config(checkpoint_path: str, device: torch.device, skip_first
     from transformers import LlavaForConditionalGeneration, AutoProcessor
     from method.models.prunable_llava import PrunableLlavaForConditionalGeneration
     from engine.configs.loader import load_config
+    import re
 
     # 固定配置路径和模型路径
     config_path = "configs/vision_token_pruning.yaml"
@@ -44,13 +45,72 @@ def load_model_and_config(checkpoint_path: str, device: torch.device, skip_first
 
     # 检查 checkpoint 是否有 repair 权重
     meta = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # --- Infer pruner hyper-params from checkpoint to avoid config mismatch ---
+    # Some checkpoints were trained with different `pruner_n_queries` / `use_question_condition`
+    # than the current config; loading with mismatched shapes will fail.
+    pruner_sd = meta.get("pruner_state_dict", {}) or {}
+    inferred_pruning_layers = None
+    inferred_n_queries = None
+    inferred_d_internal = None
+    inferred_use_question_condition = None
+
+    if isinstance(pruner_sd, dict) and pruner_sd:
+        pruner_indices = set()
+        for k in pruner_sd.keys():
+            m = re.match(r"pruners\.(\d+)\.", str(k))
+            if m:
+                pruner_indices.add(int(m.group(1)))
+        if pruner_indices:
+            inferred_pruning_layers = sorted(pruner_indices)
+
+        for k, v in pruner_sd.items():
+            if str(k).endswith("pruning_queries") and hasattr(v, "shape") and len(v.shape) == 3:
+                inferred_n_queries = int(v.shape[1])
+                inferred_d_internal = int(v.shape[2])
+                break
+
+        if inferred_d_internal is None:
+            for k, v in pruner_sd.items():
+                if str(k).endswith("vision_proj.weight") and hasattr(v, "shape") and len(v.shape) == 2:
+                    inferred_d_internal = int(v.shape[0])
+                    break
+
+        inferred_use_question_condition = any("question_proj" in str(k) for k in pruner_sd.keys())
+
+    cfg_pruning_layers = list(method_cfg.get("pruning_layers", [4, 14, 24]))
+    cfg_pruner_d_internal = int(method_cfg.get("pruner_d_internal", 512))
+    cfg_pruner_n_queries = int(method_cfg.get("pruner_n_queries", 32))
+    cfg_use_question_condition = bool(method_cfg.get("use_question_condition", False))
+
+    pruning_layers = inferred_pruning_layers or cfg_pruning_layers
+    pruner_d_internal = int(inferred_d_internal or cfg_pruner_d_internal)
+    pruner_n_queries = int(inferred_n_queries or cfg_pruner_n_queries)
+    use_question_condition = bool(
+        inferred_use_question_condition if inferred_use_question_condition is not None else cfg_use_question_condition
+    )
+
+    if pruning_layers != cfg_pruning_layers:
+        print(f"[simple_repair_analysis] Override pruning_layers: {cfg_pruning_layers} -> {pruning_layers} (from ckpt)")
+    if pruner_d_internal != cfg_pruner_d_internal:
+        print(
+            f"[simple_repair_analysis] Override pruner_d_internal: {cfg_pruner_d_internal} -> {pruner_d_internal} (from ckpt)"
+        )
+    if pruner_n_queries != cfg_pruner_n_queries:
+        print(
+            f"[simple_repair_analysis] Override pruner_n_queries: {cfg_pruner_n_queries} -> {pruner_n_queries} (from ckpt)"
+        )
+    if use_question_condition != cfg_use_question_condition:
+        print(
+            f"[simple_repair_analysis] Override use_question_condition: {cfg_use_question_condition} -> {use_question_condition} (from ckpt)"
+        )
     ckpt_has_repair = ("repair_context_encoder_state_dict" in meta) and ("repair_adapter_state_dict" in meta)
     use_repair_adapter = bool(method_cfg.get("use_repair_adapter", False) and ckpt_has_repair)
 
     if bool(method_cfg.get("use_repair_adapter", False)) and not ckpt_has_repair:
         print("注意: 配置要求 repair adapter，但 checkpoint 没有 repair 权重；禁用 repair")
 
-    # 获取 repair layers 并可能跳过第一个
+    # 获取 repair layers 并可能跳过第一个 / 手动 drop 某些层
     repair_layers_cfg = method_cfg.get("repair_layers", None)
     repair_source_layers_cfg = method_cfg.get("repair_source_layers", None)
 
@@ -62,6 +122,22 @@ def load_model_and_config(checkpoint_path: str, device: torch.device, skip_first
             print(f"跳过第一个 adapter，使用 repair_layers: {repair_layers_cfg}, repair_source_layers: {repair_source_layers_cfg}")
         else:
             print(f"跳过第一个 adapter，使用 repair_layers: {repair_layers_cfg}")
+
+    # Hard-drop adapters that are known to be harmful / ablation-only.
+    # User request: always ignore L12 and L13 (do NOT introduce extra CLI flags).
+    hard_drop_set = {12, 13}
+    if repair_layers_cfg:
+        original_layers = list(repair_layers_cfg)
+        keep_mask = [int(l) not in hard_drop_set for l in original_layers]
+        if not all(keep_mask):
+            dropped = sorted({int(l) for l, keep in zip(original_layers, keep_mask) if not keep})
+            repair_layers_cfg = [l for l, keep in zip(original_layers, keep_mask) if keep]
+            if repair_source_layers_cfg is not None:
+                repair_source_layers_cfg = [l for l, keep in zip(list(repair_source_layers_cfg), keep_mask) if keep]
+            print(
+                f"[simple_repair_analysis] Hard-drop repair adapters at layers {dropped}; "
+                f"now repair_layers={repair_layers_cfg}"
+            )
 
     # 加载基础模型
     base_model = LlavaForConditionalGeneration.from_pretrained(
@@ -75,17 +151,17 @@ def load_model_and_config(checkpoint_path: str, device: torch.device, skip_first
     # 创建可剪枝模型
     model = PrunableLlavaForConditionalGeneration(
         base_model=base_model,
-        pruning_layers=method_cfg.get("pruning_layers", [4, 14, 24]),
-        pruner_d_internal=method_cfg.get("pruner_d_internal", 512),
+        pruning_layers=pruning_layers,
+        pruner_d_internal=pruner_d_internal,
         pruner_n_heads=method_cfg.get("pruner_n_heads", 4),
-        pruner_n_queries=method_cfg.get("pruner_n_queries", 32),
+        pruner_n_queries=pruner_n_queries,
         pruner_query_dropout=0.0,
         use_adapter=method_cfg.get("use_adapter", False),
         temperature=method_cfg.get("eval_temperature", 0.1),
         dropout=0.0,
         use_gumbel_noise=False,
         pruning_threshold=method_cfg.get("eval_pruning_threshold", 0.5),
-        use_question_condition=method_cfg.get("use_question_condition", False),
+        use_question_condition=use_question_condition,
         use_repair_adapter=use_repair_adapter,
         repair_layers=repair_layers_cfg,  # 使用修改后的 repair_layers
         repair_source_layers=repair_source_layers_cfg,  # 使用修改后的 repair_source_layers
@@ -104,30 +180,40 @@ def load_model_and_config(checkpoint_path: str, device: torch.device, skip_first
         print("已加载 pruner_state_dict")
 
     if model.use_repair_adapter:
-        model.repair_context_encoder.load_state_dict(ckpt["repair_context_encoder_state_dict"])
+        # Context encoder is shared; keep strict=False for robustness across ablations.
+        model.repair_context_encoder.load_state_dict(ckpt["repair_context_encoder_state_dict"], strict=False)
 
-        # 如果跳过第一个 adapter，需要过滤 state_dict
-        if skip_first_adapter:
-            original_repair_layers = list(method_cfg.get("repair_layers", []))
-            if original_repair_layers:
-                first_layer = original_repair_layers[0]
-                adapter_state_dict = ckpt["repair_adapter_state_dict"]
+        # Adapter manager is layer-indexed. Some checkpoints may contain extra adapters
+        # (e.g., an ablation added adapter@L12). Filter to only the layers enabled in
+        # the current model to avoid "Unexpected key(s)" errors.
+        adapter_state_dict = ckpt["repair_adapter_state_dict"]
+        allowed_layers = set(int(x) for x in (getattr(model, "repair_layers", None) or []))
 
-                # 过滤掉第一个 adapter 的权重
-                filtered_state_dict = {}
-                for key, value in adapter_state_dict.items():
-                    # 检查 key 是否属于第一个 adapter
-                    # 格式通常是 "adapters.{layer_idx}.xxx"
-                    if key.startswith(f"adapters.{first_layer}."):
-                        print(f"跳过加载权重: {key}")
-                        continue
-                    filtered_state_dict[key] = value
-
-                model.repair_adapter_manager.load_state_dict(filtered_state_dict, strict=False)
-                print(f"已加载 repair adapter（跳过第一个 adapter layer {first_layer}）")
+        if not allowed_layers:
+            print("[simple_repair_analysis] Warning: use_repair_adapter=True but no repair_layers configured; skip loading adapters.")
         else:
-            model.repair_adapter_manager.load_state_dict(ckpt["repair_adapter_state_dict"])
-            print("已加载 repair_context_encoder_state_dict + repair_adapter_state_dict")
+            filtered_state_dict = {}
+            dropped_layers = set()
+            for key, value in adapter_state_dict.items():
+                m = re.match(r"adapters\.(\d+)\.", str(key))
+                if m:
+                    layer_idx = int(m.group(1))
+                    if layer_idx not in allowed_layers:
+                        dropped_layers.add(layer_idx)
+                        continue
+                filtered_state_dict[key] = value
+
+            if dropped_layers:
+                print(f"[simple_repair_analysis] Drop adapter weights for layers not in repair_layers={sorted(allowed_layers)}: {sorted(dropped_layers)}")
+
+            incompatible = model.repair_adapter_manager.load_state_dict(filtered_state_dict, strict=False)
+            if getattr(incompatible, "unexpected_keys", None):
+                print(f"[simple_repair_analysis] Unexpected adapter keys (ignored): {len(incompatible.unexpected_keys)}")
+            if getattr(incompatible, "missing_keys", None):
+                # Missing keys can happen if some adapters are disabled by config.
+                print(f"[simple_repair_analysis] Missing adapter keys (ignored): {len(incompatible.missing_keys)}")
+
+            print("已加载 repair_context_encoder_state_dict + repair_adapter_state_dict (filtered)")
 
     model.eval()
 
@@ -238,10 +324,21 @@ class StreamingDistributionAlignment:
     def compute_alignment(self, var_weight: float = 1.0) -> Dict[str, float]:
         """计算分布对齐指标
         Returns:
-            dict with keys: mean_mse, var_mse, total
+            dict with keys:
+              - mean_mse: MSE between per-dim means
+              - var_mse:  MSE between per-dim variances (2nd central moments)
+              - std_mse:  MSE between per-dim stds (sqrt variances)
+              - total:    mean_mse + var_weight * var_mse (training objective)
+              - w2_sq:    diag-Gaussian W2^2 surrogate (mean_mse + std_mse)
         """
         if self.count <= 0 or self.sum_s is None:
-            return {"mean_mse": float("nan"), "var_mse": float("nan"), "total": float("nan")}
+            return {
+                "mean_mse": float("nan"),
+                "var_mse": float("nan"),
+                "std_mse": float("nan"),
+                "total": float("nan"),
+                "w2_sq": float("nan"),
+            }
 
         # 计算均值
         inv = 1.0 / float(self.count)
@@ -261,10 +358,18 @@ class StreamingDistributionAlignment:
         var_mse = float(np.mean((var_s - var_t) ** 2))
         total = mean_mse + var_weight * var_mse
 
+        # Diagonal-Gaussian W2^2 uses std (sqrt variance), not variance.
+        std_s = np.sqrt(var_s)
+        std_t = np.sqrt(var_t)
+        std_mse = float(np.mean((std_s - std_t) ** 2))
+        w2_sq = mean_mse + std_mse
+
         return {
             "mean_mse": mean_mse,
             "var_mse": var_mse,
+            "std_mse": std_mse,
             "total": total,
+            "w2_sq": w2_sq,
         }
 
 
@@ -421,9 +526,13 @@ def main():
             "total_off": total_off,
             "mean_mse_off": metrics_off["mean_mse"],
             "var_mse_off": metrics_off["var_mse"],
+            "std_mse_off": metrics_off["std_mse"],
+            "w2_sq_off": metrics_off["w2_sq"],
             "total_on": total_on,
             "mean_mse_on": metrics_on["mean_mse"],
             "var_mse_on": metrics_on["var_mse"],
+            "std_mse_on": metrics_on["std_mse"],
+            "w2_sq_on": metrics_on["w2_sq"],
             "gain": gain,
             "is_pruning": layer in pruning_layers,
             "is_repair": layer in repair_layers,
@@ -440,8 +549,9 @@ def main():
     csv_path = os.path.join(output_dir, "repair_analysis.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "layer", "total_off", "mean_mse_off", "var_mse_off",
-            "total_on", "mean_mse_on", "var_mse_on",
+            "layer",
+            "total_off", "mean_mse_off", "var_mse_off", "std_mse_off", "w2_sq_off",
+            "total_on", "mean_mse_on", "var_mse_on", "std_mse_on", "w2_sq_on",
             "gain", "is_pruning", "is_repair"
         ])
         writer.writeheader()
@@ -611,4 +721,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

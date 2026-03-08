@@ -32,3 +32,8 @@ no adapter no repair outputs/tasks/20260304-1707_vqa-vqav2_llava157b_b7cd/checkp
 
 
 L13 25 outputs/tasks/20260304-1707_vqa-vqav2_llava157b_beec/checkpoints/checkpoint_final.pt  76.57
+
+
+
+
+outputs/tasks/20260305-2301_vqa-vqav2_llava1513b_4e19/checkpoints/checkpoint_final.pt

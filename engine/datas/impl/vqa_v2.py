@@ -268,8 +268,9 @@ class VQAV2Preparer(BasePreparer):
 
     def _load_presplits(self) -> Dict[str, List[Dict[str, Any]]]:
         data: Dict[str, List[Dict[str, Any]]] = {}
-        # train 使用训练数据
-        data['train'] = self._load_train()
+        # 只加载 split_cfg 中声明的 splits，避免在仅可视化/评估 test 时仍然加载完整 train。
+        if 'train' in self.split_cfg:
+            data['train'] = self._load_train()
         # test 使用验证数据（有标注）
         if 'test' in self.split_cfg:
             data['test'] = self._load_val_as_test()
@@ -431,4 +432,3 @@ class VQAV2Preparer(BasePreparer):
                 print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref_norm: {ref_norm}, score: {score}")
                 return {'correct': score, 'total': 1, 'accuracy': float(score)}
         return _judge
-

@@ -79,11 +79,15 @@ class BasePreparer:
             cat_priority = self.config.dataset_settings["category_priority"]
             if cat_priority["enable"]:
                 return self._split_category_priority(samples)
-        # 随机顺序拆分
+        # 随机顺序拆分（fast_load_no_random=True 时保持原顺序，便于快速调试/可视化复现）
         total = len(samples)
-        random.seed(self.seed)
-        shuffled = samples[:]
-        random.shuffle(shuffled)
+        fast_no_random = bool(self.config.dataset_settings.get("fast_load_no_random", False))
+        if fast_no_random:
+            shuffled = samples[:]
+        else:
+            random.seed(self.seed)
+            shuffled = samples[:]
+            random.shuffle(shuffled)
         targets = self.compute_split_target_sizes(total)
         result: Dict[str, BsesDataset] = {}
         ptr = 0
@@ -111,6 +115,7 @@ class BasePreparer:
     def split_from_presplits(self, presplits: Dict[str, List[Dict[str, Any]]]) -> Tuple[Dict[str, BsesDataset], List[str]]:
         placeholder_splits: List[str] = []
         result: Dict[str, BsesDataset] = {}
+        fast_no_random = bool(self.config.dataset_settings.get("fast_load_no_random", False))
 
         # 检查是否需要类别平衡截取
         use_category_balance = (
@@ -158,11 +163,14 @@ class BasePreparer:
                 subset = self._category_balanced_sample(samples, need, mode)
                 result[name] = BsesDataset(subset)
             else:
-                # 使用固定种子打乱后截取
-                random.seed(self.seed)
-                shuffled = samples[:]
-                random.shuffle(shuffled)
-                result[name] = BsesDataset(shuffled[:need])
+                # fast_load_no_random=True: 不随机打乱，保持原顺序（更可复现，也避免索引随 need 变化而漂移）
+                if fast_no_random:
+                    result[name] = BsesDataset(samples[:need])
+                else:
+                    random.seed(self.seed)
+                    shuffled = samples[:]
+                    random.shuffle(shuffled)
+                    result[name] = BsesDataset(shuffled[:need])
 
         # 对于 split_cfg 中声明但未在 presplits 出现的占位/全量, 创建空集合或占位
         for name, v in self.split_cfg.items():

@@ -14,18 +14,24 @@ sys.path.insert(0, str(project_root))
 def set_paper_style():
     """设置论文风格"""
     plt.rcParams.update({
-        "figure.dpi": 120,
+        # 目标：顶会常见风格（干净、紧凑、半页/单栏放大不显得臃肿）
+        "figure.dpi": 150,
         "savefig.dpi": 300,
-        "font.size": 11,
-        "axes.labelsize": 12,
-        "axes.titlesize": 13,
-        "legend.fontsize": 13,  # 统一图例字体
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "lines.linewidth": 3.5,  # 进一步增大线条粗细
-        "lines.markersize": 8.0,  # 进一步增大标记点
-        "axes.grid": True,
-        "grid.alpha": 0.3,
+        "font.size": 8.8,
+        "axes.labelsize": 9.6,
+        "axes.titlesize": 9.6,
+        "legend.fontsize": 8.6,
+        "xtick.labelsize": 8.4,
+        "ytick.labelsize": 8.4,
+        "axes.labelpad": 1.8,
+        "axes.linewidth": 0.9,
+        "xtick.major.size": 3.8,
+        "ytick.major.size": 3.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "lines.linewidth": 2.2,
+        "lines.markersize": 5.0,
+        "axes.grid": False,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
         "font.family": "serif",
@@ -48,8 +54,8 @@ def plot_repair_gain(csv_path: str, output_path: str, repair_layers: list):
     # 设置样式
     set_paper_style()
 
-    # 创建图表
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    # 创建图表：按“单栏/半页宽度”设计
+    fig, ax = plt.subplots(figsize=(3.45, 2.35))
 
     layers = df_filtered["layer"].values
     total_off = df_filtered["total_off"].values
@@ -59,35 +65,40 @@ def plot_repair_gain(csv_path: str, output_path: str, repair_layers: list):
     relative_gains = (gains / total_off) * 100
 
     # 绘制曲线
-    ax.plot(layers, relative_gains,
-            marker="o", color="#ff7f0e", linewidth=2.5,
-            markersize=6, markerfacecolor="#ff7f0e", markeredgewidth=0)
+    ax.plot(
+        layers, relative_gains,
+        marker="o", color="#ff7f0e", linewidth=2.2,
+        markersize=4.6, markerfacecolor="#ff7f0e", markeredgewidth=0
+    )
 
     # 添加 0 线
-    ax.axhline(0, color="k", linewidth=1.0, alpha=0.4)
+    ax.axhline(0, color="0.2", linewidth=0.85, alpha=0.6)
 
     # 标记 repair 层
     for layer in repair_layers:
         if layer in layers:
-            ax.axvline(layer, color="tab:green", linestyle="--",
-                      alpha=0.4, linewidth=1.5, zorder=0)
+            ax.axvline(layer, color="tab:green", linestyle="--", alpha=0.45, linewidth=0.85, zorder=0)
 
     # 设置标签
-    ax.set_xlabel("Decoder Layer", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Relative Gain (%)", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Decoder Layer")
+    ax.set_ylabel("Relative Gain (%)")
     # 不需要标题
 
     # 设置 x 轴范围和刻度
     ax.set_xlim(min(layers) - 0.5, max(layers) + 0.5)
-    ax.set_xticks(layers)
+    # 半页图避免 xticks 太密：优先每 2 层一个 tick（否则可能挤在一起）
+    if len(layers) > 7:
+        ax.set_xticks(list(range(int(min(layers)), int(max(layers)) + 1, 2)))
+    else:
+        ax.set_xticks(layers)
 
     # 网格
-    ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.8)
+    ax.grid(True, which="major", axis="y", linestyle=":", linewidth=0.6, alpha=0.22)
 
     # 保存
-    plt.tight_layout()
-    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.05)
-    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.05, dpi=300)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.08, dpi=300)
     plt.close(fig)
 
     print(f"已保存论文图表: {output_path}")

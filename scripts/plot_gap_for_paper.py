@@ -14,18 +14,25 @@ sys.path.insert(0, str(project_root))
 def set_paper_style():
     """设置论文风格"""
     plt.rcParams.update({
-        "figure.dpi": 120,
+        # 目标：顶会常见风格（干净、紧凑、半页/单栏放大不显得臃肿）
+        "figure.dpi": 150,
         "savefig.dpi": 300,
-        "font.size": 11,
-        "axes.labelsize": 12,
-        "axes.titlesize": 13,
-        "legend.fontsize": 13,  # 统一图例字体
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-        "lines.linewidth": 3.5,  # 进一步增大线条粗细
-        "lines.markersize": 8.0,  # 进一步增大标记点
-        "axes.grid": True,
-        "grid.alpha": 0.3,
+        "font.size": 8.8,
+        "axes.labelsize": 9.6,
+        "axes.titlesize": 9.6,
+        "legend.fontsize": 8.6,
+        "xtick.labelsize": 8.4,
+        "ytick.labelsize": 8.4,
+        "axes.labelpad": 1.8,
+        "axes.linewidth": 0.9,
+        "xtick.major.size": 3.8,
+        "ytick.major.size": 3.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "lines.linewidth": 2.2,
+        "lines.markersize": 5.0,
+        # 不在 rcParams 里全局开 grid；每张图按需开 y-grid（更干净）
+        "axes.grid": False,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
         "font.family": "serif",
@@ -41,8 +48,8 @@ def plot_gap_introduction(csv_path: str, output_path: str, pruning_layers: list)
     # 设置样式
     set_paper_style()
 
-    # 创建图表 - 单列宽度适合论文
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    # 创建图表：按“单栏/半页宽度”设计，避免缩放带来的字体过小
+    fig, ax = plt.subplots(figsize=(3.45, 2.35))
 
     # 只展示第二个剪枝器到第三个剪枝器之间的层
     # pruning_layers = [4, 14, 24]
@@ -62,36 +69,46 @@ def plot_gap_introduction(csv_path: str, output_path: str, pruning_layers: list)
     total_off_valid = total_off[valid_mask]
 
     # 绘制主曲线
-    ax.plot(layers_valid, total_off_valid,
-            marker="o", color="#d62728", linewidth=2.5,
-            markersize=6, label="Pruned (without repair)",
+    ax.plot(
+            layers_valid, total_off_valid,
+            marker="o", color="#d62728", linewidth=2.2,
+            markersize=4.6,
+            # Single curve: omit legend for a cleaner paper figure (use caption to describe).
             markerfacecolor="#d62728", markeredgewidth=0)
 
     # 标记剪枝层（只标记起点和终点）
-    ax.axvline(layer_start, color="gray", linestyle="--",
-               alpha=0.6, linewidth=1.8, zorder=0)
-    ax.axvline(layer_end, color="gray", linestyle="--",
-               alpha=0.6, linewidth=1.8, zorder=0)
+    ax.axvline(layer_start, color="0.55", linestyle="--", alpha=0.7, linewidth=0.9, zorder=0)
+    ax.axvline(layer_end, color="0.55", linestyle="--", alpha=0.7, linewidth=0.9, zorder=0)
 
-    # 添加剪枝层标签
-    y_pos = ax.get_ylim()[1] * 0.3
-    ax.text(layer_start, y_pos,
-           f"Pruning\nLayer {layer_start}",
-           ha="center", va="bottom", fontsize=9,
-           bbox=dict(boxstyle="round,pad=0.3",
-                    facecolor="white", edgecolor="gray", alpha=0.9))
-    ax.text(layer_end, y_pos,
-           f"Pruning\nLayer {layer_end}",
-           ha="center", va="bottom", fontsize=9,
-           bbox=dict(boxstyle="round,pad=0.3",
-                    facecolor="white", edgecolor="gray", alpha=0.9))
+    # 添加剪枝层标签：放在坐标轴上方（避免遮挡曲线/legend）
+    # 只标注 L14/L24（短文本避免挤出图边界）
+    ax.text(
+        layer_start + 0.15,
+        0.98,
+        f"L{layer_start}",
+        transform=ax.get_xaxis_transform(),
+        ha="left",
+        va="top",
+        fontsize=8.6,
+        color="0.25",
+    )
+    ax.text(
+        layer_end - 0.15,
+        0.98,
+        f"L{layer_end}",
+        transform=ax.get_xaxis_transform(),
+        ha="right",
+        va="top",
+        fontsize=8.6,
+        color="0.25",
+    )
 
     # 设置对数尺度
     ax.set_yscale("log")
 
     # 设置标签
-    ax.set_xlabel("Decoder Layer", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Distribution Alignment Loss", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Decoder Layer")
+    ax.set_ylabel("Distribution Alignment Loss")
     # 不需要标题
     # ax.set_title("Vision Token Pruning Causes Representation Drift",
     #             fontsize=13, fontweight="bold", pad=15)
@@ -101,15 +118,15 @@ def plot_gap_introduction(csv_path: str, output_path: str, pruning_layers: list)
     ax.set_xticks(range(layer_start, layer_end + 1, 2))
 
     # 网格
-    ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.8)
+    # ECCV 风格：只开 y 方向的轻量网格（读 log 值更方便，且不显脏）
+    ax.grid(True, which="major", axis="y", linestyle=":", linewidth=0.6, alpha=0.22)
 
-    # 图例
-    ax.legend(loc="upper left", frameon=True, fancybox=True, shadow=True)
+    # No legend for the introduction gap figure (single series).
 
     # 保存
-    plt.tight_layout()
-    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.05)
-    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.05, dpi=300)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.08, dpi=300)
     plt.close(fig)
 
     print(f"已保存论文图表: {output_path}")
@@ -121,7 +138,7 @@ def plot_gap_comparison(csv_path: str, output_path: str, pruning_layers: list):
     df = pd.read_csv(csv_path)
     set_paper_style()
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(3.45, 2.35))
 
     layers = df["layer"].values
     total_off = df["total_off"].values
@@ -135,34 +152,40 @@ def plot_gap_comparison(csv_path: str, output_path: str, pruning_layers: list):
 
     # 绘制两条曲线
     ax.plot(layers_valid, total_off_valid,
-            marker="o", color="#d62728", linewidth=2.5,
-            markersize=5, label="Without repair",
+            marker="o", color="#d62728", linewidth=2.2,
+            markersize=4.6, label="w/o repair",
             markerfacecolor="#d62728", markeredgewidth=0, alpha=0.8)
 
     ax.plot(layers_valid, total_on_valid,
-            marker="s", color="#2ca02c", linewidth=2.5,
-            markersize=5, label="With repair (ours)",
+            marker="s", color="#2ca02c", linewidth=2.2,
+            markersize=4.6, label="w/ repair (ours)",
             markerfacecolor="#2ca02c", markeredgewidth=0, alpha=0.8)
 
     # 标记剪枝层
     for layer in pruning_layers:
-        ax.axvline(layer, color="gray", linestyle="--",
-                   alpha=0.4, linewidth=1.5, zorder=0)
+        ax.axvline(layer, color="0.55", linestyle="--", alpha=0.55, linewidth=0.85, zorder=0)
 
     ax.set_yscale("log")
-    ax.set_xlabel("Decoder Layer", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Distribution Alignment Loss", fontsize=12, fontweight="bold")
-    ax.set_title("Repair Adapter Reduces Representation Drift",
-                fontsize=13, fontweight="bold", pad=15)
+    ax.set_xlabel("Decoder Layer")
+    ax.set_ylabel("Distribution Alignment Loss")
 
     ax.set_xlim(-1, max(layers) + 1)
     ax.set_xticks(range(0, max(layers) + 1, 5))
-    ax.grid(True, alpha=0.3, linestyle=":", linewidth=0.8)
-    ax.legend(loc="upper left", frameon=True, fancybox=True, shadow=True)
+    ax.grid(True, which="major", axis="y", linestyle=":", linewidth=0.6, alpha=0.22)
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
+        ncol=2,
+        frameon=False,
+        handlelength=1.5,
+        labelspacing=0.3,
+        columnspacing=0.8,
+        borderaxespad=0.0,
+    )
 
-    plt.tight_layout()
-    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.05)
-    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.05, dpi=300)
+    fig.tight_layout(pad=0.6)
+    fig.savefig(output_path.replace(".png", ".pdf"), bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(output_path, bbox_inches="tight", pad_inches=0.08, dpi=300)
     plt.close(fig)
 
     print(f"已保存对比图: {output_path}")
