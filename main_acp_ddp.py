@@ -128,7 +128,6 @@ def load_model(config, device: torch.device, local_rank: int):
     model_name = backbone_cfg.get('name', 'llava-1.5-7b')
 
     model_mapping = {
-        'llava-1.5-3b': 'llava-hf/llava-1.5-3b-hf',
         'llava-1.5-7b': 'llava-hf/llava-1.5-7b-hf',
         'llava-1.5-13b': 'llava-hf/llava-1.5-13b-hf',
     }

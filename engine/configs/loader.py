@@ -150,7 +150,6 @@ AUTO_NAME_FIELDS = [
 # ==================== 模型维度映射 ====================
 # 根据 backbone 名称自动设置 hidden_dim 和 vision_dim
 BACKBONE_DIM_MAP = {
-    "llava-1.5-3b": {"hidden_dim": 2560, "vision_dim": 1024, "model_type": "llava"},
     "llava-1.5-7b": {"hidden_dim": 4096, "vision_dim": 1024, "model_type": "llava"},
     "llava-1.5-13b": {"hidden_dim": 5120, "vision_dim": 1024, "model_type": "llava"},
 }

@@ -31,7 +31,6 @@ def compute_distribution_alignment_loss(
     mask: torch.Tensor,
     loss_type: str = "mean_var",
     var_weight: float = 1.0,
-    reduce_across_ranks: bool = True,
 ) -> torch.Tensor:
     """分布级对齐损失（仅用于 gen_answer tokens）。
 
@@ -50,7 +49,6 @@ def compute_distribution_alignment_loss(
         mask=mask,
         loss_type=loss_type,
         var_weight=var_weight,
-        reduce_across_ranks=reduce_across_ranks,
     )
     return details["total"]
 
@@ -61,7 +59,6 @@ def compute_distribution_alignment_details(
     mask: torch.Tensor,
     loss_type: str = "mean_var",
     var_weight: float = 1.0,
-    reduce_across_ranks: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """返回对齐损失及其可解释分解项（用于训练时打印诊断指标）。"""
     if student_h is None or teacher_h is None or mask is None:
@@ -74,8 +71,15 @@ def compute_distribution_alignment_details(
     if student_h.shape != teacher_h.shape:
         raise ValueError(f"student_h and teacher_h must have same shape, got {tuple(student_h.shape)} vs {tuple(teacher_h.shape)}")
 
-    # Masked moment matching over all valid gen_answer tokens in the (local) batch.
-    # In distributed training, optionally reduce moments across ranks to approximate "global batch" statistics.
+    # 仅保留“多卡全局统计”路径：
+    # - 这里的目标是让对齐损失使用 *全局 batch*（跨 rank）的 masked moments
+    # - 因此强制要求分布式已初始化，并用可导的 all_reduce 聚合统计量
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError(
+            "Distribution alignment loss requires torch.distributed to be initialized. "
+            "Please launch with torchrun (world_size>=1) so global masked moments are well-defined."
+        )
+
     h_s = student_h.float()
     h_t = teacher_h.float()
     m = mask.to(dtype=h_s.dtype)
@@ -92,27 +96,26 @@ def compute_distribution_alignment_details(
     count = m.sum()  # scalar (token count)
     d = float(h_s.shape[-1])
 
-    if reduce_across_ranks and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        # Fuse multiple reductions into one collective to reduce latency.
-        D = sum_s.shape[0]
-        pack = torch.cat(
-            [
-                sum_s,
-                sum_s2,
-                sum_t,
-                sum_t2,
-                count.reshape(1),
-                diff2_sum.reshape(1),
-            ],
-            dim=0,
-        )
-        pack = dist_nn_f.all_reduce(pack, op=dist.ReduceOp.SUM)
-        sum_s = pack[0:D]
-        sum_s2 = pack[D:2 * D]
-        sum_t = pack[2 * D:3 * D]
-        sum_t2 = pack[3 * D:4 * D]
-        count = pack[4 * D]
-        diff2_sum = pack[4 * D + 1]
+    # Fuse multiple reductions into one collective to reduce latency.
+    D = sum_s.shape[0]
+    pack = torch.cat(
+        [
+            sum_s,
+            sum_s2,
+            sum_t,
+            sum_t2,
+            count.reshape(1),
+            diff2_sum.reshape(1),
+        ],
+        dim=0,
+    )
+    pack = dist_nn_f.all_reduce(pack, op=dist.ReduceOp.SUM)
+    sum_s = pack[0:D]
+    sum_s2 = pack[D:2 * D]
+    sum_t = pack[2 * D:3 * D]
+    sum_t2 = pack[3 * D:4 * D]
+    count = pack[4 * D]
+    diff2_sum = pack[4 * D + 1]
 
     denom = count.clamp(min=1.0)
     inv = 1.0 / denom
@@ -638,7 +641,11 @@ def train_step(
         'task_loss': losses['task_loss'] * task_weight,
     }
     if 'repair_loss' in losses:
-        weighted_losses['repair_loss'] = losses['repair_loss'] * repair_weight
+        # repair_loss 使用的是“跨 rank 的全局统计”（global masked moments）。
+        # 由于本仓库的梯度同步在 sync_gradients() 中做的是 *平均*（SUM / world_size），
+        # 这里把 repair_loss 乘以 world_size，使最终等效梯度与“全局 batch 上计算一次 loss”一致。
+        world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+        weighted_losses['repair_loss'] = (losses['repair_loss'] * float(world_size)) * repair_weight
     if 'sparsity_loss' in losses:
         weighted_losses['sparsity_loss'] = losses['sparsity_loss'] * sparsity_weight
     if 'entropy_loss' in losses:

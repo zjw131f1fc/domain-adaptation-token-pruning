@@ -226,7 +226,37 @@ def evaluate(
 
     eval_pruning_mode = "topk_attn" if ab_w_o_pruner_topk else "normal"
     eval_target_token_num = method_cfg.get("target_token_num", None)
-    eval_apply_repair = False if ab_w_o_adapter else None
+    # 是否在评估时应用 delayed repair adapter：
+    # - hard_forward: 作用于 gen_answer 区域（训练口径）
+    # - hard: deployed adapter 口径（默认只修复最后一个 token）
+    #
+    # 可通过 evaluation_settings.apply_repair 控制：
+    # - "auto"/None: 跟随 checkpoint/config（若启用 adapter 则自动应用）
+    # - true/false: 强制开/关
+    apply_repair_cfg = None
+    if getattr(config, "evaluation_settings", None) is not None:
+        apply_repair_cfg = config.evaluation_settings.get("apply_repair", "auto")
+
+    if apply_repair_cfg is None:
+        eval_apply_repair = None
+    elif isinstance(apply_repair_cfg, bool):
+        eval_apply_repair = apply_repair_cfg
+    elif isinstance(apply_repair_cfg, str):
+        s = apply_repair_cfg.strip().lower()
+        if s in {"", "auto", "none", "null"}:
+            eval_apply_repair = None
+        elif s in {"true", "1", "yes", "y", "on"}:
+            eval_apply_repair = True
+        elif s in {"false", "0", "no", "n", "off"}:
+            eval_apply_repair = False
+        else:
+            raise ValueError(f"Invalid evaluation_settings.apply_repair={apply_repair_cfg!r}, expected auto/true/false.")
+    else:
+        eval_apply_repair = bool(apply_repair_cfg)
+
+    # Ablation has highest priority: force-disable repair.
+    if ab_w_o_adapter:
+        eval_apply_repair = False
 
     # 设置评估时的温度和阈值
     method_cfg = config.method_settings
@@ -363,6 +393,7 @@ def evaluate(
                     "question_ends": preprocessed["question_ends"],
                     "max_new_tokens": 32,
                     "debug_generate": (step_idx <= 3 and is_main_process()),
+                    "apply_repair": eval_apply_repair,
                 }
 
                 if hasattr(model, "generate_with_hard_pruning"):
