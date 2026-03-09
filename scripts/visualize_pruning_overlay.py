@@ -39,7 +39,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 DEFAULT_CHECKPOINT = (
-    "outputs/tasks/20260302-0000_vqa-vqav2_llava157b_acea/checkpoints/checkpoint_final.pt"
+    # "outputs/tasks/20260302-0000_vqa-vqav2_llava157b_acea/checkpoints/checkpoint_final.pt"
+    "outputs/tasks/20260309-0032_vqa-vqav2_llava157b_084e/checkpoints/checkpoint_final.pt"
 )
 DEFAULT_CONFIG = "configs/vision_token_pruning.yaml"
 
