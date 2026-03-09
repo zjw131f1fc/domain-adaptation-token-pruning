@@ -36,3 +36,5 @@ configs/loss_tests/
 examples/tmp/
 阈值.md
 消融实验的choekpoint.md
+文章*.md
+*.md
