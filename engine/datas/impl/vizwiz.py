@@ -157,7 +157,7 @@ class VizWizPreparer(BasePreparer):
             count = 0
             for ans in ref_list:
                 ans_norm = _normalize(ans)
-                if ans_norm == pred_norm or ans_norm in pred_norm or pred_norm in ans_norm:
+                if ans_norm == pred_norm:
                     count += 1
             score = count / 3.0
             return 1.0 if score >= 1.0 else score
@@ -183,7 +183,7 @@ class VizWizPreparer(BasePreparer):
                         correct += score
                     else:
                         r_norm = _normalize(r_raw)
-                        correct += 1.0 if (p_norm == r_norm or r_norm in p_norm or p_norm in r_norm) else 0.0
+                        correct += 1.0 if p_norm == r_norm else 0.0
                 return {"correct": correct, "total": total, "accuracy": (correct / total) if total > 0 else 0.0}
 
             # 单条评估
@@ -199,7 +199,7 @@ class VizWizPreparer(BasePreparer):
                 return {'correct': score, 'total': 1, 'accuracy': float(score)}
             else:
                 ref_norm = _normalize(ref)
-                score = 1.0 if (pred_norm == ref_norm or ref_norm in pred_norm or pred_norm in ref_norm) else 0.0
+                score = 1.0 if pred_norm == ref_norm else 0.0
                 return {'correct': score, 'total': 1, 'accuracy': float(score)}
 
         return _judge

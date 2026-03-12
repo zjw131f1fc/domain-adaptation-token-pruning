@@ -179,35 +179,48 @@ class SEEDBenchPreparer(BasePreparer):
 
     def _build_judge(self, meta: Dict[str, Any], splits: Dict[str, SEEDBenchDataset]):
         """构建 SEED-Bench 评估函数 - 支持多种答案格式"""
+        import re
         
         def _parse_answer(pred_raw: Any, sample: Dict[str, Any] = None) -> str:
             """解析预测答案，返回标准化的字母答案"""
             if isinstance(pred_raw, str):
-                text = pred_raw.strip().upper()
+                text = pred_raw.strip()
             else:
-                text = str(pred_raw).strip().upper()
+                text = str(pred_raw).strip()
             
             # 直接匹配字母 A/B/C/D
-            if text in ['A', 'B', 'C', 'D']:
-                return text
-            
-            # 尝试从文本中提取字母
-            for letter in ['A', 'B', 'C', 'D']:
-                if letter in text:
-                    return letter
+            upper_text = text.upper()
+            if upper_text in ['A', 'B', 'C', 'D']:
+                return upper_text
+
+            letter_patterns = [
+                r'[(\[]\s*([A-Da-d])\s*[)\]]',
+                r'(?:answer|option|choice)(?:\s+is)?[:\s]+([A-Da-d])\b',
+                r'(?:choose|pick|select)(?:\s+)?([A-Da-d])\b',
+                r'^([A-Da-d])(?:[.)\]:\s]|$)',
+                r'\b([A-Da-d])\s*[.)]?\s*$',
+            ]
+            for pattern in letter_patterns:
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                if matches:
+                    return matches[-1].group(1).upper()
             
             # 尝试数字索引转换 (0->A, 1->B, 2->C, 3->D)
             if text in ['0', '1', '2', '3']:
                 idx = int(text)
                 return chr(ord('A') + idx)
-            
-            # 尝试从文本中提取数字
-            import re
-            numbers = re.findall(r'\d+', text)
-            if numbers:
-                num = int(numbers[0])
-                if 0 <= num <= 3:
-                    return chr(ord('A') + num)
+
+            number_patterns = [
+                r'(?:answer|option|choice)(?:\s+is)?[:\s]+([0-3])\b',
+                r'(?:choose|pick|select)(?:\s+)?([0-3])\b',
+                r'^([0-3])(?:[.)\]:\s]|$)',
+                r'\b([0-3])\s*[.)]?\s*$',
+            ]
+            for pattern in number_patterns:
+                matches = list(re.finditer(pattern, text, re.IGNORECASE))
+                if matches:
+                    idx = int(matches[-1].group(1))
+                    return chr(ord('A') + idx)
             
             # 完整选项文本匹配
             if sample and 'choices' in sample:

@@ -16,7 +16,7 @@
 
 评估方式:
   - 使用 Simple Accuracy（逐条评估）
-  - 词级精确匹配：答案作为完整词出现在预测中即为正确
+  - 规范化后的精确匹配：不再接受子串命中
 """
 
 from typing import List, Dict, Any, Union
@@ -153,14 +153,13 @@ class GQAPreparer(BasePreparer):
             logger.info(f"[GQA] Split '{name}': {ds} samples")
 
     def _build_judge(self):
-        """构建 judge 函数 - 词级精确匹配
+        """构建 judge 函数 - 规范化后的精确匹配。"""
 
-        匹配规则：
-        - 单词答案：答案作为完整词出现在预测中
-        - 多词答案：答案作为连续子串出现在预测中
-
-        支持单样本和批量评估两种模式。
-        """
+        ARTICLES = {"a", "an", "the"}
+        NUMBER_MAP = {
+            "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+            "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        }
 
         def _normalize(s: Any) -> str:
             if s is None:
@@ -168,20 +167,16 @@ class GQAPreparer(BasePreparer):
             text = str(s).strip().lower()
             punct_table = str.maketrans({c: ' ' for c in "!?,.:;\"'`~()[]{}<>"})
             text = text.translate(punct_table)
-            parts = [p for p in text.split() if p]
-            return ' '.join(parts)
+            tokens = [p for p in text.split() if p]
+            cleaned: List[str] = []
+            for tok in tokens:
+                if tok in ARTICLES:
+                    continue
+                cleaned.append(NUMBER_MAP.get(tok, tok))
+            return ' '.join(cleaned)
 
         def _is_match(pred_norm: str, ref_norm: str) -> bool:
-            """词级精确匹配：ref 作为完整词出现在 pred 中"""
-            if not ref_norm:
-                return False
-            pred_words = set(pred_norm.split())
-            ref_words = ref_norm.split()
-            # 单词答案：检查是否在 pred 词集合中
-            if len(ref_words) == 1:
-                return ref_words[0] in pred_words
-            # 多词答案：检查是否作为连续子序列出现
-            return ref_norm in pred_norm
+            return bool(ref_norm) and pred_norm == ref_norm
 
         def _judge(pred, ref, sample=None, split_name: str = 'test') -> Dict[str, Any]:
             """支持单样本和批量评估"""

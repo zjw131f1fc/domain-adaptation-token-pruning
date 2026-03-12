@@ -173,7 +173,7 @@ method_settings:
   teacher_pruning_mode: keep_all
 
   # repair loss（分布级对齐，而非点到点对齐）
-  repair_loss_weight: 9.0
+  repair_loss_weight: 10.0
   # repair_loss_weight: 0.0
   repair_loss_type: w2   # w2 (mean+std) | mean_var (mean+var) | mse
   repair_var_weight: 1.0  # w2: std term weight (recommended 1.0); mean_var: var term weight
@@ -230,4 +230,4 @@ method_settings:
   # sparsity_weight_max: 0.5   # warmup 结束后达到 10.0
 
 evaluation_settings:
-  eval_mode: ["hard_forward"]
+  eval_mode: ["origin", "hard_forward"]

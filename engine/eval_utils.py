@@ -97,6 +97,20 @@ def _resolve_answer_text(sample: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _extract_prediction_text(generated: str) -> str:
+    """提取用于判分的预测文本，避免把后续对话和多行补充一并送入 judge。"""
+    text = str(generated).strip()
+    if "ASSISTANT:" in text:
+        text = text.split("ASSISTANT:")[-1].strip()
+    if "USER:" in text:
+        text = text.split("USER:")[0].strip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        return lines[0]
+    return text
+
+
 def _init_w2_accumulators(
     *,
     layers: List[int],
@@ -770,10 +784,7 @@ def evaluate(
 
         generated = processor.decode(output_ids[0], skip_special_tokens=True)
 
-        if "ASSISTANT:" in generated:
-            pred = generated.split("ASSISTANT:")[-1].strip()
-        else:
-            pred = generated.strip()
+        pred = _extract_prediction_text(generated)
 
         predictions.append(pred)
 
@@ -897,8 +908,16 @@ def evaluate(
         if 'balanced_accuracy' in eval_result:
             eval_result['accuracy'] = eval_result['balanced_accuracy']
         elif 'total_score' in eval_result:
-            # MME: 将 total_score 归一化为 0-1 范围作为 accuracy（假设满分 1400）
-            eval_result['accuracy'] = eval_result['total_score'] / 1400.0
+            # MME: 按实际参与评估的类别数归一化；若缺失则回退到满分 1400。
+            num_categories = eval_result.get('num_categories', None)
+            if isinstance(num_categories, (int, float)) and float(num_categories) > 0:
+                max_total_score = float(num_categories) * 200.0
+            else:
+                max_total_score = 1400.0
+            if max_total_score > 0:
+                eval_result['accuracy'] = max(0.0, min(1.0, eval_result['total_score'] / max_total_score))
+            else:
+                eval_result['accuracy'] = 0.0
 
     if kept_ratios:
         eval_result['avg_kept_ratio'] = sum(kept_ratios) / len(kept_ratios)

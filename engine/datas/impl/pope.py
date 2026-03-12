@@ -116,6 +116,8 @@ class POPEPreparer(BasePreparer):
                 logger.info(f"[POPE] Split '{name}' Categories: " + ", ".join(f"{c}:{n}" for c, n in sorted(cat_stat.items(), key=lambda x: (-x[1], str(x[0])))))
 
     def _build_judge(self, meta: Dict[str, Any], splits: Dict[str, BsesDataset]):
+        import re
+
         def _normalize(s: Any) -> str:
             if s is None:
                 return ''
@@ -124,6 +126,28 @@ class POPEPreparer(BasePreparer):
             text = text.translate(punct_table)
             parts = [p for p in text.split() if p]
             return ' '.join(parts)
+
+        def _parse_binary_answer(s: Any) -> str | None:
+            norm = _normalize(s)
+            if not norm:
+                return None
+            if norm in {"yes", "no"}:
+                return norm
+
+            first = norm.split()[0]
+            if first in {"yes", "no"}:
+                return first
+
+            patterns = [
+                r'\b(?:answer|response|prediction|output)(?:\s+is)?[:\s]+(yes|no)\b',
+                r'\b(?:choose|pick|select)(?:\s+)?(yes|no)\b',
+            ]
+            for pattern in patterns:
+                matches = list(re.finditer(pattern, norm, re.IGNORECASE))
+                if matches:
+                    return matches[-1].group(1).lower()
+            return None
+
         def _judge(pred, ref, sample=None, split_name: str = 'test'):
             if isinstance(pred, list):
                 if not isinstance(ref, list):
@@ -133,13 +157,13 @@ class POPEPreparer(BasePreparer):
                     raise ValueError("pred/ref 长度不一致")
                 correct = 0
                 for p_raw, r_raw in zip(pred, ref):
-                    p_norm = _normalize(p_raw)
-                    r_norm = _normalize(r_raw)
-                    if r_norm and r_norm in p_norm:
+                    pred_label = _parse_binary_answer(p_raw)
+                    ref_label = _parse_binary_answer(r_raw)
+                    if pred_label is not None and pred_label == ref_label:
                         correct += 1
                 return {"correct": correct, "total": total, "accuracy": (correct / total) if total > 0 else 0.0}
-            p_norm = _normalize(pred)
-            r_norm = _normalize(ref)
-            is_correct = 1 if (r_norm and r_norm in p_norm) else 0
+            pred_label = _parse_binary_answer(pred)
+            ref_label = _parse_binary_answer(ref)
+            is_correct = 1 if (pred_label is not None and pred_label == ref_label) else 0
             return {"correct": is_correct, "total": 1, "accuracy": float(is_correct)}
         return _judge

@@ -162,6 +162,7 @@ class MMEPreparer(BasePreparer):
         4. score = acc × 100 + acc_plus × 100
         5. 每个子任务最高 200 分
         """
+        import re
 
         def _normalize(s: Any) -> str:
             if s is None:
@@ -172,12 +173,38 @@ class MMEPreparer(BasePreparer):
             parts = [p for p in text.split() if p]
             return ' '.join(parts)
 
-        def _is_match(pred_norm: str, ref_norm: str) -> bool:
-            """检查预测是否正确：ref 作为完整词出现在 pred 中"""
+        def _parse_binary_answer(s: Any) -> str | None:
+            norm = _normalize(s)
+            if not norm:
+                return None
+            if norm in {"yes", "no"}:
+                return norm
+
+            first = norm.split()[0]
+            if first in {"yes", "no"}:
+                return first
+
+            patterns = [
+                r'\b(?:answer|response|prediction|output)(?:\s+is)?[:\s]+(yes|no)\b',
+                r'\b(?:choose|pick|select)(?:\s+)?(yes|no)\b',
+            ]
+            for pattern in patterns:
+                matches = list(re.finditer(pattern, norm, re.IGNORECASE))
+                if matches:
+                    return matches[-1].group(1).lower()
+            return None
+
+        def _is_match(pred_raw: Any, ref_raw: Any) -> bool:
+            ref_norm = _normalize(ref_raw)
             if not ref_norm:
                 return False
-            pred_words = set(pred_norm.split())
-            return ref_norm in pred_words
+
+            ref_binary = _parse_binary_answer(ref_raw)
+            if ref_binary is not None:
+                return _parse_binary_answer(pred_raw) == ref_binary
+
+            pred_norm = _normalize(pred_raw)
+            return pred_norm == ref_norm
 
         def _aggregate_judge(
             predictions: List[str],
@@ -209,10 +236,7 @@ class MMEPreparer(BasePreparer):
             for pred, ref, sample in zip(predictions, references, samples):
                 category = sample.get('category', 'unknown')
                 question_id = sample.get('question_id', 'unknown')
-                ref_norm = _normalize(ref)
-                pred_norm = _normalize(pred)
-
-                is_correct = _is_match(pred_norm, ref_norm)
+                is_correct = _is_match(pred, ref)
                 if is_correct:
                     total_correct += 1
 

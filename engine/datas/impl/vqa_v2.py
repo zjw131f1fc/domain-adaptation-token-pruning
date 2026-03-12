@@ -195,9 +195,8 @@ class VQAV2Preparer(BasePreparer):
     def _load_val_as_test(self) -> List[Dict[str, Any]]:
         """加载验证数据作为测试集
 
-        注意：测试集不过滤 "none" 答案，在 judge 中会将 GT 为 "none" 的样本直接记为正确
+        注意：测试集不过滤 "none" 答案，评估时会忽略这类样本，不计入分母。
         """
-        """加载验证数据作为测试集"""
         q_path = os.path.join(self.data_root, 'val_questions.json')
         a_path = os.path.join(self.data_root, 'val_annotations.json')
         img_root = os.path.join(self.data_root, 'val_images', 'val2014')  # 目录: val_images/val2014
@@ -248,7 +247,7 @@ class VQAV2Preparer(BasePreparer):
                 train_answer = mc_answer
             else:
                 train_answer = self._get_most_common_answer(answers)
-            # 测试集不过滤 "none" 答案，在 judge 中会将 GT 为 "none" 的样本直接记为正确
+            # 测试集保留 "none" 答案，供评估时忽略这类样本
             # 构建样本
             sample = {
                 'image': img_path,  # 存储路径而非加载图像
@@ -356,13 +355,10 @@ class VQAV2Preparer(BasePreparer):
                     cleaned.append(tok)
             return ' '.join(cleaned)
 
-        def _is_none_answer(ref) -> bool:
-            """检查 GT 是否为 'none' 答案"""
+        def _is_none_answer(ref: Any) -> bool:
             if isinstance(ref, list):
-                # 多答案情况：检查是否所有答案都是 none
                 return all(_normalize(ans) == 'none' for ans in ref)
-            else:
-                return _normalize(ref) == 'none'
+            return _normalize(ref) == 'none'
 
         def _official_score(pred_norm: str, ref_list: List[str]) -> float:
             # 空预测直接返回0分
@@ -372,8 +368,7 @@ class VQAV2Preparer(BasePreparer):
             count = 0
             for ans in ref_list:
                 ans_norm = _normalize(ans)
-                # 模糊匹配：检查预测答案是否包含参考答案，或参考答案是否包含预测答案
-                if ans_norm == pred_norm or ans_norm in pred_norm or pred_norm in ans_norm:
+                if ans_norm == pred_norm:
                     count += 1
             score = count / 3.0
             return 1.0 if score >= 1.0 else score
@@ -383,16 +378,17 @@ class VQAV2Preparer(BasePreparer):
             if isinstance(pred, list):
                 if not isinstance(ref, list):
                     raise TypeError("批量判定时 ref 也应为列表")
-                total = len(pred)
-                if len(ref) != total:
+                if len(ref) != len(pred):
                     raise ValueError("pred/ref 长度不一致")
                 correct = 0
+                total = 0
+                ignored = 0
                 for p_raw, r_raw in zip(pred, ref):
-                    # GT 为 "none" 的样本直接记为正确（测试集不过滤这类样本）
                     if _is_none_answer(r_raw):
-                        correct += 1.0
+                        ignored += 1
                         continue
 
+                    total += 1
                     # 预处理：空预测直接计0分
                     p_norm = _normalize(p_raw)
                     if not p_norm or p_norm.strip() == "":
@@ -404,31 +400,35 @@ class VQAV2Preparer(BasePreparer):
                         score = _official_score(p_norm, r_raw)
                         correct += score
                     else:
-                        # 单答案情况，使用模糊匹配
+                        # 单答案情况，使用规范化后的精确匹配
                         r_norm = _normalize(r_raw)
-                        correct += 1.0 if (p_norm == r_norm or r_norm in p_norm or p_norm in r_norm) else 0.0
-                return {"correct": correct, "total": total, "accuracy": (correct / total) if total > 0 else 0.0}
+                        correct += 1.0 if p_norm == r_norm else 0.0
+                return {
+                    "correct": correct,
+                    "total": total,
+                    "ignored": ignored,
+                    "accuracy": (correct / total) if total > 0 else 0.0,
+                }
 
             # 单条评估
-            # GT 为 "none" 的样本直接记为正确
             if _is_none_answer(ref):
-                return {'correct': 1.0, 'total': 1, 'accuracy': 1.0}
+                return {'correct': 0.0, 'total': 0, 'ignored': 1, 'accuracy': 0.0}
 
             # 预处理：空预测直接返回0分
             pred_norm = _normalize(pred)
             if not pred_norm or pred_norm.strip() == "":
                 print(f"[VQAV2 Judge] pred_norm: (empty), ref: {ref}, score: 0.0")
-                return {'correct': 0.0, 'total': 1, 'accuracy': 0.0}
+                return {'correct': 0.0, 'total': 1, 'ignored': 0, 'accuracy': 0.0}
 
             if isinstance(ref, list):
                 # 多答案情况，使用官方评分
                 score = _official_score(pred_norm, ref)
                 print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref: {ref}, score: {score}")
-                return {'correct': score, 'total': 1, 'accuracy': float(score)}
+                return {'correct': score, 'total': 1, 'ignored': 0, 'accuracy': float(score)}
             else:
-                # 单答案情况，使用模糊匹配
+                # 单答案情况，使用规范化后的精确匹配
                 ref_norm = _normalize(ref)
-                score = 1.0 if (pred_norm == ref_norm or ref_norm in pred_norm or pred_norm in ref_norm) else 0.0
+                score = 1.0 if pred_norm == ref_norm else 0.0
                 print(f"[VQAV2 Judge] pred_norm: {pred_norm}, ref_norm: {ref_norm}, score: {score}")
-                return {'correct': score, 'total': 1, 'accuracy': float(score)}
+                return {'correct': score, 'total': 1, 'ignored': 0, 'accuracy': float(score)}
         return _judge
